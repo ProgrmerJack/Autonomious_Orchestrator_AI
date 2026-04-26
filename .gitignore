@@ -1,0 +1,24 @@
+
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md
+
+# Runtime state
+.agentos/
+runs/
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Rust
+target/
+
+# Dashboard
+apps/dashboard/node_modules/
+apps/dashboard/dist/
+
+Plan.md

@@ -1,0 +1,7 @@
+[package]
+name = "agent_body"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency body process for the AgentOS orchestrator."
+
+[dependencies]

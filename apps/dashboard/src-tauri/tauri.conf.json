@@ -1,0 +1,21 @@
+{
+    "$schema": "https://schema.tauri.app/config/2",
+    "productName": "AgentOS Dashboard",
+    "version": "0.1.0",
+    "identifier": "local.agentos.dashboard",
+    "build": {
+        "beforeBuildCommand": "npm run build",
+        "beforeDevCommand": "npm run dev",
+        "devUrl": "http://127.0.0.1:5173",
+        "frontendDist": "../dist"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "AgentOS Control",
+                "width": 1100,
+                "height": 760
+            }
+        ]
+    }
+}

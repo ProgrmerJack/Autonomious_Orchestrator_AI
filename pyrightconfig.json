@@ -1,0 +1,11 @@
+{
+    "include": [
+        "agentos_orchestrator",
+        "tests"
+    ],
+    "extraPaths": [
+        "."
+    ],
+    "pythonVersion": "3.11",
+    "typeCheckingMode": "basic"
+}

@@ -1,0 +1,60 @@
+{
+    "name": "deep_research_default",
+    "default": "deny",
+    "allow": {
+        "actions": [
+            "file.read",
+            "file.write",
+            "mcp.call",
+            "mcp.list",
+            "memory.commit",
+            "network.fetch",
+            "os.act",
+            "os.snapshot",
+            "sandbox.spawn"
+        ],
+        "paths": [
+            "runs/**",
+            "artifacts/**",
+            ".agentos/**",
+            "memory://*",
+            "mcp://*"
+        ],
+        "network_hosts": [
+            "api.semanticscholar.org",
+            "api.openalex.org",
+            "api.github.com",
+            "generativelanguage.googleapis.com",
+            "pubmed.ncbi.nlm.nih.gov",
+            "modelcontextprotocol.io",
+            "github.com"
+        ]
+    },
+    "forbid": {
+        "actions": [
+            "credential.read",
+            "defender.modify",
+            "host.admin",
+            "os.act.admin",
+            "system.registry.write"
+        ],
+        "paths": [
+            "C:/Users/*/.ssh/**",
+            "C:/Users/*/.aws/**",
+            "C:/Users/*/.azure/**",
+            "C:/Users/*/AppData/Roaming/Microsoft/Credentials/**"
+        ],
+        "keywords": [
+            "api_key",
+            "password",
+            "private_key",
+            "secret_token"
+        ]
+    },
+    "require_approval": {
+        "actions": [
+            "os.act",
+            "sandbox.exec"
+        ]
+    }
+}

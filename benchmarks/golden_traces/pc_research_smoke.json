@@ -1,0 +1,33 @@
+{
+  "trace_id": "pc_research_smoke",
+  "name": "PC control plus deep research smoke",
+  "scope": "local operator workflow",
+  "objective": "Use guarded PC snapshot, selector debugging, channel command routing, and quick research artifacts to assess an OS-agent research workflow.",
+  "steps": [
+    {
+      "kind": "pc.snapshot",
+      "backend": "windows-uia",
+      "expect": "structured UI nodes or a policy decision"
+    },
+    {
+      "kind": "pc.debug-selector",
+      "selector": "name=AgentOS",
+      "expect": "ranked selector candidates or actionable guidance"
+    },
+    {
+      "kind": "channel.command",
+      "text": "/pc-research-smoke compare OpenCode OpenClaw local PC agents",
+      "expect": "completed run or approval-required response"
+    },
+    {
+      "kind": "research.artifacts",
+      "expect": "brief, sources, digest, plan, and claim trace files"
+    }
+  ],
+  "expectations": [
+    "No guarded OS action executes without policy authorization.",
+    "Selector diagnostics explain exact matches and fallbacks.",
+    "Channel commands route into the same orchestrator path as dashboard commands.",
+    "Research output includes evidence grades and claim-source traceability."
+  ]
+}

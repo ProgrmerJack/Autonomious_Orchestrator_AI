@@ -1,0 +1,26 @@
+{
+    "name": "agentos-dashboard",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "vite --host 127.0.0.1",
+        "build": "vite build",
+        "preview": "vite preview --host 127.0.0.1",
+        "tauri": "tauri"
+    },
+    "dependencies": {
+        "@tauri-apps/api": "^2.0.0",
+        "react": "latest",
+        "react-dom": "latest",
+        "lucide-react": "latest"
+    },
+    "devDependencies": {
+        "@tauri-apps/cli": "^2.0.0",
+        "@types/react": "latest",
+        "@types/react-dom": "latest",
+        "@vitejs/plugin-react": "latest",
+        "typescript": "latest",
+        "vite": "latest"
+    }
+}
