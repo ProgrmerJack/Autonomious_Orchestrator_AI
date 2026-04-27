@@ -110,9 +110,7 @@ class TrustMonitor:
             reasons.append("payload resembles indirect prompt injection")
         if self._is_web_to_local_shift(action, previous):
             score += 4
-            reasons.append(
-                "behavior shifted from web research to local probing"
-            )
+            reasons.append("behavior shifted from web research to local probing")
 
         parsed = urlparse(action.target)
         last_target = str(previous.get("last_target", ""))

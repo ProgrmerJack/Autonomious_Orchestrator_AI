@@ -117,6 +117,31 @@ class AgentOSClient:
     def pc_receipts(self) -> list[dict[str, Any]]:
         return self._request("GET", "/pc/receipts")
 
+    def pc_workflow_plan(self, objective: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/pc/workflow/plan",
+            {"objective": objective},
+        )
+
+    def pc_workflow_execute(
+        self,
+        objective: str,
+        backend: str = "virtual-desktop-sandbox",
+        approval_token: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "objective": objective,
+            "backend": backend,
+        }
+        if approval_token:
+            payload["approval_token"] = approval_token
+        return self._request(
+            "POST",
+            "/pc/workflow/execute",
+            payload,
+        )
+
     def channel_deliveries(self) -> list[dict[str, Any]]:
         return self._request("GET", "/channels/deliveries")
 

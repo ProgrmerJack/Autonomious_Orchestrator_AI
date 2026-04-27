@@ -34,9 +34,7 @@ class SelectorDebugReport:
         return {
             "selector": self.selector,
             "exact_matches": self.exact_matches,
-            "candidates": [
-                candidate.asdict() for candidate in self.candidates
-            ],
+            "candidates": [candidate.asdict() for candidate in self.candidates],
             "ready": self.ready,
             "guidance": self.guidance,
         }
@@ -56,36 +54,19 @@ def debug_selector(
         key=lambda candidate: candidate.score,
         reverse=True,
     )[: max(1, limit)]
-    exact_matches = sum(
-        1 for candidate in candidates if candidate.score >= 100
-    )
-    ready = exact_matches == 1 or bool(
-        candidates and candidates[0].score >= 80
-    )
+    exact_matches = sum(1 for candidate in candidates if candidate.score >= 100)
+    ready = exact_matches == 1 or bool(candidates and candidates[0].score >= 80)
     if not cleaned:
-        guidance = (
-            "Provide a selector such as name=Save or "
-            "automation_id=submit."
-        )
+        guidance = "Provide a selector such as name=Save or automation_id=submit."
     elif exact_matches == 1:
-        guidance = (
-            "One exact match found; the selector is ready for "
-            "guarded action."
-        )
+        guidance = "One exact match found; the selector is ready for guarded action."
     elif exact_matches > 1:
-        guidance = (
-            "Multiple exact matches found; add role= or "
-            "automation_id= detail."
-        )
+        guidance = "Multiple exact matches found; add role= or automation_id= detail."
     elif candidates:
-        guidance = (
-            "No exact match found; use the highest-ranked "
-            "fallback candidate."
-        )
+        guidance = "No exact match found; use the highest-ranked fallback candidate."
     else:
         guidance = (
-            "No candidate matched; take a fresh snapshot or "
-            "broaden the selector."
+            "No candidate matched; take a fresh snapshot or broaden the selector."
         )
     return SelectorDebugReport(
         selector=cleaned,

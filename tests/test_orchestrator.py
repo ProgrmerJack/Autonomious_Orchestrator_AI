@@ -76,6 +76,7 @@ class OrchestratorTests(unittest.TestCase):
                             "network_hosts": [
                                 "api.openalex.org",
                                 "api.semanticscholar.org",
+                                "api.crossref.org",
                                 "api.github.com",
                                 "generativelanguage.googleapis.com",
                             ],
@@ -126,6 +127,7 @@ class OrchestratorTests(unittest.TestCase):
                             "network_hosts": [
                                 "api.openalex.org",
                                 "api.semanticscholar.org",
+                                "api.crossref.org",
                                 "api.github.com",
                                 "generativelanguage.googleapis.com",
                             ],

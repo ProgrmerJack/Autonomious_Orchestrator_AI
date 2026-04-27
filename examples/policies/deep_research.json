@@ -23,6 +23,7 @@
         "network_hosts": [
             "api.semanticscholar.org",
             "api.openalex.org",
+            "api.crossref.org",
             "api.github.com",
             "generativelanguage.googleapis.com",
             "pubmed.ncbi.nlm.nih.gov",

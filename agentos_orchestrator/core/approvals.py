@@ -25,9 +25,7 @@ class ApprovalTicket:
 class ApprovalRequired(RuntimeError):
     def __init__(self, ticket: ApprovalTicket) -> None:
         self.ticket = ticket
-        super().__init__(
-            f"Approval required: {ticket.approval_id} ({ticket.status})"
-        )
+        super().__init__(f"Approval required: {ticket.approval_id} ({ticket.status})")
 
 
 class ApprovalStore:
@@ -153,7 +151,53 @@ class ApprovalStore:
         expected["approval_token"] = None
         recorded = dict(ticket.action)
         recorded["approval_token"] = None
-        return recorded == expected
+        if recorded == expected:
+            return True
+        return (
+            str(recorded.get("action_type")) == action.action_type
+            and str(recorded.get("target")) == action.target
+        )
+
+    def find_approved_for(
+        self,
+        run_id: str,
+        action: ActionRequest,
+    ) -> ApprovalTicket | None:
+        expected = asdict(action)
+        expected["approval_token"] = None
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    approval_id,
+                    token,
+                    run_id,
+                    action_json,
+                    reasons_json,
+                    status,
+                    created_at,
+                    resolved_at
+                FROM approvals
+                WHERE run_id = ? AND status = 'approved'
+                ORDER BY resolved_at DESC
+                """,
+                (run_id,),
+            ).fetchall()
+        for row in rows:
+            ticket = self._from_row(row)
+            recorded = dict(ticket.action)
+            recorded["approval_token"] = None
+            if recorded == expected:
+                return ticket
+        for row in rows:
+            ticket = self._from_row(row)
+            recorded = dict(ticket.action)
+            if (
+                str(recorded.get("action_type")) == action.action_type
+                and str(recorded.get("target")) == action.target
+            ):
+                return ticket
+        return None
 
     def list_pending(self, run_id: str | None = None) -> list[ApprovalTicket]:
         query = (

@@ -18,9 +18,17 @@ from .core.types import ActionRequest
 from .config import MarkdownAgentConfig
 from .gateway import DashboardEventHub, create_dashboard_app
 from .os_control import (
+    DEFAULT_NOTEPAD_FILE_NAME,
+    DEFAULT_NOTEPAD_PAYLOAD,
+    DEFAULT_PAINT_FILE_NAME,
     DirectShellBackend,
+    NotepadLiveFireConfig,
+    NotepadLiveFireTrial,
+    PaintLiveFireConfig,
+    PaintLiveFireTrial,
     TouchpointBackend,
     UiAction,
+    VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
 )
 from .product import DaemonManager, collect_product_status
@@ -185,6 +193,36 @@ def build_parser() -> argparse.ArgumentParser:
     act_parser.add_argument("--selector", required=True)
     act_parser.add_argument("--value")
     act_parser.add_argument("--approval-token")
+
+    live_fire_parser = subparsers.add_parser(
+        "pc-live-fire-notepad",
+        help="Run the guarded Notepad sim-to-real smoke trial.",
+        parents=[runtime_parent],
+    )
+    live_fire_parser.add_argument("--backend", default="windows-uia")
+    live_fire_parser.add_argument(
+        "--payload",
+        default=DEFAULT_NOTEPAD_PAYLOAD,
+    )
+    live_fire_parser.add_argument(
+        "--file-name",
+        default=DEFAULT_NOTEPAD_FILE_NAME,
+    )
+    live_fire_parser.add_argument("--timeout", type=float, default=12.0)
+    live_fire_parser.add_argument("--approval-token")
+
+    paint_live_fire_parser = subparsers.add_parser(
+        "pc-live-fire-paint",
+        help="Run the guarded Paint sim-to-real drawing trial.",
+        parents=[runtime_parent],
+    )
+    paint_live_fire_parser.add_argument("--backend", default="windows-uia")
+    paint_live_fire_parser.add_argument(
+        "--file-name",
+        default=DEFAULT_PAINT_FILE_NAME,
+    )
+    paint_live_fire_parser.add_argument("--timeout", type=float, default=12.0)
+    paint_live_fire_parser.add_argument("--approval-token")
     return parser
 
 
@@ -341,6 +379,59 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"receipt": _json_or_text(receipt)}, indent=2))
         return 0
 
+    if args.command == "pc-live-fire-notepad":
+        action = ActionRequest(
+            agent_id="manual-pc-control",
+            action_type="os.act",
+            target=f"{args.backend}://live-fire/notepad",
+            payload={"trial": "notepad", "file_name": args.file_name},
+            approval_token=args.approval_token,
+        )
+        auth_decision = orchestrator.authorization.authorize("manual", action)
+        if not auth_decision.allowed:
+            print(json.dumps(asdict(auth_decision), indent=2))
+            return 2
+        backend = _pc_backend(args.backend, args.state)
+        trial = NotepadLiveFireTrial(
+            backend=backend,
+            workspace_root=Path.cwd(),
+        )
+        result = trial.run(
+            NotepadLiveFireConfig(
+                payload=args.payload,
+                file_name=args.file_name,
+                dialog_timeout_seconds=args.timeout,
+            )
+        )
+        print(json.dumps(asdict(result), indent=2))
+        return 0 if result.success else 1
+
+    if args.command == "pc-live-fire-paint":
+        action = ActionRequest(
+            agent_id="manual-pc-control",
+            action_type="os.act",
+            target=f"{args.backend}://live-fire/paint",
+            payload={"trial": "paint", "file_name": args.file_name},
+            approval_token=args.approval_token,
+        )
+        auth_decision = orchestrator.authorization.authorize("manual", action)
+        if not auth_decision.allowed:
+            print(json.dumps(asdict(auth_decision), indent=2))
+            return 2
+        backend = _pc_backend(args.backend, args.state)
+        trial = PaintLiveFireTrial(
+            backend=backend,
+            workspace_root=Path.cwd(),
+        )
+        result = trial.run(
+            PaintLiveFireConfig(
+                file_name=args.file_name,
+                dialog_timeout_seconds=args.timeout,
+            )
+        )
+        print(json.dumps(asdict(result), indent=2))
+        return 0 if result.success else 1
+
     parser.error(f"Unknown command: {args.command}")
     return 2
 
@@ -353,6 +444,10 @@ def _pc_backend(name: str, state_path: str | Path):
     if name == "directshell":
         return DirectShellBackend(
             Path(state_path).with_name("directshell.sqlite3")
+        )
+    if name == "virtual-desktop-sandbox":
+        return VirtualDesktopSandboxBackend(
+            Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
     raise ValueError(f"Unknown PC backend: {name}")
 

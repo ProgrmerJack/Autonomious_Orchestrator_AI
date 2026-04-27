@@ -69,9 +69,7 @@ class ProductTests(unittest.TestCase):
                 ".agentos/memory.sqlite3",
             )
 
-        providers = {
-            provider.provider_id: provider for provider in status.providers
-        }
+        providers = {provider.provider_id: provider for provider in status.providers}
         self.assertTrue(providers["openai"].configured)
 
     def test_daemon_manager_reports_stopped_without_state(self) -> None:
@@ -108,6 +106,14 @@ class ProductTests(unittest.TestCase):
             client.pc_debug_selector("name=AgentOS")["path"],
             "/pc/debug-selector",
         )
+        self.assertEqual(
+            client.pc_workflow_plan("write a report")["path"],
+            "/pc/workflow/plan",
+        )
+        self.assertEqual(
+            client.pc_workflow_execute("write a report")["path"],
+            "/pc/workflow/execute",
+        )
 
     def test_command_registry_merges_defaults_and_user_commands(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -124,6 +130,7 @@ class ProductTests(unittest.TestCase):
 
             self.assertEqual(saved.render("topic"), "[quick] audit topic")
             self.assertIsNotNone(registry.get("quick-research"))
+            self.assertIsNotNone(registry.get("research"))
             loaded = registry.get("/audit")
             self.assertIsNotNone(loaded)
             assert loaded is not None

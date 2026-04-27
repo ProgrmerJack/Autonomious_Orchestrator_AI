@@ -93,10 +93,7 @@ def setup_checks(
                 f"{sys.version_info.minor}."
                 f"{sys.version_info.micro}"
             ),
-            repair_hint=(
-                "Install Python 3.11+ and rerun "
-                "scripts/install-agentos.ps1."
-            ),
+            repair_hint=("Install Python 3.11+ and rerun scripts/install-agentos.ps1."),
         ),
         _check(
             "policy-file",
@@ -104,8 +101,7 @@ def setup_checks(
             policy.exists(),
             str(policy),
             repair_hint=(
-                "Create or select a policy JSON file before "
-                "launching AgentOS."
+                "Create or select a policy JSON file before launching AgentOS."
             ),
         ),
         _policy_check(policy),
@@ -115,8 +111,7 @@ def setup_checks(
             _path_parent_writable(state),
             str(state),
             repair_hint=(
-                "Create the .agentos directory or choose a writable "
-                "state path."
+                "Create the .agentos directory or choose a writable state path."
             ),
         ),
         _check(
@@ -125,8 +120,7 @@ def setup_checks(
             _path_parent_writable(memory),
             str(memory),
             repair_hint=(
-                "Create the .agentos directory or choose a writable "
-                "memory path."
+                "Create the .agentos directory or choose a writable memory path."
             ),
         ),
         _check(
@@ -135,8 +129,7 @@ def setup_checks(
             (dashboard_dir / "package.json").exists(),
             str(dashboard_dir),
             repair_hint=(
-                "Restore apps/dashboard/package.json from the "
-                "project template."
+                "Restore apps/dashboard/package.json from the project template."
             ),
         ),
         _check(
@@ -159,10 +152,7 @@ def setup_checks(
             "One-command launcher",
             (workspace_root / "AgentOS.cmd").exists(),
             str(workspace_root / "AgentOS.cmd"),
-            repair_hint=(
-                "Run scripts/install-agentos.ps1 to create the "
-                "launcher."
-            ),
+            repair_hint=("Run scripts/install-agentos.ps1 to create the launcher."),
         ),
     ]
     return checks
@@ -228,8 +218,7 @@ def channel_statuses() -> list[ChannelStatus]:
             endpoint="/channels/slack",
             configured=bool(os.environ.get("SLACK_BOT_TOKEN")),
             detail=(
-                "Accepts Slack event payloads; set SLACK_BOT_TOKEN "
-                "for bot delivery"
+                "Accepts Slack event payloads; set SLACK_BOT_TOKEN for bot delivery"
             ),
         ),
         ChannelStatus(
@@ -300,8 +289,7 @@ def _policy_check(policy_path: Path) -> SetupCheck:
             status="fail",
             detail=str(exc),
             repair_hint=(
-                "Use a valid JSON policy with default deny and "
-                "approval gates."
+                "Use a valid JSON policy with default deny and approval gates."
             ),
         )
     requires = set(payload.get("require_approval", {}).get("actions", []))
@@ -311,13 +299,9 @@ def _policy_check(policy_path: Path) -> SetupCheck:
         check_id="policy-safety",
         label="Policy safety posture",
         status="pass" if safe else "fail",
-        detail=(
-            "default deny with os.act approval" if safe else "tighten policy"
-        ),
+        detail=("default deny with os.act approval" if safe else "tighten policy"),
         repair_hint=(
-            "Set default to deny and require approval for os.act."
-            if not safe
-            else ""
+            "Set default to deny and require approval for os.act." if not safe else ""
         ),
     )
 

@@ -17,9 +17,7 @@ class FakeDeepResearchEngine(DeepResearchEngine):
                     {
                         "display_name": "Accessibility Tree Agents",
                         "publication_year": 2025,
-                        "authorships": [
-                            {"author": {"display_name": "A. Researcher"}}
-                        ],
+                        "authorships": [{"author": {"display_name": "A. Researcher"}}],
                         "abstract_inverted_index": {
                             "Accessibility": [0],
                             "agents": [1],
@@ -29,9 +27,7 @@ class FakeDeepResearchEngine(DeepResearchEngine):
                         "id": "https://openalex.org/W1",
                     },
                     {
-                        "display_name": (
-                            "Membrane Transporters in Drug Development"
-                        ),
+                        "display_name": ("Membrane Transporters in Drug Development"),
                         "publication_year": 2010,
                         "authorships": [],
                         "abstract_inverted_index": {
@@ -49,9 +45,7 @@ class FakeDeepResearchEngine(DeepResearchEngine):
                 "items": [
                     {
                         "full_name": "All-Hands-AI/OpenHands",
-                        "html_url": (
-                            "https://github.com/All-Hands-AI/OpenHands"
-                        ),
+                        "html_url": ("https://github.com/All-Hands-AI/OpenHands"),
                         "description": (
                             "OpenHands is a software agent platform for "
                             "coding workflows, OpenCode comparison, "
@@ -101,6 +95,7 @@ class ResearchTests(unittest.TestCase):
                 self.assertTrue((Path(temp_dir) / artifact).exists())
             self.assertIn("digest.json", " ".join(brief.artifacts))
             self.assertIn("research_plan.json", " ".join(brief.artifacts))
+            self.assertIn("analysis_report.md", " ".join(brief.artifacts))
             self.assertIn("claim_trace.json", " ".join(brief.artifacts))
             self.assertIn(
                 "provider_diagnostics.json",
@@ -122,12 +117,8 @@ class ResearchTests(unittest.TestCase):
                 set(by_title),
             )
 
-            claim_trace_path = (
-                Path(temp_dir) / "runs/run_1/research/claim_trace.json"
-            )
-            claim_trace = json.loads(
-                claim_trace_path.read_text(encoding="utf-8")
-            )
+            claim_trace_path = Path(temp_dir) / "runs/run_1/research/claim_trace.json"
+            claim_trace = json.loads(claim_trace_path.read_text(encoding="utf-8"))
             self.assertGreaterEqual(claim_trace["source_count"], 1)
             self.assertTrue(claim_trace["claims"])
 
@@ -144,12 +135,12 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual(brief.objective, "protein design benchmarks")
             self.assertEqual(brief.query, "protein design benchmarks")
 
-            plan_path = (
-                Path(temp_dir) / "runs/run_2/research/research_plan.json"
-            )
+            plan_path = Path(temp_dir) / "runs/run_2/research/research_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             self.assertEqual(plan["depth"], "multi-hour")
             self.assertGreaterEqual(len(plan["query_variants"]), 4)
+            self.assertGreaterEqual(len(plan["subquestions"]), 3)
+            self.assertGreaterEqual(len(plan["comparative_axes"]), 4)
             self.assertIn("structured scholarly APIs", plan["token_strategy"])
 
     def test_depth_marker_survives_supervisor_prefix(self) -> None:
@@ -164,9 +155,7 @@ class ResearchTests(unittest.TestCase):
             )
 
             self.assertEqual(brief.query, "accessibility tree desktop agents")
-            plan_path = (
-                Path(temp_dir) / "runs/run_3/research/research_plan.json"
-            )
+            plan_path = Path(temp_dir) / "runs/run_3/research/research_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             self.assertEqual(plan["depth"], "quick")
 
@@ -182,9 +171,7 @@ class ResearchTests(unittest.TestCase):
             self.assertIn("github-repositories", providers)
             self.assertIn("software-reference", providers)
 
-            plan_path = (
-                Path(temp_dir) / "runs/run_4/research/research_plan.json"
-            )
+            plan_path = Path(temp_dir) / "runs/run_4/research/research_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             self.assertIn("software repository search", plan["token_strategy"])
 
@@ -209,6 +196,76 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(ranked[0].provider, "gemini-flash")
         self.assertEqual(ranked[0].evidence_grade, "tool-observation")
         self.assertGreater(ranked[0].score, 60)
+
+    def test_irrelevant_github_sources_are_filtered(self) -> None:
+        query = "compare OpenHands OpenCode OpenClaw OSWorld WebArena"
+        irrelevant = ResearchSource(
+            provider="github-repositories",
+            title="awesome-go",
+            url="https://github.com/avelino/awesome-go",
+            year=2026,
+            abstract="Curated list of Go libraries and tools.",
+            citation_count=100000,
+        )
+        relevant = ResearchSource(
+            provider="github-repositories",
+            title="anomalyco/opencode",
+            url="https://github.com/anomalyco/opencode",
+            year=2026,
+            abstract="OpenCode coding agent benchmark for desktop workflows.",
+            citation_count=100,
+        )
+
+        ranked = RankingProbe.rank_sources([irrelevant, relevant], query)
+        titles = {item.title for item in ranked}
+
+        self.assertIn("anomalyco/opencode", titles)
+        self.assertNotIn("awesome-go", titles)
+
+    def test_balanced_selection_prefers_scholarly_source(self) -> None:
+        query = "compare OpenHands OpenCode OpenClaw OSWorld WebArena"
+        scholarly = ResearchSource(
+            provider="openalex",
+            title="OSWorld Benchmark for Computer Use Agents",
+            url="https://openalex.org/W123",
+            year=2025,
+            abstract="OSWorld benchmark evaluates desktop agent reliability.",
+            citation_count=50,
+        )
+        github_a = ResearchSource(
+            provider="github-repositories",
+            title="anomalyco/opencode",
+            url="https://github.com/anomalyco/opencode",
+            year=2026,
+            abstract="OpenCode desktop agent implementation.",
+            citation_count=500,
+        )
+        github_b = ResearchSource(
+            provider="github-repositories",
+            title="openclaw/openclaw",
+            url="https://github.com/openclaw/openclaw",
+            year=2026,
+            abstract="OpenClaw personal AI assistant.",
+            citation_count=500,
+        )
+
+        # Pretend these are pre-ranked descending by score.
+        selected = DeepResearchEngine._select_balanced_top(
+            [github_a, github_b, scholarly],
+            2,
+            query,
+        )
+        providers = {item.provider for item in selected}
+
+        self.assertIn("openalex", providers)
+        self.assertIn("github-repositories", providers)
+
+    def test_software_reference_sources_exclude_k_dense(self) -> None:
+        sources = DeepResearchEngine._software_reference_sources(
+            "OpenHands OpenCode OpenClaw"
+        )
+        urls = {item.url for item in sources}
+        self.assertNotIn("https://www.k-dense.ai/", urls)
 
 
 if __name__ == "__main__":

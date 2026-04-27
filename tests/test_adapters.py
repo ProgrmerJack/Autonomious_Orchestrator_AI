@@ -19,9 +19,7 @@ class AdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "directshell.sqlite3"
             backend = DirectShellBackend(db_path)
-            action_id = backend.perform(
-                UiAction("click", "role=button[name='Submit']")
-            )
+            action_id = backend.perform(UiAction("click", "role=button[name='Submit']"))
             self.assertEqual(action_id, "1")
             connection = sqlite3.connect(db_path)
             try:

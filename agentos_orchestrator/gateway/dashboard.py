@@ -31,9 +31,11 @@ from agentos_orchestrator.gateway.channels import (
 )
 from agentos_orchestrator.gateway.router import GatewayCommandRouter
 from agentos_orchestrator.os_control import (
+    DesktopWorkflowService,
     DirectShellBackend,
     TouchpointBackend,
     UiAction,
+    VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
 )
 from agentos_orchestrator.os_control.selector_debug import debug_selector
@@ -143,9 +145,7 @@ class DashboardRunManager:
 
     def _run_job(self, job_id: str, objective: str) -> None:
         self._update(job_id, status="running")
-        self.event_hub.publish(
-            {"job": {"job_id": job_id, "status": "running"}}
-        )
+        self.event_hub.publish({"job": {"job_id": job_id, "status": "running"}})
         try:
             report = self.orchestrator.run(objective)
         except (
@@ -244,9 +244,7 @@ def create_dashboard_app(
         return asdict(approvals.deny(token))
 
     if orchestrator is not None:
-        command_registry = CommandRegistry(
-            Path.cwd() / ".agentos" / "commands.json"
-        )
+        command_registry = CommandRegistry(Path.cwd() / ".agentos" / "commands.json")
         command_router = GatewayCommandRouter(orchestrator, command_registry)
         telegram = TelegramWebhookAdapter()
         generic_webhook = GenericWebhookAdapter()
@@ -254,6 +252,7 @@ def create_dashboard_app(
         discord = DiscordWebhookAdapter()
         run_manager = DashboardRunManager(orchestrator, event_hub)
         daemon_manager = DaemonManager(Path.cwd())
+        workflow_service = DesktopWorkflowService(Path.cwd())
         pc_receipts: deque[dict[str, Any]] = deque(maxlen=100)
         channel_deliveries: deque[dict[str, Any]] = deque(maxlen=100)
 
@@ -353,18 +352,11 @@ def create_dashboard_app(
 
         @app.get("/commands")
         async def list_commands() -> list[dict]:
-            return [
-                command.asdict()
-                for command in command_registry.list_commands()
-            ]
+            return [command.asdict() for command in command_registry.list_commands()]
 
         @app.post("/commands")
         async def save_command(payload: dict) -> dict:
-            command_id = (
-                str(payload.get("command_id") or "")
-                .strip()
-                .removeprefix("/")
-            )
+            command_id = str(payload.get("command_id") or "").strip().removeprefix("/")
             template = str(payload.get("template") or "").strip()
             if not command_id or not template:
                 raise fastapi.HTTPException(
@@ -412,9 +404,7 @@ def create_dashboard_app(
 
         @app.get("/runs")
         async def list_runs() -> list[dict]:
-            return [
-                asdict(record) for record in orchestrator.runtime.list_runs()
-            ]
+            return [asdict(record) for record in orchestrator.runtime.list_runs()]
 
         @app.get("/runs/{run_id}")
         async def get_run(run_id: str) -> dict:
@@ -463,10 +453,7 @@ def create_dashboard_app(
             return {
                 "status": "ok",
                 "backend": backend,
-                "nodes": [
-                    asdict(node)
-                    for node in nodes[: max(1, min(limit, 500))]
-                ],
+                "nodes": [asdict(node) for node in nodes[: max(1, min(limit, 500))]],
             }
 
         @app.post("/pc/debug-selector")
@@ -493,6 +480,71 @@ def create_dashboard_app(
         async def pc_receipt_history() -> list[dict]:
             return list(pc_receipts)
 
+        @app.post("/pc/workflow/plan")
+        async def pc_workflow_plan(payload: dict) -> dict:
+            objective = str(payload.get("objective") or "").strip()
+            if not objective:
+                raise fastapi.HTTPException(
+                    status_code=400,
+                    detail="objective is required",
+                )
+            plan = workflow_service.plan(objective)
+            return {"status": "ok", "plan": plan.asdict()}
+
+        @app.post("/pc/workflow/execute")
+        async def pc_workflow_execute(payload: dict) -> dict:
+            objective = str(payload.get("objective") or "").strip()
+            backend_name = str(payload.get("backend") or "virtual-desktop-sandbox")
+            approval_token = payload.get("approval_token")
+            if not objective:
+                raise fastapi.HTTPException(
+                    status_code=400,
+                    detail="objective is required",
+                )
+            action = ActionRequest(
+                agent_id="dashboard-pc-control",
+                action_type="os.act",
+                target=f"{backend_name}://workflow",
+                payload={"workflow_objective": objective},
+                approval_token=(str(approval_token) if approval_token else None),
+            )
+            decision = orchestrator.authorization.authorize(
+                "dashboard",
+                action,
+            )
+            if not decision.allowed:
+                blocked = {
+                    "status": _blocked_status(decision.requires_approval),
+                    "decision": asdict(decision),
+                }
+                pc_receipts.appendleft(
+                    {
+                        "created_at": utc_now(),
+                        "backend": backend_name,
+                        "selector": "workflow",
+                        "action": "workflow.execute",
+                        "result": blocked,
+                    }
+                )
+                return blocked
+            backend = _pc_backend(backend_name, orchestrator.state_path)
+            result = workflow_service.execute(objective, backend)
+            if result.get("status") == "clarification_required":
+                envelope = result
+            else:
+                envelope = {"status": "executed", **result}
+            pc_receipts.appendleft(
+                {
+                    "created_at": utc_now(),
+                    "backend": backend_name,
+                    "selector": "workflow",
+                    "action": "workflow.execute",
+                    "result": envelope,
+                }
+            )
+            event_hub.publish({"pc_receipt": pc_receipts[0]})
+            return envelope
+
         @app.post("/pc/actions")
         async def pc_action(payload: dict) -> dict:
             backend = str(payload.get("backend") or "windows-uia")
@@ -513,9 +565,7 @@ def create_dashboard_app(
                     "action": action_type,
                     "value_present": value is not None,
                 },
-                approval_token=(
-                    str(approval_token) if approval_token else None
-                ),
+                approval_token=(str(approval_token) if approval_token else None),
             )
             decision = orchestrator.authorization.authorize(
                 "dashboard",
@@ -635,22 +685,27 @@ def _pc_backend(name: str, state_path: str | Path):
     if name == "touchpoint":
         return TouchpointBackend()
     if name == "directshell":
-        return DirectShellBackend(
-            Path(state_path).with_name("directshell.sqlite3")
+        return DirectShellBackend(Path(state_path).with_name("directshell.sqlite3"))
+    if name == "virtual-desktop-sandbox":
+        return VirtualDesktopSandboxBackend(
+            Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
     raise ValueError(f"Unknown PC backend: {name}")
 
 
 def _pc_backend_status(state_path: str | Path) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
-    for name in ("windows-uia", "touchpoint", "directshell"):
+    for name in (
+        "windows-uia",
+        "touchpoint",
+        "directshell",
+        "virtual-desktop-sandbox",
+    ):
         try:
             backend = _pc_backend(name, state_path)
             available = backend.available()
         except (OSError, RuntimeError, ValueError) as exc:
-            statuses.append(
-                {"name": name, "available": False, "error": str(exc)}
-            )
+            statuses.append({"name": name, "available": False, "error": str(exc)})
         else:
             statuses.append({"name": name, "available": available})
     return statuses
@@ -677,9 +732,7 @@ def _record_channel_delivery(
 def _golden_traces_payload(workspace_root: Path) -> dict[str, Any]:
     trace_dir = workspace_root / "benchmarks" / "golden_traces"
     traces: list[dict[str, Any]] = []
-    trace_paths = (
-        sorted(trace_dir.glob("*.json")) if trace_dir.exists() else []
-    )
+    trace_paths = sorted(trace_dir.glob("*.json")) if trace_dir.exists() else []
     for path in trace_paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -695,9 +748,7 @@ def _replay_benchmarks(workspace_root: Path, trace_id: str) -> dict[str, Any]:
     payload = _golden_traces_payload(workspace_root)
     traces = payload["traces"]
     selected = [
-        trace
-        for trace in traces
-        if not trace_id or trace.get("trace_id") == trace_id
+        trace for trace in traces if not trace_id or trace.get("trace_id") == trace_id
     ]
     results = []
     for trace in selected:

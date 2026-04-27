@@ -28,9 +28,7 @@ class CommandRegistry:
         self.path = Path(path) if path is not None else None
 
     def list_commands(self) -> list[WorkflowCommand]:
-        commands = {
-            command.command_id: command for command in _default_commands()
-        }
+        commands = {command.command_id: command for command in _default_commands()}
         for command in self._load_user_commands():
             commands[command.command_id] = command
         return sorted(commands.values(), key=lambda item: item.command_id)
@@ -46,9 +44,7 @@ class CommandRegistry:
         if self.path is None:
             raise ValueError("command registry has no writable path")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        commands = {
-            item.command_id: item for item in self._load_user_commands()
-        }
+        commands = {item.command_id: item for item in self._load_user_commands()}
         commands[command.command_id] = command
         self.path.write_text(
             json.dumps(
@@ -75,9 +71,7 @@ class CommandRegistry:
             try:
                 commands.append(
                     WorkflowCommand(
-                        command_id=(
-                            str(item["command_id"]).strip().removeprefix("/")
-                        ),
+                        command_id=(str(item["command_id"]).strip().removeprefix("/")),
                         label=str(item.get("label") or item["command_id"]),
                         description=str(item.get("description") or ""),
                         template=str(item["template"]),
@@ -98,19 +92,30 @@ def _default_commands() -> list[WorkflowCommand]:
             template="[quick] {argument}",
         ),
         WorkflowCommand(
+            command_id="research",
+            label="Research",
+            description=("Alias for multi-hour deep research from channel inputs."),
+            template=(
+                "[multi-hour] Execute paper-mode deep research with "
+                "iterative retrieval and evidence-coverage gates for: "
+                "{argument}"
+            ),
+        ),
+        WorkflowCommand(
             command_id="deep-research",
             label="Multi-hour research",
-            description=(
-                "Budgeted long-horizon research with durable artifacts."
+            description=("Budgeted long-horizon research with durable artifacts."),
+            template=(
+                "[multi-hour] Execute paper-mode deep research with "
+                "iterative retrieval, evidence-coverage gates, and active "
+                "PC research actions (approval-gated) for: {argument}"
             ),
-            template="[multi-hour] {argument}",
         ),
         WorkflowCommand(
             command_id="pc-research-smoke",
             label="PC research smoke",
             description=(
-                "Research objective shaped to exercise PC-control "
-                "evidence paths."
+                "Research objective shaped to exercise PC-control evidence paths."
             ),
             template=(
                 "[quick] Use local PC control, browser evidence, "
@@ -122,12 +127,11 @@ def _default_commands() -> list[WorkflowCommand]:
             command_id="competitive-audit",
             label="Competitive audit",
             description=(
-                "Compare AgentOS against OS-agent and coding-agent "
-                "competitors."
+                "Compare AgentOS against OS-agent and coding-agent competitors."
             ),
             template=(
                 "[standard] Compare AgentOS against OpenClaw, OpenCode, "
-                "OpenHands, and K-Dense for: {argument}"
+                "and OpenHands for: {argument}"
             ),
         ),
     ]

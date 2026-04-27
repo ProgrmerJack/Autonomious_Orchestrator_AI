@@ -67,15 +67,11 @@ class SlackWebhookAdapter:
             return None
         return ChannelMessage(
             channel=self.name,
-            sender_id=str(
-                event.get("user") or payload.get("user_id") or "unknown"
-            ),
+            sender_id=str(event.get("user") or payload.get("user_id") or "unknown"),
             text=str(text),
             metadata={
                 "team_id": payload.get("team_id"),
-                "channel_id": (
-                    event.get("channel") or payload.get("channel_id")
-                ),
+                "channel_id": (event.get("channel") or payload.get("channel_id")),
                 "event_id": payload.get("event_id"),
             },
         )
@@ -92,9 +88,7 @@ class DiscordWebhookAdapter:
         author = raw_author if isinstance(raw_author, dict) else {}
         return ChannelMessage(
             channel=self.name,
-            sender_id=str(
-                author.get("id") or payload.get("user_id") or "unknown"
-            ),
+            sender_id=str(author.get("id") or payload.get("user_id") or "unknown"),
             text=str(text),
             metadata={
                 "channel_id": payload.get("channel_id"),

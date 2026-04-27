@@ -38,7 +38,7 @@ class RepeatedTransitionEvaluator:
         event: Event,
         history: list[Event],
     ) -> list[EvaluationFinding]:
-        recent = history[-self.max_repeats:]
+        recent = history[-self.max_repeats :]
         repeats = [item for item in recent if item.type == event.type]
         if len(repeats) < self.max_repeats:
             return []

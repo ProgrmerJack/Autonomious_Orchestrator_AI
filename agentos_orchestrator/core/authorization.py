@@ -35,6 +35,10 @@ class AuthorizationMiddleware:
         run_id: str,
         action: ActionRequest,
     ) -> AuthorizationDecision:
+        if not action.approval_token:
+            approved = self.approvals.find_approved_for(run_id, action)
+            if approved is not None:
+                action.approval_token = approved.token
         policy_decision = self.policy.evaluate(action)
         trust_decision = self.trust.assess(run_id, action)
         reasons = [*policy_decision.reasons, *trust_decision.reasons]
