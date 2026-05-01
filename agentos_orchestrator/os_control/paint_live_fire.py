@@ -49,9 +49,7 @@ class PaintLiveFireConfig:
     filename_selector: str = "automation_id=1001&&class_name=Edit"
     save_button_selector: str = "automation_id=1&&class_name=Button&&name=Save"
     save_hotkey: str = "^s"
-    stroke_points: tuple[
-        tuple[float, float], ...
-    ] = DEFAULT_PAINT_STROKE_POINTS
+    stroke_points: tuple[tuple[float, float], ...] = DEFAULT_PAINT_STROKE_POINTS
     min_non_background_pixels: int = 1
     min_non_background_width: int = 40
     min_non_background_height: int = 40
@@ -272,10 +270,7 @@ class PaintLiveFireTrial:
     ):
         attempts = max(
             1,
-            int(
-                config.file_timeout_seconds
-                / max(config.poll_interval_seconds, 0.001)
-            )
+            int(config.file_timeout_seconds / max(config.poll_interval_seconds, 0.001))
             + 1,
         )
         last_error = ""
@@ -289,9 +284,7 @@ class PaintLiveFireTrial:
                 self.poller.sleep_fn(config.poll_interval_seconds)
         if last_error:
             raise ValueError(last_error)
-        raise FileNotFoundError(
-            f"Paint output file was not created: {target_path}"
-        )
+        raise FileNotFoundError(f"Paint output file was not created: {target_path}")
 
 
 def _paint_window_observation(nodes: list[UiNode]) -> PollObservation:
@@ -302,20 +295,14 @@ def _paint_window_observation(nodes: list[UiNode]) -> PollObservation:
     ]
     return PollObservation(
         matched=bool(matches),
-        reason=(
-            "paint window observed"
-            if matches
-            else "paint window not observed"
-        ),
+        reason=("paint window observed" if matches else "paint window not observed"),
         node_count=len(nodes),
         matched_nodes=[_node_label(node) for node in matches[:5]],
     )
 
 
 def _default_paint_config() -> PaintLiveFireConfig:
-    return PaintLiveFireConfig(
-        file_name=f"paint_smoke_{int(time.time())}.png"
-    )
+    return PaintLiveFireConfig(file_name=f"paint_smoke_{int(time.time())}.png")
 
 
 def _paint_image_matches(

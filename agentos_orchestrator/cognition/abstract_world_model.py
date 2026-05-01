@@ -486,6 +486,7 @@ class AbstractWorldModel:
 # instead of generating a full video frame.                                  #
 # ======================================================================== #
 
+
 class AbstractMCTSAdapter:
     """Wraps AbstractWorldModel as a WorldModel compatible with MCTSSimulator.
 
@@ -500,17 +501,46 @@ class AbstractMCTSAdapter:
 
     # Fixed set of candidate actions the planner proposes during MCTS
     _CANDIDATE_ACTIONS: list[dict] = [
-        {"action_type": "click",  "selector": "main_button",   "region": "main"},
-        {"action_type": "click",  "selector": "header_nav",    "region": "header"},
-        {"action_type": "click",  "selector": "sidebar_item",  "region": "sidebar"},
-        {"action_type": "click",  "selector": "modal_confirm", "region": "modal"},
-        {"action_type": "click",  "selector": "modal_cancel",  "region": "modal"},
-        {"action_type": "type",   "selector": "search_input",  "region": "header"},
-        {"action_type": "type",   "selector": "form_field",    "region": "main"},
-        {"action_type": "scroll", "selector": "main_content",  "region": "main"},
-        {"action_type": "hotkey", "selector": "ctrl_s",        "region": "main"},
-        {"action_type": "hotkey", "selector": "escape",        "region": "main"},
+        {"action_type": "click", "selector": "main_button", "region": "main"},
+        {"action_type": "click", "selector": "header_nav", "region": "header"},
+        {"action_type": "click", "selector": "sidebar_item", "region": "sidebar"},
+        {"action_type": "click", "selector": "modal_confirm", "region": "modal"},
+        {"action_type": "click", "selector": "modal_cancel", "region": "modal"},
+        {"action_type": "type", "selector": "search_input", "region": "header"},
+        {"action_type": "type", "selector": "form_field", "region": "main"},
+        {"action_type": "scroll", "selector": "main_content", "region": "main"},
+        {"action_type": "hotkey", "selector": "ctrl_s", "region": "main"},
+        {"action_type": "hotkey", "selector": "escape", "region": "main"},
     ]
+    _APP_CONTEXTS = [
+        "browser",
+        "file_explorer",
+        "text_editor",
+        "spreadsheet",
+        "media",
+        "settings",
+        "terminal",
+        "other",
+    ]
+    _ELEMENT_TYPES = [
+        "button",
+        "text_field",
+        "checkbox",
+        "menu",
+        "panel",
+        "icon",
+        "tab",
+        "scrollbar",
+        "dropdown",
+        "link",
+        "image",
+        "video",
+        "table",
+        "chart",
+        "notification",
+        "other",
+    ]
+    _REGIONS = ["header", "sidebar", "main", "modal", "floating"]
 
     def __init__(self, model: "AbstractWorldModel") -> None:
         self._model = model
@@ -558,7 +588,9 @@ class AbstractMCTSAdapter:
             float(np.clip(vec[44], 0, 1)) * 0.1 if len(vec) > 44 else 0.0
         )
 
-        return float(np.clip(progress * 0.7 + modal_bonus + notification_bonus, 0.0, 1.0))
+        return float(
+            np.clip(progress * 0.7 + modal_bonus + notification_bonus, 0.0, 1.0)
+        )
 
     def is_terminal(self, state: "WorldState", objective: str) -> bool:
         """Terminal if task progress avg > 0.8 or depth exceeds safe limit."""
@@ -570,13 +602,13 @@ class AbstractMCTSAdapter:
         return state.depth >= 12
 
     def available_actions(self, state: "WorldState") -> list[UiAction]:
-        """Return the candidate action set (filtered by state context).
-
-        In modal context: only offer modal actions.
-        In main context: offer full set minus modal actions.
-        """
+        """Return candidate actions inferred from the current abstract UI."""
         vec = self._to_float_array(state.state_vector)
-        modal_active = len(vec) > 29 and vec[29] > 0.5
+        modal_active = self._modal_active(vec)
+
+        inferred = self._inferred_actions(vec, modal_active)
+        if inferred:
+            return inferred
 
         actions: list[UiAction] = []
         for cand in self._CANDIDATE_ACTIONS:
@@ -618,3 +650,100 @@ class AbstractMCTSAdapter:
         if isinstance(state_vector, dict):
             return np.array(list(state_vector.values()), dtype=np.float32)
         return np.zeros(256, dtype=np.float32)
+
+    def _inferred_actions(self, vec: np.ndarray, modal_active: bool) -> list[UiAction]:
+        app_context = self._dominant_label(
+            vec[: len(self._APP_CONTEXTS)], self._APP_CONTEXTS
+        )
+        region_slice = vec[28:33] if len(vec) >= 33 else np.zeros(5, dtype=np.float32)
+        focus_slice = vec[33:38] if len(vec) >= 38 else np.zeros(5, dtype=np.float32)
+        dominant_region = self._dominant_label(region_slice, self._REGIONS) or "main"
+        focus_region = (
+            self._dominant_label(focus_slice, self._REGIONS) or dominant_region
+        )
+        region = "modal" if modal_active else focus_region
+        type_slice = vec[12:28] if len(vec) >= 28 else np.zeros(16, dtype=np.float32)
+        type_weights = {
+            label: float(type_slice[index])
+            for index, label in enumerate(self._ELEMENT_TYPES)
+        }
+
+        actions: list[UiAction] = []
+        if modal_active:
+            if type_weights.get("text_field", 0.0) > 0.01:
+                self._append_candidate(actions, "type", "inferred_modal_field", "modal")
+            if type_weights.get("button", 0.0) > 0.01:
+                self._append_candidate(
+                    actions, "click", "inferred_modal_confirm", "modal"
+                )
+            self._append_candidate(actions, "hotkey", "escape", "modal", value="escape")
+            return actions
+
+        if type_weights.get("text_field", 0.0) > 0.01:
+            selector = (
+                "inferred_search_input"
+                if app_context in {"browser", "file_explorer"}
+                or dominant_region == "header"
+                else "inferred_form_field"
+            )
+            self._append_candidate(actions, "type", selector, region)
+
+        if type_weights.get("button", 0.0) > 0.01:
+            self._append_candidate(actions, "click", "inferred_primary_button", region)
+
+        if (
+            sum(
+                type_weights.get(label, 0.0)
+                for label in {"menu", "dropdown", "link", "tab"}
+            )
+            > 0.01
+        ):
+            nav_region = "header" if region_slice[0] >= region_slice[1] else "sidebar"
+            self._append_candidate(actions, "click", "inferred_navigation", nav_region)
+
+        if (
+            sum(type_weights.get(label, 0.0) for label in {"panel", "table", "chart"})
+            > 0.01
+        ):
+            self._append_candidate(actions, "scroll", "inferred_content", "main")
+            self._append_candidate(actions, "click", "inferred_result_panel", "main")
+
+        if app_context in {"text_editor", "spreadsheet", "media", "other"}:
+            self._append_candidate(actions, "focus", "inferred_workspace", region)
+
+        return actions[:6]
+
+    @staticmethod
+    def _append_candidate(
+        actions: list[UiAction],
+        action_type: str,
+        selector: str,
+        region: str,
+        value: str | None = None,
+    ) -> None:
+        if any(
+            action.action_type == action_type and action.selector == selector
+            for action in actions
+        ):
+            return
+        actions.append(
+            UiAction(
+                action_type=action_type,
+                selector=selector,
+                value=value,
+                metadata={"region": region, "source": "abstract_mcts_dynamic"},
+            )
+        )
+
+    @staticmethod
+    def _dominant_label(vec: np.ndarray, labels: list[str]) -> str:
+        if len(vec) == 0 or not np.any(vec):
+            return ""
+        return labels[int(np.argmax(vec))]
+
+    @staticmethod
+    def _modal_active(vec: np.ndarray) -> bool:
+        layout_modal = len(vec) > 10 and vec[10] > 0.2
+        modal_presence = len(vec) > 38 and vec[38] > 0.2
+        legacy_modal = len(vec) > 29 and vec[29] > 0.5
+        return bool(layout_modal or modal_presence or legacy_modal)

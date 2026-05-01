@@ -172,10 +172,7 @@ class LiveFireNotepadTests(unittest.TestCase):
             self.assertGreaterEqual(backend.snapshot_count, 4)
             self.assertEqual(result.safety_reason, "allowed")
             self.assertTrue(
-                any(
-                    item["label"] == "save_as_dialog"
-                    for item in result.observations
-                )
+                any(item["label"] == "save_as_dialog" for item in result.observations)
             )
             self.assertTrue(
                 any(

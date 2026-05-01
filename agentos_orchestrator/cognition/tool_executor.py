@@ -32,6 +32,7 @@ Security posture
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from typing import Any
 # ─────────────────────────────────────────────────────────────────────────── #
 # Data Structures                                                              #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 @dataclass
 class ToolResult:
@@ -105,7 +107,7 @@ _BLOCKED_MODULES: frozenset[str] = frozenset(
         "signal",
         "pty",
         "resource",
-        "gc",   # can be abused to walk the object graph
+        "gc",  # can be abused to walk the object graph
         "_thread",
     }
 )
@@ -120,7 +122,7 @@ _VETTED_PACKAGES: frozenset[str] = frozenset(
         "scikit-learn",
         "statsmodels",
         "yfinance",
-        "requests",      # only usable if allow_network=True
+        "requests",  # only usable if allow_network=True
         "httpx",
         "polars",
         "openpyxl",
@@ -219,6 +221,127 @@ class ToolExecutor:
                 print(f"RESULT: error={{e}}")
         """).strip()
 
+    def build_http_probe_code(
+        self,
+        endpoints: list[str],
+        methods: list[str] | None = None,
+    ) -> str:
+        """Generate code that probes likely API endpoints safely."""
+        endpoint_list = [str(endpoint) for endpoint in endpoints[:3]]
+        method_list = methods or ["OPTIONS", "GET"]
+        return textwrap.dedent(
+            f"""
+            import json
+            import urllib.error
+            import urllib.request
+
+            ENDPOINTS = {endpoint_list!r}
+            METHODS = {method_list!r}
+            results = {{}}
+
+            for endpoint in ENDPOINTS:
+                endpoint_results = {{}}
+                for method in METHODS:
+                    request = urllib.request.Request(endpoint, method=method)
+                    try:
+                        with urllib.request.urlopen(request, timeout=2.0) as response:
+                            body = response.read(240).decode("utf-8", errors="replace")
+                            endpoint_results[method] = {{
+                                "status": int(response.status),
+                                "content_type": response.headers.get("Content-Type", ""),
+                                "body_preview": body,
+                            }}
+                    except urllib.error.HTTPError as exc:
+                        endpoint_results[method] = {{
+                            "status": int(exc.code),
+                            "error": str(exc),
+                        }}
+                    except Exception as exc:
+                        endpoint_results[method] = {{
+                            "error": str(exc),
+                        }}
+                results[endpoint] = endpoint_results
+
+            print(json.dumps(results, indent=2))
+            print("RESULT: control_probe=" + json.dumps(results))
+            """
+        ).strip()
+
+    def build_api_workflow_code(self, workflow: dict[str, Any]) -> str:
+        """Generate code that executes a synthesized API workflow."""
+        workflow_json = json.dumps(workflow, ensure_ascii=True)
+        return textwrap.dedent(
+            f"""
+            import json
+            import os
+            import urllib.error
+            import urllib.request
+
+            WORKFLOW = json.loads({workflow_json!r})
+            runtime_headers = dict(WORKFLOW.get("headers", {{}}))
+            for env_key in WORKFLOW.get("auth_env_keys", []):
+                value = os.environ.get(env_key)
+                if not value:
+                    continue
+                if env_key in {{"ACCESS_TOKEN", "API_TOKEN", "BEARER_TOKEN"}}:
+                    runtime_headers.setdefault("Authorization", f"Bearer {{value}}")
+                elif env_key in {{"API_KEY", "X_API_KEY"}}:
+                    runtime_headers.setdefault("X-API-Key", value)
+                elif env_key == "AUTHORIZATION":
+                    runtime_headers.setdefault("Authorization", value)
+
+            results = []
+            for step in WORKFLOW.get("steps", []):
+                headers = dict(runtime_headers)
+                data = None
+                body = step.get("json_body")
+                if body is not None:
+                    headers.setdefault("Content-Type", "application/json")
+                    data = json.dumps(body).encode("utf-8")
+                request = urllib.request.Request(
+                    step["url"],
+                    data=data,
+                    method=step.get("method", "GET"),
+                    headers=headers,
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=3.0) as response:
+                        preview = response.read(300).decode("utf-8", errors="replace")
+                        results.append(
+                            {{
+                                "name": step.get("name", "step"),
+                                "url": step["url"],
+                                "method": step.get("method", "GET"),
+                                "status": int(response.status),
+                                "content_type": response.headers.get("Content-Type", ""),
+                                "body_preview": preview,
+                            }}
+                        )
+                except urllib.error.HTTPError as exc:
+                    results.append(
+                        {{
+                            "name": step.get("name", "step"),
+                            "url": step["url"],
+                            "method": step.get("method", "GET"),
+                            "status": int(exc.code),
+                            "error": str(exc),
+                        }}
+                    )
+                except Exception as exc:
+                    results.append(
+                        {{
+                            "name": step.get("name", "step"),
+                            "url": step["url"],
+                            "method": step.get("method", "GET"),
+                            "error": str(exc),
+                        }}
+                    )
+
+            print(json.dumps(results, indent=2))
+            print("RESULT: api_workflow=" + json.dumps(results))
+            """
+        ).strip()
+
     # ------------------------------------------------------------------ #
     # Internal Execution Engine                                            #
     # ------------------------------------------------------------------ #
@@ -271,8 +394,7 @@ class ToolExecutor:
 
         # 6. Collect artefacts (any files written to run_dir)
         artefacts = [
-            p for p in run_dir.iterdir()
-            if p.is_file() and p.name != "script.py"
+            p for p in run_dir.iterdir() if p.is_file() and p.name != "script.py"
         ]
 
         # 7. Parse RESULT: lines from stdout
@@ -289,11 +411,12 @@ class ToolExecutor:
             parsed_results=parsed,
         )
 
-    def _build_wrapper(
-        self, code: str, run_dir: Path, allow_network: bool
-    ) -> str:
+    def _build_wrapper(self, code: str, run_dir: Path, allow_network: bool) -> str:
         """Inject path guard and optional network block around user code."""
-        network_guard = "" if allow_network else textwrap.dedent("""
+        network_guard = (
+            ""
+            if allow_network
+            else textwrap.dedent("""
             import sys as _sys
             _real_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
             def _guarded_import(name, *args, **kwargs):
@@ -305,6 +428,7 @@ class ToolExecutor:
             import builtins as _builtins
             _builtins.__import__ = _guarded_import
         """).strip()
+        )
 
         path_guard = textwrap.dedent(f"""
             import os as _os
@@ -322,12 +446,14 @@ class ToolExecutor:
             _builtins.open = _safe_open
         """).strip()
 
-        return "\n".join([
-            path_guard,
-            network_guard,
-            "# ── user code ──────────────────────────────",
-            code,
-        ])
+        return "\n".join(
+            [
+                path_guard,
+                network_guard,
+                "# ── user code ──────────────────────────────",
+                code,
+            ]
+        )
 
     @staticmethod
     def _validate_code(code: str) -> str | None:
@@ -370,10 +496,11 @@ class ToolExecutor:
     def _parse_results(stdout: str) -> dict[str, Any]:
         """Extract RESULT: key=value lines from stdout."""
         import json
+
         results: dict[str, Any] = {}
         for line in stdout.splitlines():
             if line.startswith("RESULT:"):
-                payload = line[len("RESULT:"):].strip()
+                payload = line[len("RESULT:") :].strip()
                 # Try key=json_value format
                 if "=" in payload:
                     k, _, v = payload.partition("=")

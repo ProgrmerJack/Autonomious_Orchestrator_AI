@@ -53,7 +53,7 @@ class ActiveInferenceExplorer:
     """
 
     # Actions considered safe for exploration
-    SAFE_ACTION_TYPES = {"focus", "click", "hover"}
+    SAFE_ACTION_TYPES = {"focus", "click", "hover", "type", "invoke"}
     DESTRUCTIVE_KEYWORDS = {
         "delete",
         "remove",
@@ -63,6 +63,33 @@ class ActiveInferenceExplorer:
         "exit",
         "format",
         "erase",
+        "submit",
+        "confirm",
+        "purchase",
+        "buy",
+        "sell",
+        "send",
+        "transfer",
+        "wire",
+    }
+    SEARCH_FIELD_KEYWORDS = {
+        "search",
+        "find",
+        "query",
+        "filter",
+        "lookup",
+        "address",
+        "url",
+    }
+    CANVAS_OBJECTIVE_KEYWORDS = {
+        "draw",
+        "paint",
+        "design",
+        "sketch",
+        "annotate",
+        "write",
+        "edit",
+        "compose",
     }
 
     def __init__(self, max_probes: int = 6, random_seed: int | None = None) -> None:
@@ -106,11 +133,39 @@ class ActiveInferenceExplorer:
                 )
                 results.append(result)
                 self._exploration_log.append(result)
-                self._visited_selectors.add(action.selector)
+                self._visited_selectors.add(self._visit_key(action))
             except Exception:
-                self._visited_selectors.add(action.selector)
+                self._visited_selectors.add(self._visit_key(action))
                 continue
         return results
+
+    def suggest_action(
+        self,
+        nodes: list[UiNode],
+        objective: str,
+        success_patterns: list[dict[str, Any]] | None = None,
+    ) -> UiAction | None:
+        """Return the best grounded primitive for the current UI.
+
+        Unlike `explore`, this is a single-step proposal used by the main
+        agent loop before it falls back to abstract planning.
+        """
+        candidates = self._rank_candidates(
+            nodes,
+            objective,
+            success_patterns=success_patterns,
+        )
+        for candidate in candidates:
+            if candidate.safety_score < 0.35:
+                continue
+            candidate.action.metadata.setdefault("source", "active_inference_grounding")
+            candidate.action.metadata.setdefault(
+                "expected_observation",
+                "This grounded primitive should reveal a new affordance or advance the task.",
+            )
+            candidate.action.metadata.setdefault("rationale", candidate.rationale)
+            return candidate.action
+        return None
 
     def _choose_probe(
         self,
@@ -120,7 +175,9 @@ class ActiveInferenceExplorer:
         """Select the next exploratory action using expected info gain."""
         candidates = self._rank_candidates(nodes, objective)
         for candidate in candidates:
-            if candidate.action.selector not in self._visited_selectors:
+            if candidate.safety_score < 0.35:
+                continue
+            if self._visit_key(candidate.action) not in self._visited_selectors:
                 return candidate.action
         return None
 
@@ -128,6 +185,7 @@ class ActiveInferenceExplorer:
         self,
         nodes: list[UiNode],
         objective: str,
+        success_patterns: list[dict[str, Any]] | None = None,
     ) -> list[ExplorationAction]:
         """Rank UI nodes by expected exploration value."""
         actions: list[ExplorationAction] = []
@@ -136,32 +194,56 @@ class ActiveInferenceExplorer:
             if not node.enabled:
                 continue
             selector = self._selector_for_node(node)
-            if selector in self._visited_selectors:
-                continue
-            # Compute safety
-            safety = self._safety_score(node)
-            # Compute expected info gain
-            info_gain = self._expected_info_gain(node, lower_obj)
-            action = UiAction(
-                action_type="click",
-                selector=selector,
-                value=None,
-                metadata={"exploration": True, "role": node.role},
-            )
-            actions.append(
-                ExplorationAction(
-                    action=action,
-                    expected_info_gain=info_gain,
-                    safety_score=safety,
-                    rationale=f"Probe {node.role} '{node.name}' (safety={safety:.2f}, info_gain={info_gain:.2f})",
+            for action_type, value, rationale_hint in self._candidate_actions_for_node(
+                node,
+                lower_obj,
+            ):
+                action = UiAction(
+                    action_type=action_type,
+                    selector=selector,
+                    value=value,
+                    metadata={
+                        "exploration": True,
+                        "role": node.role,
+                        "node_id": node.node_id,
+                    },
                 )
-            )
+                if self._visit_key(action) in self._visited_selectors:
+                    continue
+                safety = self._safety_score(node, action_type=action_type, value=value)
+                if safety <= 0.0:
+                    continue
+                info_gain = self._expected_info_gain(
+                    node,
+                    lower_obj,
+                    action_type=action_type,
+                ) + self._success_pattern_bonus(
+                    selector,
+                    node,
+                    action_type,
+                    success_patterns,
+                )
+                actions.append(
+                    ExplorationAction(
+                        action=action,
+                        expected_info_gain=min(1.0, info_gain),
+                        safety_score=safety,
+                        rationale=(
+                            f"{action_type} {node.role} '{node.name}' via {rationale_hint} "
+                            f"(safety={safety:.2f}, info_gain={min(1.0, info_gain):.2f})"
+                        ),
+                    )
+                )
         # Sort by expected free energy reduction = info_gain * safety
         actions.sort(key=lambda a: a.expected_info_gain * a.safety_score, reverse=True)
         return actions
 
     @staticmethod
-    def _safety_score(node: UiNode) -> float:
+    def _safety_score(
+        node: UiNode,
+        action_type: str = "click",
+        value: str | None = None,
+    ) -> float:
         """Score how safe it is to interact with this node."""
         name_lower = node.name.lower()
         role = node.role.lower()
@@ -169,14 +251,31 @@ class ActiveInferenceExplorer:
         for kw in ActiveInferenceExplorer.DESTRUCTIVE_KEYWORDS:
             if kw in name_lower:
                 score -= 0.4
+        if action_type == "focus":
+            score += 0.05
+        if action_type == "type":
+            if any(kw in name_lower for kw in {"password", "passcode", "secret"}):
+                return 0.0
+            if any(
+                kw in name_lower for kw in ActiveInferenceExplorer.SEARCH_FIELD_KEYWORDS
+            ):
+                score -= 0.05
+            else:
+                score -= 0.25
+        if value and len(value) > 60:
+            score -= 0.1
         if role in {"button", "menuitem", "hyperlink"}:
             score += 0.1
-        if role in {"edit", "document", "canvas"}:
+        if role in {"edit", "document", "canvas"} and action_type == "click":
             score -= 0.1  # May edit content unintentionally
         return max(0.0, min(1.0, score))
 
     @staticmethod
-    def _expected_info_gain(node: UiNode, lower_obj: str) -> float:
+    def _expected_info_gain(
+        node: UiNode,
+        lower_obj: str,
+        action_type: str = "click",
+    ) -> float:
         """Estimate information gain from interacting with this node."""
         score = 0.5
         name = node.name.lower()
@@ -184,14 +283,115 @@ class ActiveInferenceExplorer:
         # Prefer interactive controls
         if role in {"button", "menu", "menuitem", "hyperlink", "tab"}:
             score += 0.3
+        if action_type == "focus" and role in {"edit", "document", "canvas", "pane"}:
+            score += 0.2
+        if action_type == "type" and any(
+            kw in name for kw in ActiveInferenceExplorer.SEARCH_FIELD_KEYWORDS
+        ):
+            score += 0.45
         # Prefer nodes whose name matches the objective
-        for token in lower_obj.split():
+        for token in set(lower_obj.split()):
             if token and token in name:
                 score += 0.2
         # Prefer previously unvisited roles
         if role in {"combobox", "splitbutton", "toolbar"}:
             score += 0.15
         return min(1.0, score)
+
+    def _candidate_actions_for_node(
+        self,
+        node: UiNode,
+        lower_obj: str,
+    ) -> list[tuple[str, str | None, str]]:
+        role = node.role.lower()
+        name_lower = node.name.lower()
+        if role in {"edit", "combobox"}:
+            candidates: list[tuple[str, str | None, str]] = [
+                ("focus", None, "focus editable control"),
+            ]
+            if self._is_search_like(name_lower, lower_obj):
+                candidates.insert(
+                    0,
+                    (
+                        "type",
+                        self._probe_text(lower_obj),
+                        "type into search-like field",
+                    ),
+                )
+            return candidates
+        if role in {"document", "canvas"}:
+            candidates = [("focus", None, "focus workspace surface")]
+            if any(kw in lower_obj for kw in self.CANVAS_OBJECTIVE_KEYWORDS):
+                candidates.append(("click", None, "enter primary workspace"))
+            return candidates
+        if role in {
+            "button",
+            "menu",
+            "menuitem",
+            "hyperlink",
+            "tab",
+            "listitem",
+            "treeitem",
+            "toolbar",
+        }:
+            return [("click", None, "activate control")]
+        return [("focus", None, "inspect control")]
+
+    @staticmethod
+    def _is_search_like(name_lower: str, lower_obj: str) -> bool:
+        if any(
+            kw in name_lower for kw in ActiveInferenceExplorer.SEARCH_FIELD_KEYWORDS
+        ):
+            return True
+        return any(kw in lower_obj for kw in {"search", "find", "query", "lookup"})
+
+    @staticmethod
+    def _probe_text(lower_obj: str) -> str:
+        stop_words = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "into",
+            "from",
+            "that",
+            "this",
+            "application",
+            "app",
+        }
+        tokens = [
+            token
+            for token in lower_obj.split()
+            if len(token) > 2 and token not in stop_words
+        ]
+        if not tokens:
+            return "help"
+        return " ".join(tokens[:4])[:48]
+
+    @staticmethod
+    def _success_pattern_bonus(
+        selector: str,
+        node: UiNode,
+        action_type: str,
+        success_patterns: list[dict[str, Any]] | None,
+    ) -> float:
+        if not success_patterns:
+            return 0.0
+        selector_lower = selector.lower()
+        node_name = node.name.lower()
+        bonus = 0.0
+        for event in success_patterns:
+            past_action = event.get("action")
+            if not isinstance(past_action, UiAction):
+                continue
+            past_selector = str(past_action.selector or "").lower()
+            if past_action.action_type == action_type:
+                bonus += 0.03
+            if node_name and node_name in past_selector:
+                bonus += 0.05
+            if selector_lower and selector_lower == past_selector:
+                bonus += 0.07
+        return min(0.2, bonus)
 
     @staticmethod
     def _state_hash(nodes: list[UiNode]) -> str:
@@ -246,11 +446,15 @@ class ActiveInferenceExplorer:
             return f"name={node.name}"
         return node.node_id
 
+    @staticmethod
+    def _visit_key(action: UiAction) -> str:
+        return f"{action.action_type}:{action.selector}"
+
     def get_affordance_map(self) -> dict[str, dict[str, Any]]:
         """Return a map of explored selectors to their observed effects."""
         mapping: dict[str, dict[str, Any]] = {}
         for result in self._exploration_log:
-            mapping[result.action.selector] = {
+            mapping[self._visit_key(result.action)] = {
                 "info_gain": result.info_gain,
                 "safe": result.safe,
                 "deltas": result.state_delta,

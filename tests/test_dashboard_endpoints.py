@@ -130,6 +130,43 @@ class DashboardEndpointsTests(unittest.TestCase):
                 replay = api.post("/benchmarks/replay", json={}).json()
                 self.assertTrue(replay["passed"])
 
+                eval_pack = api.get("/benchmarks/eval-pack").json()
+                self.assertEqual(eval_pack["task_count"], 100)
+
+                live_fire = api.post(
+                    "/benchmarks/live-fire-eval",
+                    json={
+                        "backend": "virtual-desktop-sandbox",
+                        "max_tasks": 2,
+                        "windows_safe_pack": True,
+                        "repeat": 2,
+                        "promote_failures": False,
+                    },
+                ).json()
+                self.assertEqual(live_fire["task_count"], 4)
+                self.assertIn("replay_debug", live_fire)
+                self.assertIn("training_summary", live_fire)
+                self.assertIn("milestone", live_fire)
+
+                review = api.get("/benchmarks/live-fire-review").json()
+                self.assertIn("runs", review)
+                self.assertIn("failed_tasks", review)
+                self.assertIn("milestone", review)
+
+                shadow = api.post(
+                    "/benchmarks/live-fire-shadow-training",
+                    json={"trajectory_paths": live_fire["trajectory_paths"]},
+                ).json()
+                self.assertTrue(shadow["advisory_only"])
+                self.assertEqual(
+                    shadow["head_order"],
+                    ["outcome_critic", "option_policy", "affordance_ranker"],
+                )
+                self.assertTrue(shadow["ready_for_shadow_training"])
+
+                debug = api.post("/debug/replay", json={}).json()
+                self.assertIn("runs", debug)
+
                 policy = api.post(
                     "/policy/inspect",
                     json={

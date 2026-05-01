@@ -1,0 +1,541 @@
+{
+  "trace_id": "live_fire_terminal_03_fill_form_925e0d0f6c",
+  "name": "Live-fire eval failure: terminal_03_fill_form",
+  "scope": "universal OS live-fire eval",
+  "objective": "Prevent regression for terminal_03_fill_form.",
+  "failure_modes": [
+    "typed value was not observed"
+  ],
+  "steps": [
+    {
+      "kind": "live_fire.execute",
+      "expect": "Task is run safely."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "Failure is recorded."
+    },
+    {
+      "kind": "debug.replay",
+      "expect": "Replay explains failure."
+    },
+    {
+      "kind": "shadow.train",
+      "expect": "Trajectory trains heads."
+    }
+  ],
+  "expectations": [
+    "The failure remains reproducible from the live-fire trace.",
+    "A future run either verifies the task or records a repair."
+  ],
+  "metadata": {
+    "run_id": "windows_uia_safe_pack_20260430_post_reground",
+    "surface": "terminal",
+    "intent": "fill_form",
+    "trajectory_path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_terminal_03_fill_form.jsonl"
+  },
+  "replay_debug": {
+    "run_count": 1,
+    "runs": [
+      {
+        "path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_terminal_03_fill_form.jsonl",
+        "run_id": "windows_uia_safe_pack_20260430_post_reground_terminal_03_fill_form",
+        "objective": "On a terminal surface, fill form and verify the result.",
+        "step_count": 2,
+        "success": false,
+        "steps": [
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "terminal",
+                "element_count": 949,
+                "element_types": {
+                  "button": 300,
+                  "image": 108,
+                  "panel": 470,
+                  "tab": 38,
+                  "text_field": 33
+                },
+                "focus_region": "main",
+                "interactive_count": 407,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "terminal",
+                "element_count": 965,
+                "element_types": {
+                  "button": 305,
+                  "image": 109,
+                  "panel": 478,
+                  "tab": 40,
+                  "text_field": 33
+                },
+                "focus_region": "main",
+                "interactive_count": 415,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 965,
+                  "before": 949
+                },
+                "element_types": {
+                  "after": {
+                    "button": 305,
+                    "image": 109,
+                    "panel": 478,
+                    "tab": 40,
+                    "text_field": 33
+                  },
+                  "before": {
+                    "button": 300,
+                    "image": 108,
+                    "panel": 470,
+                    "tab": 38,
+                    "text_field": 33
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.76,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "prompt",
+                    "stdout",
+                    "current directory",
+                    "exit code"
+                  ],
+                  "family": "terminal",
+                  "preferred_channels": [
+                    "api",
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "repair_recipes": [
+                    "prefer tool executor",
+                    "read prompt before typing",
+                    "capture exit code"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "receipt_success",
+                    "process_launched",
+                    "clipboard_contains"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.977,
+                  "app_family": "terminal",
+                  "app_signature": "terminal:80585366dbbc",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.811,
+                  "confidence": 0.898,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "api",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.75,
+                  "evidence": {
+                    "app_context": "terminal",
+                    "element_count": 949,
+                    "interactive_count": 407,
+                    "layout_mode": "full",
+                    "node_count": 949,
+                    "sample_names": [
+                      "QA OSD",
+                      "Running applications",
+                      "Widgets 28\u00f8C Partly cloudy",
+                      "27\u00f8C",
+                      "Partly cloudy",
+                      "28\u00f8C",
+                      "Partly cloudy",
+                      "Start"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "tool",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "tool",
+              "rationale": "Terminal-like surface should prefer structured tool execution.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.977,
+              "app_family": "terminal",
+              "app_signature": "terminal:80585366dbbc",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.811,
+              "confidence": 0.898,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "api",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "terminal",
+                "element_count": 949,
+                "interactive_count": 407,
+                "layout_mode": "full",
+                "node_count": 949,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "tool",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "prompt",
+                "stdout",
+                "current directory",
+                "exit code"
+              ],
+              "family": "terminal",
+              "preferred_channels": [
+                "api",
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "repair_recipes": [
+                "prefer tool executor",
+                "read prompt before typing",
+                "capture exit code"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "receipt_success",
+                "process_launched",
+                "clipboard_contains"
+              ]
+            },
+            "action": {
+              "action_type": "launch_app",
+              "selector": "powershell.exe",
+              "value": "powershell.exe",
+              "control_channel": "api"
+            },
+            "expected_observation": "terminal surface launches.",
+            "verification_contract": {
+              "expected": "terminal surface launches.",
+              "kind": "process_launched",
+              "metadata": {
+                "action_type": "launch_app",
+                "selector": "powershell.exe"
+              },
+              "path": "",
+              "required": true,
+              "target": "",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": ""
+              },
+              "expected": "terminal surface launches.",
+              "kind": "process_launched",
+              "matched": true,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"powershell.exe\", \"process_id\": 40816, \"selector\": \"powershell.exe\", \"status\": \"launched\"}",
+              "reason": "",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"launch_app\", \"launched\": \"powershell.exe\", \"process_id\": 40816, \"selector\": \"powershell.exe\", \"status\": \"launched\"}",
+            "outcome": {
+              "expected": "terminal surface launches.",
+              "failure_reason": null,
+              "matched": true,
+              "new_blocker": null,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"powershell.exe\", \"process_id\": 40816, \"selector\": \"powershell.exe\", \"status\": \"launched\"}",
+              "suggested_repair": null
+            },
+            "blocker": null,
+            "repair": null,
+            "latency_ms": 1945.751
+          },
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "terminal",
+                "element_count": 965,
+                "element_types": {
+                  "button": 305,
+                  "image": 109,
+                  "panel": 478,
+                  "tab": 40,
+                  "text_field": 33
+                },
+                "focus_region": "main",
+                "interactive_count": 415,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "terminal",
+                "element_count": 965,
+                "element_types": {
+                  "button": 305,
+                  "image": 109,
+                  "panel": 478,
+                  "tab": 40,
+                  "text_field": 33
+                },
+                "focus_region": "main",
+                "interactive_count": 415,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {}
+            },
+            "chosen_mode": {
+              "confidence": 0.76,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "prompt",
+                    "stdout",
+                    "current directory",
+                    "exit code"
+                  ],
+                  "family": "terminal",
+                  "preferred_channels": [
+                    "api",
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "repair_recipes": [
+                    "prefer tool executor",
+                    "read prompt before typing",
+                    "capture exit code"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "receipt_success",
+                    "process_launched",
+                    "clipboard_contains"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.977,
+                  "app_family": "terminal",
+                  "app_signature": "terminal:80585366dbbc",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.811,
+                  "confidence": 0.898,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "api",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.75,
+                  "evidence": {
+                    "app_context": "terminal",
+                    "element_count": 965,
+                    "interactive_count": 415,
+                    "layout_mode": "full",
+                    "node_count": 965,
+                    "sample_names": [
+                      "QA OSD",
+                      "Running applications",
+                      "Widgets 28\u00f8C Partly cloudy",
+                      "27\u00f8C",
+                      "Partly cloudy",
+                      "28\u00f8C",
+                      "Partly cloudy",
+                      "Start"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "tool",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "tool",
+              "rationale": "Terminal-like surface should prefer structured tool execution.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.977,
+              "app_family": "terminal",
+              "app_signature": "terminal:80585366dbbc",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.811,
+              "confidence": 0.898,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "api",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "terminal",
+                "element_count": 965,
+                "interactive_count": 415,
+                "layout_mode": "full",
+                "node_count": 965,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "tool",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "prompt",
+                "stdout",
+                "current directory",
+                "exit code"
+              ],
+              "family": "terminal",
+              "preferred_channels": [
+                "api",
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "repair_recipes": [
+                "prefer tool executor",
+                "read prompt before typing",
+                "capture exit code"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "receipt_success",
+                "process_launched",
+                "clipboard_contains"
+              ]
+            },
+            "action": {
+              "action_type": "set_text",
+              "selector": "name=Terminal - 3 running windows",
+              "value": "AgentOS live-fire value",
+              "control_channel": "api"
+            },
+            "expected_observation": "The target field contains the live-fire value.",
+            "verification_contract": {
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "metadata": {
+                "action_type": "set_text",
+                "regrounded": true,
+                "selector": "name=Terminal - 3 running windows"
+              },
+              "path": "",
+              "required": true,
+              "target": "name=Terminal - 3 running windows",
+              "value": "AgentOS live-fire value"
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": "name=Terminal - 3 running windows"
+              },
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "matched": false,
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer - 6 running windows pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 7 running windows visual studio code - 1 running window terminal - 3 running windows show hidden icons  onedrive - personal\r\nup to date  tray input indicator e",
+              "reason": "typed value was not observed",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"set_text\", \"draw_path\": null, \"focus_error\": null, \"matched_name\": \"Terminal - 3 running windows\", \"matched_role\": \"ControlType.Button\", \"selector\": \"name=Terminal - 3 running windows\", \"status\": \"typed\"}",
+            "outcome": {
+              "expected": "The target field contains the live-fire value.",
+              "failure_reason": "typed value was not observed",
+              "matched": false,
+              "new_blocker": "typed value was not observed",
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer - 6 running windows pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 7 running windows visual studio code - 1 running window terminal - 3 running windows show hidden icons  onedrive - personal\r\nup to date  tray input indicator e",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "blocker": {
+              "new_blocker": "typed value was not observed",
+              "failure_reason": "typed value was not observed",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "repair": null,
+            "latency_ms": 3252.78
+          }
+        ],
+        "final_state": {
+          "failure_reason": "typed value was not observed",
+          "success": false,
+          "task_id": "terminal_03_fill_form"
+        }
+      }
+    ],
+    "schema_version": 1
+  }
+}

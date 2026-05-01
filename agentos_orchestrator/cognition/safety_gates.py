@@ -12,7 +12,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from agentos_orchestrator.os_control.base import UiAction
 
@@ -93,7 +92,9 @@ class FormalSafetyVerifier:
         objective: str = "",
         approval_token: str | None = None,
     ) -> SafetyDecision:
-        return self.verify_plan([action], objective=objective, approval_token=approval_token)
+        return self.verify_plan(
+            [action], objective=objective, approval_token=approval_token
+        )
 
     def verify_plan(
         self,
@@ -101,6 +102,7 @@ class FormalSafetyVerifier:
         objective: str = "",
         approval_token: str | None = None,
     ) -> SafetyDecision:
+        del objective
         violations: list[SafetyViolation] = []
         if len(actions) > self.policy.max_actions_per_plan:
             violations.append(
@@ -117,7 +119,9 @@ class FormalSafetyVerifier:
             violations.extend(self._check_network_tool(action, index))
 
         solver = "z3" if self._z3_can_prove(len(violations) == 0) else "deterministic"
-        return SafetyDecision(allowed=not violations, violations=violations, solver=solver)
+        return SafetyDecision(
+            allowed=not violations, violations=violations, solver=solver
+        )
 
     def _check_destructive(
         self,
@@ -127,12 +131,24 @@ class FormalSafetyVerifier:
     ) -> list[SafetyViolation]:
         haystack = " ".join(
             str(part).lower()
-            for part in [action.action_type, action.selector, action.value, action.metadata]
+            for part in [
+                action.action_type,
+                action.selector,
+                action.value,
+                action.metadata,
+            ]
             if part is not None
         )
-        destructive = any(keyword in haystack for keyword in self.policy.destructive_keywords)
-        high_stakes_action = action.action_type.lower() in self.policy.high_stakes_actions
-        if (destructive or high_stakes_action) and self.policy.require_approval_for_destructive:
+        destructive = any(
+            _keyword_matches_haystack(keyword, haystack)
+            for keyword in self.policy.destructive_keywords
+        )
+        high_stakes_action = (
+            action.action_type.lower() in self.policy.high_stakes_actions
+        )
+        if (
+            destructive or high_stakes_action
+        ) and self.policy.require_approval_for_destructive:
             if not approval_token:
                 return [
                     SafetyViolation(
@@ -163,7 +179,9 @@ class FormalSafetyVerifier:
                 )
         return violations
 
-    def _check_shell_like_payloads(self, action: UiAction, index: int) -> list[SafetyViolation]:
+    def _check_shell_like_payloads(
+        self, action: UiAction, index: int
+    ) -> list[SafetyViolation]:
         payload = " ".join(
             str(action.metadata.get(key, ""))
             for key in {"command", "script", "powershell", "shell"}
@@ -190,7 +208,9 @@ class FormalSafetyVerifier:
                 ]
         return []
 
-    def _check_network_tool(self, action: UiAction, index: int) -> list[SafetyViolation]:
+    def _check_network_tool(
+        self, action: UiAction, index: int
+    ) -> list[SafetyViolation]:
         if self.policy.allow_network_tools:
             return []
         if action.metadata.get("allow_network") is True:
@@ -238,7 +258,7 @@ class FormalSafetyVerifier:
         """Use Z3 when installed; otherwise deterministic checks are authoritative."""
         try:
             import z3  # type: ignore[import-not-found]
-        except Exception:
+        except ImportError:
             return False
         allowed = z3.Bool("plan_allowed")
         solver = z3.Solver()
@@ -250,3 +270,11 @@ def default_safety_verifier(workspace_root: str | Path) -> FormalSafetyVerifier:
     return FormalSafetyVerifier(
         SafetyPolicy(allowed_roots=[Path(workspace_root).resolve(strict=False)])
     )
+
+
+def _keyword_matches_haystack(keyword: str, haystack: str) -> bool:
+    normalized = keyword.strip().lower()
+    if not normalized:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(normalized)}(?![A-Za-z0-9])"
+    return re.search(pattern, haystack) is not None

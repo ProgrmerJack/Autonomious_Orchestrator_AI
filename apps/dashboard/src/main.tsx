@@ -2,8 +2,10 @@ import React, { FormEvent, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
     Activity,
+    AlertTriangle,
     Check,
     ClipboardList,
+    Database,
     Eye,
     FileText,
     Gauge,
@@ -27,7 +29,7 @@ const API_BASE =
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
 type JsonMap = Record<string, unknown>;
-type View = 'research' | 'pc' | 'approvals' | 'runs' | 'events' | 'channels' | 'system';
+type View = 'research' | 'pc' | 'approvals' | 'runs' | 'events' | 'channels' | 'live-fire' | 'system';
 
 type Approval = {
     approval_id: string;
@@ -197,6 +199,58 @@ type ChannelDelivery = {
     status: string;
 };
 
+type LiveFireFailure = {
+    run_id: string;
+    task_id: string;
+    surface: string;
+    intent: string;
+    classification: string;
+    durable: boolean;
+    promotable: boolean;
+    failure_reason: string;
+    replay_payload: JsonMap;
+    existing_golden_trace?: string;
+};
+
+type LiveFireRunReview = {
+    run_id: string;
+    backend: string;
+    success: boolean;
+    passed: number;
+    failed: number;
+    task_count: number;
+    created_at: number;
+    failures: LiveFireFailure[];
+};
+
+type LiveFireReviewPayload = {
+    runs: LiveFireRunReview[];
+    failed_tasks: LiveFireFailure[];
+    milestone: {
+        real_windows_task_target: number;
+        durable_failure_target: number;
+        real_windows_tasks: number;
+        durable_promoted_failures: number;
+        unsafe_action_blocks: number;
+        ready_to_widen_scope: boolean;
+    };
+    triage_classes: string[];
+};
+
+type ShadowTrainingSummary = {
+    advisory_only: boolean;
+    ready_for_shadow_training: boolean;
+    head_order: string[];
+    total_examples: number;
+    heads: Record<string, {
+        path: string;
+        examples: number;
+        ready: boolean;
+        advisory_only: boolean;
+    }>;
+    source_paths?: string[];
+};
+
 async function fetchJson<T>(path: string, options?: RequestInit): Promise<T> {
     const response = await fetch(`${API_BASE}${path}`, options);
     if (!response.ok) {
@@ -262,6 +316,10 @@ function App() {
     const [deliveries, setDeliveries] = useState<ChannelDelivery[]>([]);
     const [goldenTraces, setGoldenTraces] = useState<JsonMap | null>(null);
     const [benchmarkReplay, setBenchmarkReplay] = useState<JsonMap | null>(null);
+    const [liveFireReview, setLiveFireReview] = useState<LiveFireReviewPayload | null>(null);
+    const [selectedLiveFireFailure, setSelectedLiveFireFailure] = useState<LiveFireFailure | null>(null);
+    const [liveFireStatus, setLiveFireStatus] = useState('idle');
+    const [shadowTraining, setShadowTraining] = useState<ShadowTrainingSummary | null>(null);
 
     const visibleEvents = useMemo(() => events.slice(0, 80), [events]);
     const backendAvailable = system?.pc_backends.find(
@@ -306,6 +364,12 @@ function App() {
             setActiveJobId(null);
         }
     }, [activeJobId, jobs]);
+
+    useEffect(() => {
+        if (view === 'live-fire') {
+            void loadLiveFireReview();
+        }
+    }, [view]);
 
     async function refreshAll() {
         try {
@@ -444,6 +508,69 @@ function App() {
         await refreshAll();
     }
 
+    async function loadLiveFireReview() {
+        const payload = await fetchJson<LiveFireReviewPayload>(
+            '/benchmarks/live-fire-review?limit=12'
+        );
+        setLiveFireReview(payload);
+        if (!selectedLiveFireFailure && payload.failed_tasks.length > 0) {
+            setSelectedLiveFireFailure(payload.failed_tasks[0]);
+        }
+    }
+
+    async function runSafeLiveFire() {
+        setLiveFireStatus('running safe Windows matrix');
+        const payload = await fetchJson<JsonMap>('/benchmarks/live-fire-eval', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                backend: 'windows-uia',
+                windows_safe_pack: true,
+                max_tasks: 10,
+                repeat: 1,
+                promote_after: 2,
+                replay_limit: 25
+            })
+        });
+        setLiveFireStatus(String(payload.status || payload.run_id || 'complete'));
+        await loadLiveFireReview();
+        await refreshAll();
+    }
+
+    async function promoteSelectedFailure() {
+        if (!selectedLiveFireFailure) {
+            return;
+        }
+        setLiveFireStatus('promoting failure');
+        const payload = await fetchJson<JsonMap>('/benchmarks/live-fire-review/promote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                run_id: selectedLiveFireFailure.run_id,
+                task_id: selectedLiveFireFailure.task_id
+            })
+        });
+        setLiveFireStatus(String(payload.status || 'review updated'));
+        await loadLiveFireReview();
+        await refreshAll();
+    }
+
+    async function runShadowTraining() {
+        setLiveFireStatus('writing advisory heads');
+        const payload = await fetchJson<ShadowTrainingSummary>(
+            '/benchmarks/live-fire-shadow-training',
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            }
+        );
+        setShadowTraining(payload);
+        setLiveFireStatus(
+            payload.ready_for_shadow_training ? 'shadow heads ready' : 'shadow heads incomplete'
+        );
+    }
+
     async function runPcAction(
         approvalToken?: string,
         override?: { backend: string; selector: string; action: string }
@@ -556,6 +683,9 @@ function App() {
                 </button>
                 <button className={view === 'channels' ? 'active' : ''} onClick={() => setView('channels')}>
                     <MessageSquare size={16} /> Channels
+                </button>
+                <button className={view === 'live-fire' ? 'active' : ''} onClick={() => setView('live-fire')}>
+                    <AlertTriangle size={16} /> Live Fire
                 </button>
                 <button className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>
                     <Settings size={16} /> System
@@ -848,6 +978,115 @@ function App() {
                             </article>
                         ))}
                         {channelResponse && <pre>{JSON.stringify(channelResponse, null, 2)}</pre>}
+                    </div>
+                </section>
+            )}
+
+            {view === 'live-fire' && (
+                <section className="layout two-col live-fire-view">
+                    <div className="panel">
+                        <h2><AlertTriangle size={18} /> Live-Fire Review</h2>
+                        <div className="actions live-fire-actions">
+                            <button type="button" onClick={runSafeLiveFire} title="Run safe Windows UIA matrix">
+                                <Play size={16} /> Safe Windows run
+                            </button>
+                            <button type="button" className="secondary" onClick={loadLiveFireReview} title="Refresh live-fire review">
+                                <RefreshCw size={16} /> Refresh
+                            </button>
+                            <button type="button" className="secondary" onClick={runShadowTraining} title="Write advisory shadow-training heads">
+                                <Database size={16} /> Shadow train
+                            </button>
+                        </div>
+                        <p className="muted">{liveFireStatus}</p>
+                        {liveFireReview && (
+                            <div className="milestone-grid">
+                                <div>
+                                    <strong>{liveFireReview.milestone.real_windows_tasks}/{liveFireReview.milestone.real_windows_task_target}</strong>
+                                    <span>Windows tasks</span>
+                                </div>
+                                <div>
+                                    <strong>{liveFireReview.milestone.durable_promoted_failures}/{liveFireReview.milestone.durable_failure_target}</strong>
+                                    <span>Golden failures</span>
+                                </div>
+                                <div>
+                                    <strong>{liveFireReview.milestone.unsafe_action_blocks}</strong>
+                                    <span>Unsafe blocks</span>
+                                </div>
+                            </div>
+                        )}
+                        <h3>Recent Runs</h3>
+                        {!liveFireReview && <p className="muted">No live-fire review loaded</p>}
+                        {liveFireReview?.runs.map((run) => (
+                            <article className="row" key={run.run_id}>
+                                <div>
+                                    <strong>{run.run_id}</strong>
+                                    <p>{run.backend} · {run.passed}/{run.task_count} passed</p>
+                                    <span>{run.failed} failed</span>
+                                </div>
+                                <span className={run.success ? 'pill pass' : 'pill fail'}>
+                                    {run.success ? 'pass' : 'review'}
+                                </span>
+                            </article>
+                        ))}
+                        <h3>Failed Tasks</h3>
+                        <div className="failure-list">
+                            {liveFireReview?.failed_tasks.length === 0 && <p className="muted">No failed tasks in recent runs</p>}
+                            {liveFireReview?.failed_tasks.map((failure) => (
+                                <button
+                                    type="button"
+                                    className={selectedLiveFireFailure?.task_id === failure.task_id ? 'failure-item active' : 'failure-item'}
+                                    key={`${failure.run_id}-${failure.task_id}`}
+                                    onClick={() => setSelectedLiveFireFailure(failure)}
+                                    title="Inspect replay payload"
+                                >
+                                    <span>{failure.classification}</span>
+                                    <strong>{failure.task_id}</strong>
+                                    <small>{failure.surface} / {failure.intent}</small>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="panel">
+                        <h2><Eye size={18} /> Replay Payload</h2>
+                        {!selectedLiveFireFailure && <p className="muted">Select a failed task</p>}
+                        {selectedLiveFireFailure && (
+                            <>
+                                <article className="row">
+                                    <div>
+                                        <strong>{selectedLiveFireFailure.classification}</strong>
+                                        <p>{selectedLiveFireFailure.failure_reason}</p>
+                                        <span>{selectedLiveFireFailure.run_id}</span>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={!selectedLiveFireFailure.promotable}
+                                        onClick={promoteSelectedFailure}
+                                        title="Promote durable failure to golden trace"
+                                    >
+                                        <Check size={16} /> Promote
+                                    </button>
+                                </article>
+                                <pre>{JSON.stringify(selectedLiveFireFailure.replay_payload, null, 2)}</pre>
+                            </>
+                        )}
+                        {shadowTraining && (
+                            <>
+                                <h3>Shadow Heads</h3>
+                                <div className="shadow-heads">
+                                    {shadowTraining.head_order.map((head) => (
+                                        <article className="row" key={head}>
+                                            <div>
+                                                <strong>{head}</strong>
+                                                <p>{shadowTraining.heads[head]?.path}</p>
+                                            </div>
+                                            <span className={shadowTraining.heads[head]?.ready ? 'pill pass' : 'pill'}>
+                                                {shadowTraining.heads[head]?.examples || 0}
+                                            </span>
+                                        </article>
+                                    ))}
+                                </div>
+                            </>
+                        )}
                     </div>
                 </section>
             )}

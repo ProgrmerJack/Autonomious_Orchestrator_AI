@@ -10,8 +10,10 @@ Target loop time: <100ms per screenshot → action.
 from __future__ import annotations
 
 import io
+import pickle
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -151,16 +153,21 @@ class LocalFastVLA:
         "checkbox",
         "unknown",
     ]
+    FEEDBACK_SEARCH_WINDOW = 1024
+    FEEDBACK_MAX_DETECTION_SIDE = 768
 
     def __init__(self, model_path: str | None = None) -> None:
         self.classifier: RandomForestClassifier | None = None
         self._training_features: list[list[float]] = []
         self._training_labels: list[str] = []
+        self._pending_feedback_samples = 0
         self._model_path = model_path
         self._inference_count = 0
         # Semantic embedder for objective-matching (fixes visual illiteracy)
         self._embedder = SemanticEmbedder(n_components=64)
         self._init_classifier()
+        if self._model_path:
+            self.load_model(self._model_path)
 
     def _init_classifier(self) -> None:
         """Initialize with a default classifier (will improve with feedback)."""
@@ -168,7 +175,7 @@ class LocalFastVLA:
             n_estimators=50,
             max_depth=10,
             random_state=42,
-            n_jobs=1,
+            n_jobs=-1,
         )
         # Bootstrap with synthetic data so it can predict from day one
         X, y = self._bootstrap_training_data()
@@ -283,26 +290,192 @@ class LocalFastVLA:
         x: int,
         y: int,
         correct_type: str,
+        *,
+        fit_now: bool = True,
+        fit_every: int = 128,
+        min_samples_before_fit: int = 10,
     ) -> None:
         """Online learning: user/agent corrects a misclassification."""
+        if not self.collect_feedback(screenshot_bytes, x, y, correct_type):
+            return
+        if (
+            fit_now
+            and self._pending_feedback_samples >= max(1, fit_every)
+            and len(self._training_features) >= max(1, min_samples_before_fit)
+        ):
+            self.fit_feedback_classifier(min_samples=min_samples_before_fit)
+
+    def collect_feedback(
+        self,
+        screenshot_bytes: bytes,
+        x: int,
+        y: int,
+        correct_type: str,
+    ) -> bool:
+        """Collect a labeled affordance sample without retraining immediately."""
+        closest = self._feedback_element_for_coordinates(screenshot_bytes, x, y)
+        if closest is None:
+            return False
+        self._training_features.append(self._extract_features(closest))
+        self._training_labels.append(correct_type)
+        self._pending_feedback_samples += 1
+        return True
+
+    def fit_feedback_classifier(self, *, min_samples: int = 10) -> bool:
+        """Fit the classifier once on the accumulated feedback buffer."""
+        if self.classifier is None:
+            return False
+        if len(self._training_features) < max(1, min_samples):
+            return False
+        try:
+            self.classifier.fit(self._training_features, self._training_labels)
+        except Exception:
+            return False
+        self._pending_feedback_samples = 0
+        return True
+
+    def _feedback_element_for_coordinates(
+        self,
+        screenshot_bytes: bytes,
+        x: int,
+        y: int,
+    ) -> DetectedElement | None:
+        """Locate the detected element closest to the corrected coordinates."""
         img = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
         arr = np.array(img)
-        elements = self._detect_by_contours(arr)
-        elements.extend(self._detect_by_msers(arr))
+        region, offset_x, offset_y, scale = self._feedback_detection_region(arr, x, y)
+        elements = self._detect_by_contours(region)
+        elements.extend(self._detect_by_msers(region))
+        elements = [
+            self._restore_feedback_element(element, offset_x, offset_y, scale)
+            for element in elements
+        ]
         elements = self._non_max_suppression(elements)
-        # Find element closest to (x, y)
-        closest = min(
+        if not elements:
+            return self._fallback_feedback_element(arr, x, y)
+        return min(
             elements,
             key=lambda e: (
                 ((e.x + e.width // 2 - x) ** 2 + (e.y + e.height // 2 - y) ** 2) ** 0.5
             ),
         )
-        features = self._extract_features(closest)
-        self._training_features.append(features)
-        self._training_labels.append(correct_type)
-        # Retrain every 10 feedback samples
-        if len(self._training_features) >= 10 and self.classifier is not None:
-            self.classifier.fit(self._training_features, self._training_labels)
+
+    def _feedback_detection_region(
+        self,
+        arr: np.ndarray,
+        x: int,
+        y: int,
+    ) -> tuple[np.ndarray, int, int, float]:
+        height, width = arr.shape[:2]
+        window = max(64, int(self.FEEDBACK_SEARCH_WINDOW))
+        left = 0
+        top = 0
+        region = arr
+        if width > window or height > window:
+            half_window = window // 2
+            left = max(0, min(width - window, x - half_window))
+            top = max(0, min(height - window, y - half_window))
+            right = min(width, left + window)
+            bottom = min(height, top + window)
+            region = arr[top:bottom, left:right]
+        region, scale = self._resize_feedback_region(region)
+        return region, left, top, scale
+
+    def _resize_feedback_region(
+        self,
+        arr: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        height, width = arr.shape[:2]
+        max_side = max(height, width)
+        target_max_side = max(64, int(self.FEEDBACK_MAX_DETECTION_SIDE))
+        if max_side <= target_max_side:
+            return arr, 1.0
+        scale = max_side / target_max_side
+        new_width = max(1, int(round(width / scale)))
+        new_height = max(1, int(round(height / scale)))
+        resized = Image.fromarray(arr).resize(
+            (new_width, new_height),
+            Image.Resampling.BILINEAR,
+        )
+        return np.array(resized), scale
+
+    @staticmethod
+    def _restore_feedback_element(
+        element: DetectedElement,
+        offset_x: int,
+        offset_y: int,
+        scale: float,
+    ) -> DetectedElement:
+        return DetectedElement(
+            x=offset_x + int(round(element.x * scale)),
+            y=offset_y + int(round(element.y * scale)),
+            width=max(1, int(round(element.width * scale))),
+            height=max(1, int(round(element.height * scale))),
+            aspect_ratio=element.aspect_ratio,
+            solidity=element.solidity,
+            edge_density=element.edge_density,
+            color_variance=element.color_variance,
+            text_like=element.text_like,
+            affordance_type=element.affordance_type,
+            confidence=element.confidence,
+        )
+
+    @staticmethod
+    def _fallback_feedback_element(
+        arr: np.ndarray,
+        x: int,
+        y: int,
+    ) -> DetectedElement:
+        height, width = arr.shape[:2]
+        box_width = max(24, min(width // 8, 160))
+        box_height = max(24, min(height // 12, 96))
+        left = max(0, min(width - box_width, x - box_width // 2))
+        top = max(0, min(height - box_height, y - box_height // 2))
+        roi = arr[top : top + box_height, left : left + box_width]
+        color_variance = float(np.var(roi)) if roi.size else 0.0
+        return DetectedElement(
+            x=left,
+            y=top,
+            width=box_width,
+            height=box_height,
+            aspect_ratio=box_width / max(box_height, 1),
+            solidity=1.0,
+            edge_density=0.0,
+            color_variance=color_variance,
+            text_like=False,
+        )
+
+    def save_model(self, path: str | Path | None = None) -> Path:
+        target = Path(path or self._model_path or ".agentos/local_vla.pkl")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "classifier": self.classifier,
+            "training_features": self._training_features,
+            "training_labels": self._training_labels,
+            "inference_count": self._inference_count,
+        }
+        with target.open("wb") as handle:
+            pickle.dump(payload, handle)
+        return target
+
+    def load_model(self, path: str | Path) -> bool:
+        target = Path(path)
+        if not target.exists():
+            return False
+        try:
+            with target.open("rb") as handle:
+                payload = pickle.load(handle)
+        except (OSError, pickle.PickleError, ValueError, TypeError):
+            return False
+        classifier = payload.get("classifier")
+        if classifier is not None:
+            self.classifier = classifier
+        self._training_features = list(payload.get("training_features") or [])
+        self._training_labels = list(payload.get("training_labels") or [])
+        self._inference_count = int(payload.get("inference_count") or 0)
+        self._pending_feedback_samples = 0
+        self._model_path = str(target)
+        return True
 
     # ------------------------------------------------------------------ #
     # Classical CV detection
@@ -528,14 +701,14 @@ class LocalFastVLA:
 
         # Build an affordance description for each element and embed it
         _AFFORDANCE_DESCS = {
-            "button":    "click button press activate submit confirm",
-            "canvas":    "draw paint sketch illustrate canvas drawing area",
+            "button": "click button press activate submit confirm",
+            "canvas": "draw paint sketch illustrate canvas drawing area",
             "text_field": "type enter write input search text field form",
-            "menu":      "open menu navigate select option dropdown",
-            "icon":      "launch open activate icon visual element",
+            "menu": "open menu navigate select option dropdown",
+            "icon": "launch open activate icon visual element",
             "scrollbar": "scroll move navigate list content",
-            "checkbox":  "toggle check select enable disable",
-            "unknown":   "interact element UI widget",
+            "checkbox": "toggle check select enable disable",
+            "unknown": "interact element UI widget",
         }
         lower_objective = objective.lower()
         for elem in elements:

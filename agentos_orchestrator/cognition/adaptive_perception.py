@@ -496,10 +496,10 @@ class AdaptivePerceptionEngine:
             except (IndexError, ValueError):
                 n = 0
             if n <= 3 and w < 80 and h < 35:
-                return "button"       # Short label, button-sized
+                return "button"  # Short label, button-sized
             if n <= 10 and w < 200 and h < 40:
-                return "button"       # Medium label, still button
-            return "text_block"       # Longer → paragraph/label
+                return "button"  # Medium label, still button
+            return "text_block"  # Longer → paragraph/label
         if aspect > 5 and h < 25:
             return "text_block"
         if aspect > 0.8 and aspect < 1.3 and w > 40 and h > 40:
@@ -524,7 +524,9 @@ class AdaptivePerceptionEngine:
 
         # "input" tag = text field → boost for type/search/enter intents
         if text == "input":
-            if any(kw in obj_lower for kw in ("type", "enter", "write", "search", "fill")):
+            if any(
+                kw in obj_lower for kw in ("type", "enter", "write", "search", "fill")
+            ):
                 boost += 0.35
 
         # Short text glyph count → likely an interactive button/label
@@ -535,7 +537,10 @@ class AdaptivePerceptionEngine:
                 n = 99
             if n <= 10:
                 # Short label = probably an action button
-                if any(kw in obj_lower for kw in ("click", "press", "open", "submit", "save", "close")):
+                if any(
+                    kw in obj_lower
+                    for kw in ("click", "press", "open", "submit", "save", "close")
+                ):
                     boost += 0.25
 
         # "icon" tag → relevant for navigate / launch / toggle actions

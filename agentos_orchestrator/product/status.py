@@ -8,6 +8,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentos_orchestrator.cognition.adaptation_readiness import (
+    collect_adaptation_readiness,
+)
+
 
 @dataclass(slots=True)
 class SetupCheck:
@@ -248,6 +252,11 @@ def benchmark_status(
     readiness = len(passed_required) / max(len(required), 1)
     eval_passed = bool((eval_snapshot or {}).get("passed", True))
     trace_count = _golden_trace_count(workspace_root)
+    adaptation = (
+        collect_adaptation_readiness(workspace_root).asdict()
+        if workspace_root is not None
+        else {}
+    )
     return {
         "readiness_score": round(readiness, 3),
         "required_checks_passed": len(passed_required),
@@ -258,6 +267,7 @@ def benchmark_status(
         "release_gate": readiness >= 1 and eval_passed and trace_count > 0,
         "evals_passed": eval_passed,
         "evals": eval_snapshot or {},
+        "adaptation_readiness": adaptation,
     }
 
 

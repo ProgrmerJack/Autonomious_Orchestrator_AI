@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import html
+import ipaddress
 import os
 import re
 import time
@@ -28,8 +29,10 @@ class ResearchSource:
     relevance: float = 0.0
     recency: float = 0.0
     citation_strength: float = 0.0
+    credibility_score: float = 0.0
     contradiction_risk: float = 0.0
     evidence_grade: str = "ungraded"
+    quality_flags: list[str] = field(default_factory=list)
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -41,7 +44,9 @@ class ResearchSource:
             "citation_count": self.citation_count,
             "evidence_grade": self.evidence_grade,
             "relevance": self.relevance,
+            "credibility_score": self.credibility_score,
             "contradiction_risk": self.contradiction_risk,
+            "quality_flags": self.quality_flags,
         }
 
 
@@ -101,6 +106,13 @@ class DeepResearchEngine:
             settings.depth,
             pc_context_info,
         )
+        seed_urls = self._source_seed_urls(
+            research_objective,
+            planning_context,
+            pc_context,
+        )
+        if seed_urls:
+            plan["source_seeds"] = seed_urls
         merged_targets = (
             dict(planning_context.get("coverage_targets") or {})
             if planning_context
@@ -121,6 +133,7 @@ class DeepResearchEngine:
             selected,
             settings.depth,
             plan,
+            query,
         )
         artifacts = self._write_artifacts(
             run_id,
@@ -152,6 +165,92 @@ class DeepResearchEngine:
             },
         )
 
+    @classmethod
+    def _source_seed_urls(
+        cls,
+        objective: str,
+        planning_context: dict[str, Any] | None,
+        pc_context: dict[str, Any] | None,
+    ) -> list[str]:
+        candidates: list[str] = []
+        candidates.extend(cls._collect_urls(objective))
+        if planning_context:
+            candidates.extend(cls._collect_urls(planning_context))
+        if pc_context:
+            candidates.extend(cls._collect_urls(pc_context))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in candidates:
+            cleaned = url.rstrip(").,;]}>\"'")
+            if not cls._is_safe_public_url(cleaned):
+                continue
+            if cleaned in seen:
+                continue
+            seen.add(cleaned)
+            deduped.append(cleaned)
+        return deduped[:12]
+
+    @classmethod
+    def _collect_urls(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return cls._urls_from_text(value)
+        if isinstance(value, dict):
+            results: list[str] = []
+            for item in value.values():
+                results.extend(cls._collect_urls(item))
+            return results
+        if isinstance(value, (list, tuple, set)):
+            results: list[str] = []
+            for item in value:
+                results.extend(cls._collect_urls(item))
+            return results
+        return []
+
+    @staticmethod
+    def _urls_from_text(text: str) -> list[str]:
+        if not text:
+            return []
+        return re.findall(r"https?://[^\s<>()]+", text)
+
+    def _seed_sources(self, seed_urls: list[str]) -> list[ResearchSource]:
+        if not seed_urls:
+            return []
+        sources: list[ResearchSource] = []
+        for url in seed_urls:
+            source = self._seed_source(url)
+            if source is not None:
+                sources.append(source)
+        self._record_provider_diagnostic(
+            "seed-url",
+            "ok" if sources else "empty",
+            f"seeded {len(sources)} explicit URL sources",
+        )
+        return sources
+
+    def _seed_source(self, url: str) -> ResearchSource | None:
+        if not self._is_safe_public_url(url):
+            return None
+        content = self._fetch_page_text(url, max_bytes=40_000)
+        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+        title = self._label_from_url(url)
+        if content:
+            first_sentence = re.split(r"[.!?]", content, maxsplit=1)[0].strip()
+            if first_sentence and len(first_sentence.split()) <= 18:
+                title = first_sentence[:160]
+        abstract = (
+            content
+            or f"Seeded external source collected from the objective or context: {url}"
+        )[:2000]
+        return ResearchSource(
+            provider="seed-url",
+            title=title[:160],
+            url=url,
+            authors=[host] if host else [],
+            abstract=abstract,
+            score=18.0,
+        )
+
     def _iterative_retrieval(
         self,
         query: str,
@@ -159,16 +258,30 @@ class DeepResearchEngine:
         plan: dict[str, Any],
         targets: dict[str, Any],
     ) -> dict[str, Any]:
-        all_sources: list[ResearchSource] = []
+        all_sources: list[ResearchSource] = self._seed_sources(
+            plan.get("source_seeds") or []
+        )
         all_variants = plan["query_plan"][: settings.max_query_variants * 4]
         min_runtime_seconds = self._min_runtime_seconds(settings.depth, targets)
-        max_passes = int(targets.get("max_retrieval_passes") or 1)
+        min_depth_passes = self._min_depth_passes(settings.depth, targets)
+        max_low_novelty_streak = self._max_low_novelty_streak(
+            settings.depth,
+            targets,
+        )
+        coverage_targets = self._coverage_targets(targets)
+        max_passes = int(
+            targets.get("max_retrieval_passes")
+            or self._default_max_passes(settings.depth)
+        )
         max_passes = max(max_passes, self._runtime_pass_floor(min_runtime_seconds))
+        max_passes = max(max_passes, min_depth_passes)
         max_passes = max(1, min(max_passes, 240))
         started_at = time.monotonic()
         retrieval_passes: list[dict[str, Any]] = []
         previous_titles: set[str] = set()
+        low_novelty_streak = 0
         stop_reason = "max_passes_reached"
+        passing_snapshot: dict[str, Any] | None = None
         # Classify the query once to gate providers for every pass.
         allowed_providers = self._classify_query(query)
 
@@ -187,46 +300,13 @@ class DeepResearchEngine:
                     break
             pass_sources: list[ResearchSource] = []
             for search_query in pass_variants:
-                if "openalex" in allowed_providers:
-                    oa_results = self._search_openalex(
-                        search_query, settings.per_provider
+                pass_sources.extend(
+                    self._search_query_across_providers(
+                        search_query,
+                        allowed_providers,
+                        settings.per_provider,
                     )
-                    if not oa_results:
-                        self._record_provider_diagnostic(
-                            "openalex",
-                            f"0 results for query: {search_query[:120]}",
-                        )
-                    pass_sources.extend(oa_results)
-                if "semantic-scholar" in allowed_providers:
-                    ss_results = self._search_semantic_scholar(
-                        search_query, settings.per_provider
-                    )
-                    if not ss_results:
-                        self._record_provider_diagnostic(
-                            "semantic-scholar",
-                            f"0 results for query: {search_query[:120]}",
-                        )
-                    pass_sources.extend(ss_results)
-                if "crossref" in allowed_providers:
-                    cr_results = self._search_crossref(
-                        search_query, settings.per_provider
-                    )
-                    if not cr_results:
-                        self._record_provider_diagnostic(
-                            "crossref",
-                            f"0 results for query: {search_query[:120]}",
-                        )
-                    pass_sources.extend(cr_results)
-                if (
-                    "github-repositories" in allowed_providers
-                    and self._looks_like_software_agent_query(search_query)
-                ):
-                    pass_sources.extend(
-                        self._search_github_repositories(
-                            search_query,
-                            min(settings.per_provider, 5),
-                        )
-                    )
+                )
 
             if pass_index == 0 and self._looks_like_software_agent_query(query):
                 pass_sources.extend(self._software_reference_sources(query))
@@ -248,7 +328,8 @@ class DeepResearchEngine:
             # It runs after the first API pass so we enrich concrete results.
             if pass_index == 0 and settings.depth in {"standard", "multi-hour"}:
                 content_queries = self._enrich_top_sources(
-                    selected[: min(12, settings.max_sources)]
+                    selected[: min(12, settings.max_sources)],
+                    query,
                 )
                 for cq in content_queries:
                     if cq and cq not in all_variants:
@@ -271,6 +352,22 @@ class DeepResearchEngine:
                         self._dedupe_sources(all_sources), query
                     )
                     selected = ranked[: settings.max_sources]
+            if (
+                settings.depth == "multi-hour"
+                and pass_index >= 5
+                and (pass_index + 1) % 4 == 0
+            ):
+                cited_more = self._citation_chase(
+                    selected[:6],
+                    query,
+                    citation_depth=1,
+                )
+                if cited_more:
+                    all_sources.extend(cited_more)
+                    ranked = self._rank_sources(
+                        self._dedupe_sources(all_sources), query
+                    )
+                    selected = ranked[: settings.max_sources]
 
             current_titles = {
                 self._normalize_title(source.title)
@@ -279,7 +376,7 @@ class DeepResearchEngine:
             }
             new_titles = current_titles - previous_titles
             novelty_rate = len(new_titles) / max(len(current_titles), 1)
-            coverage = self._coverage_metrics(selected, novelty_rate)
+            coverage = self._coverage_metrics(selected, novelty_rate, plan)
             retrieval_passes.append(
                 {
                     "pass_index": pass_index + 1,
@@ -296,10 +393,31 @@ class DeepResearchEngine:
             )
             previous_titles = current_titles
             budget_met = (time.monotonic() - started_at) >= min_runtime_seconds
-            if self._meets_targets(coverage, targets):
-                if not budget_met:
+            depth_met = (pass_index + 1) >= min_depth_passes
+            novelty_threshold = float(targets.get("min_novelty_rate") or 0.0)
+            if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
+                low_novelty_streak += 1
+            else:
+                low_novelty_streak = 0
+            if self._meets_targets(coverage, coverage_targets):
+                passing_snapshot = {
+                    "selected": list(selected),
+                    "coverage": dict(coverage),
+                }
+                if not budget_met or not depth_met:
                     continue
                 stop_reason = "coverage_targets_met"
+                selected = self._finalize_selected_sources(
+                    selected,
+                    all_sources,
+                    query,
+                    settings.max_sources,
+                )
+                coverage = self._coverage_metrics(
+                    selected,
+                    coverage["novelty_rate"],
+                    plan,
+                )
                 return {
                     "selected": selected,
                     "coverage": coverage,
@@ -307,18 +425,19 @@ class DeepResearchEngine:
                     "stop_reason": stop_reason,
                     "query_variants": all_variants,
                 }
-            if (
-                coverage["novelty_rate"] < float(targets.get("min_novelty_rate") or 0.0)
-                and pass_index > 0
-            ):
-                if not budget_met:
+            if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
+                if (
+                    not budget_met
+                    or not depth_met
+                    or low_novelty_streak < max_low_novelty_streak
+                ):
                     continue
                 stop_reason = "novelty_below_threshold"
                 break
             if coverage["max_contradiction_risk"] > float(
                 targets.get("max_contradiction_risk") or 1.0
             ):
-                if not budget_met:
+                if not budget_met or not depth_met:
                     continue
                 stop_reason = "contradiction_above_threshold"
                 break
@@ -329,8 +448,33 @@ class DeepResearchEngine:
                     selected,
                     settings.depth,
                     pass_index,
+                    plan,
                 )
             )
+
+        if passing_snapshot is not None:
+            selected = self._finalize_selected_sources(
+                list(passing_snapshot["selected"]),
+                all_sources,
+                query,
+                settings.max_sources,
+            )
+            coverage = self._coverage_metrics(
+                selected,
+                float(passing_snapshot["coverage"].get("novelty_rate") or 0.0),
+                plan,
+            )
+            return {
+                "selected": selected,
+                "coverage": coverage,
+                "passes": retrieval_passes,
+                "stop_reason": (
+                    "coverage_targets_met"
+                    if stop_reason == "max_passes_reached"
+                    else stop_reason
+                ),
+                "query_variants": all_variants[: settings.max_query_variants],
+            }
 
         ranked = self._rank_sources(self._dedupe_sources(all_sources), query)
         selected = self._select_balanced_top(
@@ -338,8 +482,14 @@ class DeepResearchEngine:
             settings.max_sources,
             query,
         )
+        selected = self._finalize_selected_sources(
+            selected,
+            all_sources,
+            query,
+            settings.max_sources,
+        )
         novelty_rate = retrieval_passes[-1]["novelty_rate"] if retrieval_passes else 0.0
-        coverage = self._coverage_metrics(selected, float(novelty_rate))
+        coverage = self._coverage_metrics(selected, float(novelty_rate), plan)
         return {
             "selected": selected,
             "coverage": coverage,
@@ -358,6 +508,50 @@ class DeepResearchEngine:
         if depth != "multi-hour":
             return 0
         return max(target_seconds, 0)
+
+    @staticmethod
+    def _min_depth_passes(depth: str, targets: dict[str, Any]) -> int:
+        raw_value = targets.get("min_depth_passes", 0)
+        try:
+            target_passes = int(raw_value)
+        except (TypeError, ValueError):
+            target_passes = 0
+        if depth != "multi-hour":
+            return max(target_passes, 1)
+        return max(target_passes, 12)
+
+    @staticmethod
+    def _default_max_passes(depth: str) -> int:
+        if depth == "quick":
+            return 1
+        if depth == "multi-hour":
+            return 12
+        return 4
+
+    @staticmethod
+    def _coverage_targets(targets: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "min_source_count",
+            "min_provider_count",
+            "min_scholarly_sources",
+            "min_strong_or_moderate",
+            "min_novelty_rate",
+            "max_contradiction_risk",
+            "min_perspective_count",
+            "min_perspective_ratio",
+        )
+        return {key: targets[key] for key in keys if key in targets}
+
+    @staticmethod
+    def _max_low_novelty_streak(depth: str, targets: dict[str, Any]) -> int:
+        raw_value = targets.get("max_low_novelty_streak", 0)
+        try:
+            streak = int(raw_value)
+        except (TypeError, ValueError):
+            streak = 0
+        if depth != "multi-hour":
+            return max(streak, 1)
+        return max(streak, 3)
 
     @staticmethod
     def _pass_variants(
@@ -386,10 +580,12 @@ class DeepResearchEngine:
             // estimated_pass_seconds,
         )
 
-    @staticmethod
+    @classmethod
     def _coverage_metrics(
+        cls,
         selected: list[ResearchSource],
         novelty_rate: float,
+        plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         provider_count = len({source.provider for source in selected})
         scholarly_source_count = sum(
@@ -406,6 +602,10 @@ class DeepResearchEngine:
             (source.contradiction_risk for source in selected),
             default=0.0,
         )
+        perspective_coverage = cls._perspective_coverage(
+            selected,
+            (plan or {}).get("perspectives") or [],
+        )
         return {
             "source_count": len(selected),
             "provider_count": provider_count,
@@ -413,12 +613,99 @@ class DeepResearchEngine:
             "strong_or_moderate": strong_or_moderate,
             "novelty_rate": novelty_rate,
             "max_contradiction_risk": contradiction_max,
+            "perspective_count": perspective_coverage["count"],
+            "perspective_total": perspective_coverage["total"],
+            "perspective_ratio": perspective_coverage["ratio"],
+            "covered_perspectives": perspective_coverage["covered"],
+            "missing_perspectives": perspective_coverage["missing"],
         }
+
+    @classmethod
+    def _perspective_coverage(
+        cls,
+        selected: list[ResearchSource],
+        perspectives: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not perspectives:
+            return {
+                "count": 0,
+                "total": 0,
+                "ratio": 0.0,
+                "covered": [],
+                "missing": [],
+            }
+
+        covered: list[str] = []
+        missing: list[str] = []
+        for perspective in perspectives:
+            matches = cls._matched_sources_for_perspective(selected, perspective)
+            if matches:
+                covered.append(str(perspective["name"]))
+            else:
+                missing.append(str(perspective["name"]))
+
+        total = len(perspectives)
+        return {
+            "count": len(covered),
+            "total": total,
+            "ratio": len(covered) / total if total else 0.0,
+            "covered": covered,
+            "missing": missing,
+        }
+
+    @classmethod
+    def _matched_sources_for_perspective(
+        cls,
+        sources: list[ResearchSource],
+        perspective: dict[str, Any],
+    ) -> list[ResearchSource]:
+        perspective_name = str(perspective.get("name") or "")
+        keywords = [
+            str(keyword).lower()
+            for keyword in (perspective.get("keywords") or [])
+            if str(keyword).strip()
+        ]
+        matched: list[ResearchSource] = []
+        for source in sources:
+            text = f"{source.title} {source.abstract}".lower()
+            keyword_hits = sum(1 for keyword in keywords if keyword in text)
+            if keyword_hits > 0:
+                matched.append(source)
+                continue
+            if perspective_name in {"overview", "established-results"} and (
+                source.provider in {"openalex", "semantic-scholar", "crossref"}
+                and source.evidence_grade in {"strong", "moderate"}
+            ):
+                matched.append(source)
+                continue
+            if perspective_name in {"evidence", "evaluation", "computation"} and (
+                source.evidence_grade in {"strong", "moderate", "tool-observation"}
+            ):
+                matched.append(source)
+                continue
+            if perspective_name in {
+                "limitations",
+                "proof-barriers",
+                "failure-analysis",
+                "safety",
+            } and (
+                source.contradiction_risk >= 0.25
+                or any(
+                    flag in source.quality_flags
+                    for flag in (
+                        "speculative-proof-claim",
+                        "unsupported-proof-title",
+                    )
+                )
+            ):
+                matched.append(source)
+        matched.sort(key=lambda item: item.score, reverse=True)
+        return matched
 
     @staticmethod
     def _meets_targets(coverage: dict[str, Any], targets: dict[str, Any]) -> bool:
         if not targets:
-            return True
+            return False
         checks = [
             coverage["source_count"] >= int(targets.get("min_source_count", 0)),
             coverage["provider_count"] >= int(targets.get("min_provider_count", 0)),
@@ -429,6 +716,10 @@ class DeepResearchEngine:
             coverage["novelty_rate"] >= float(targets.get("min_novelty_rate", 0.0)),
             coverage["max_contradiction_risk"]
             <= float(targets.get("max_contradiction_risk", 1.0)),
+            coverage["perspective_count"]
+            >= int(targets.get("min_perspective_count", 0)),
+            coverage["perspective_ratio"]
+            >= float(targets.get("min_perspective_ratio", 0.0)),
         ]
         return all(checks)
 
@@ -438,20 +729,57 @@ class DeepResearchEngine:
         selected: list[ResearchSource],
         depth: str,
         pass_index: int,
+        plan: dict[str, Any] | None = None,
     ) -> list[str]:
         providers = {source.provider for source in selected}
-        variants = [
-            f"{query} benchmark reproducibility pass {pass_index + 2}",
-            f"{query} limitations failure analysis pass {pass_index + 2}",
-        ]
-        if "openalex" not in providers or "semantic-scholar" not in providers:
-            variants.append(f"{query} survey paper evaluation methods")
-        if "github-repositories" not in providers:
-            variants.append(f"{query} repository architecture implementation")
+        software_mode = self._looks_like_software_agent_query(query)
+        math_mode = self._looks_like_math_query(query)
+        variants: list[str] = []
+        if software_mode:
+            variants.extend(
+                [
+                    f"{query} benchmark reproducibility pass {pass_index + 2}",
+                    f"{query} limitations failure analysis pass {pass_index + 2}",
+                ]
+            )
+            if "openalex" not in providers or "semantic-scholar" not in providers:
+                variants.append(f"{query} survey paper evaluation methods")
+            if "github-repositories" not in providers:
+                variants.append(f"{query} repository architecture implementation")
+        elif math_mode:
+            variants.extend(
+                [
+                    f"{query} theorem barrier",
+                    f"{query} obstruction transfer",
+                    f"{query} density to pointwise",
+                ]
+            )
+            if "openalex" not in providers or "semantic-scholar" not in providers:
+                variants.append(f"{query} expository survey")
+        else:
+            variants.extend(
+                [
+                    f"{query} literature review",
+                    f"{query} limitations open problems",
+                ]
+            )
+            if "openalex" not in providers or "semantic-scholar" not in providers:
+                variants.append(f"{query} survey paper")
+        if plan is not None and plan.get("perspectives"):
+            missing = self._perspective_coverage(
+                selected,
+                plan.get("perspectives") or [],
+            )["missing"]
+            for perspective in plan.get("perspectives") or []:
+                if perspective.get("name") not in missing:
+                    continue
+                variants.extend((perspective.get("queries") or [])[:2])
         variants.extend(self._query_variants(query, depth))
         deduped: list[str] = []
         seen: set[str] = set()
         for variant in variants:
+            if self._is_low_signal_query_variant(variant, query):
+                continue
             normalized = self._normalize_title(variant)
             if not normalized or normalized in seen:
                 continue
@@ -773,9 +1101,128 @@ class DeepResearchEngine:
         )
         return sources
 
+    def _search_web_results(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        params = urllib.parse.urlencode({"q": query})
+        raw_html = self._get_text(
+            f"https://html.duckduckgo.com/html/?{params}",
+            accept="text/html,application/xhtml+xml",
+            max_bytes=120_000,
+        )
+        sources: list[ResearchSource] = []
+        if raw_html:
+            for rank, match in enumerate(
+                re.finditer(
+                    (
+                        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"'
+                        r"[^>]*>(.*?)</a>"
+                    ),
+                    raw_html,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ),
+                start=1,
+            ):
+                raw_url = self._normalize_web_result_url(match.group(1))
+                if not self._is_safe_public_url(raw_url):
+                    continue
+                title = self._html_to_text(match.group(2)) or self._label_from_url(
+                    raw_url
+                )
+                tail = raw_html[match.end() : match.end() + 1500]
+                snippet_match = re.search(
+                    r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+                    tail,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                snippet = (
+                    self._html_to_text(snippet_match.group(1))
+                    if snippet_match is not None
+                    else ""
+                )
+                host = urllib.parse.urlparse(raw_url).netloc.lower().lstrip("www.")
+                score = max((limit or self.limit_per_provider) - rank + 1, 0)
+                sources.append(
+                    ResearchSource(
+                        provider="web-search",
+                        title=title[:160],
+                        url=raw_url,
+                        authors=[host] if host else [],
+                        abstract=(
+                            snippet or "Generic web result. Snippet unavailable."
+                        )[:1200],
+                        citation_count=score,
+                        score=float(score),
+                    )
+                )
+                if len(sources) >= (limit or self.limit_per_provider):
+                    break
+        self._record_provider_diagnostic(
+            "web-search",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} results",
+        )
+        return sources
+
     # ------------------------------------------------------------------
     # Provider routing
     # ------------------------------------------------------------------
+
+    def _search_query_across_providers(
+        self,
+        search_query: str,
+        allowed_providers: set[str],
+        per_provider_limit: int,
+    ) -> list[ResearchSource]:
+        provider_searchers = self._provider_searchers()
+        sources: list[ResearchSource] = []
+        for provider in self._provider_order():
+            if provider not in allowed_providers:
+                continue
+            if (
+                provider == "github-repositories"
+                and not self._looks_like_software_agent_query(search_query)
+            ):
+                continue
+            searcher = provider_searchers.get(provider)
+            if searcher is None:
+                continue
+            limit = (
+                min(per_provider_limit, 5)
+                if provider == "github-repositories"
+                else per_provider_limit
+            )
+            provider_results = searcher(search_query, limit)
+            if not provider_results:
+                self._record_provider_diagnostic(
+                    provider,
+                    "query-empty",
+                    f"0 results for query: {search_query[:120]}",
+                )
+                continue
+            sources.extend(provider_results)
+        return sources
+
+    @staticmethod
+    def _provider_order() -> tuple[str, ...]:
+        return (
+            "openalex",
+            "semantic-scholar",
+            "crossref",
+            "web-search",
+            "github-repositories",
+        )
+
+    def _provider_searchers(self) -> dict[str, Any]:
+        return {
+            "openalex": self._search_openalex,
+            "semantic-scholar": self._search_semantic_scholar,
+            "crossref": self._search_crossref,
+            "web-search": self._search_web_results,
+            "github-repositories": self._search_github_repositories,
+        }
 
     @classmethod
     def _classify_query(cls, query: str) -> set[str]:
@@ -813,13 +1260,17 @@ class DeepResearchEngine:
             "fashion",
         }
         if words & non_academic:
-            # Scholarly providers won't return useful results.
-            # Gemini Flash is the only option; include it even if the key
-            # is absent (the caller handles the missing-key case gracefully).
-            return {"gemini-flash"}
+            # Scholarly providers won't return useful results. Fall back to
+            # broad web search and tool observations.
+            return {"web-search", "gemini-flash"}
 
         # Default scholarly stack is always included.
-        selected: set[str] = {"openalex", "semantic-scholar", "crossref"}
+        selected: set[str] = {
+            "openalex",
+            "semantic-scholar",
+            "crossref",
+            "web-search",
+        }
 
         # Code / software queries also warrant a GitHub search.
         software_words = {
@@ -849,7 +1300,11 @@ class DeepResearchEngine:
     # Content enrichment and citation chasing
     # ------------------------------------------------------------------
 
-    def _enrich_top_sources(self, sources: list[ResearchSource]) -> list[str]:
+    def _enrich_top_sources(
+        self,
+        sources: list[ResearchSource],
+        query: str = "",
+    ) -> list[str]:
         """Fetch each source's landing page, extend its abstract with real
         content, and return new query strings extracted from that content.
 
@@ -858,34 +1313,27 @@ class DeepResearchEngine:
         the time cost comes entirely from network round-trips.
         """
         new_queries: list[str] = []
-        # Allowed domains — must agree with the policy network_hosts list.
-        allowed_hosts = {
-            "doi.org",
-            "arxiv.org",
-            "semanticscholar.org",
-            "github.com",
-            "openalex.org",
-            "ncbi.nlm.nih.gov",
-            "crossref.org",
-        }
         for source in sources:
-            if not source.url:
-                continue
-            parsed = urllib.parse.urlparse(source.url)
-            host = parsed.netloc.lower().lstrip("www.")
-            if not any(host == h or host.endswith(f".{h}") for h in allowed_hosts):
+            if not self._is_safe_public_url(source.url):
                 continue
             content = self._fetch_page_text(source.url, max_bytes=40_000)
-            if len(content) > 200:
+            if len(content) > 80:
                 # Extend the abstract so ranking gets real signal.
                 extra = content[:600]
-                source.abstract = f"{source.abstract} {extra}".strip()[:2000]
+                if source.abstract.lower().startswith("generic web result for "):
+                    source.abstract = extra[:2000]
+                else:
+                    source.abstract = f"{source.abstract} {extra}".strip()[:2000]
                 # Derive new focused queries from the fetched content.
-                new_queries.extend(self._content_to_new_queries(content, source.title))
+                new_queries.extend(
+                    self._content_to_new_queries(content, source.title, query)
+                )
         # Deduplicate before returning.
         seen: set[str] = set()
         result: list[str] = []
         for q in new_queries:
+            if self._is_low_signal_query_variant(q, query):
+                continue
             norm = self._normalize_title(q)
             if norm and norm not in seen:
                 seen.add(norm)
@@ -897,33 +1345,128 @@ class DeepResearchEngine:
 
         Returns an empty string on any error — callers must tolerate failure.
         """
-        if not url or not url.startswith("http"):
+        if not self._is_safe_public_url(url):
             return ""
-        req = urllib.request.Request(
+        raw = self._get_text(
+            url,
+            accept="text/html,application/xhtml+xml,*/*",
+            max_bytes=max_bytes,
+        )
+        if not raw:
+            return ""
+        return self._html_to_text(raw)
+
+    def _finalize_selected_sources(
+        self,
+        selected: list[ResearchSource],
+        all_sources: list[ResearchSource],
+        query: str,
+        max_sources: int,
+    ) -> list[ResearchSource]:
+        needs_enrichment = [
+            source
+            for source in selected
+            if self._is_safe_public_url(source.url)
+            and self._abstract_quality(source.abstract)[0] == 0
+        ]
+        if not needs_enrichment:
+            return selected
+        self._enrich_top_sources(needs_enrichment[: min(12, max_sources)], query)
+        ranked = self._rank_sources(self._dedupe_sources(all_sources), query)
+        return self._select_balanced_top(ranked, max_sources, query)
+
+    def _get_text(
+        self,
+        url: str,
+        accept: str = "text/html,application/xhtml+xml,*/*",
+        max_bytes: int = 40_000,
+    ) -> str:
+        request = urllib.request.Request(
             url,
             headers={
-                "Accept": "text/html,application/xhtml+xml,*/*",
+                "Accept": accept,
                 "User-Agent": "agentos-orchestrator/0.1 (research enrichment)",
             },
         )
         try:
             with urllib.request.urlopen(  # noqa: S310 - policy-gated URLs
-                req,
-                timeout=15,
-            ) as resp:
-                raw = resp.read(max_bytes)
-                text = raw.decode("utf-8", errors="replace")
-                text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL)
-                text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL)
-                text = re.sub(r"<[^>]+>", " ", text)
-                text = html.unescape(text)
-                text = re.sub(r"\s+", " ", text).strip()
-                return text
-        except Exception:  # noqa: BLE001 - all network errors are acceptable
+                request,
+                timeout=min(self.timeout_seconds, 15),
+            ) as response:
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                if content_type and not any(
+                    marker in content_type
+                    for marker in ("text/", "html", "xml", "json")
+                ):
+                    return ""
+                return response.read(max_bytes).decode("utf-8", errors="replace")
+        except (OSError, urllib.error.URLError):
             return ""
 
+    @staticmethod
+    def _html_to_text(raw: str) -> str:
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL)
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _normalize_web_result_url(url: str) -> str:
+        cleaned = html.unescape(url).strip()
+        if cleaned.startswith("//"):
+            cleaned = f"https:{cleaned}"
+        if cleaned.startswith("/"):
+            cleaned = urllib.parse.urljoin("https://html.duckduckgo.com/", cleaned)
+        parsed = urllib.parse.urlparse(cleaned)
+        if "duckduckgo.com" in parsed.netloc:
+            target = urllib.parse.parse_qs(parsed.query).get("uddg", [None])[0]
+            if target:
+                return urllib.parse.unquote(target)
+        return cleaned
+
+    @staticmethod
+    def _label_from_url(url: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        path = urllib.parse.unquote(parsed.path.rstrip("/").rsplit("/", 1)[-1])
+        candidate = path or parsed.netloc.lower().lstrip("www.") or url
+        candidate = re.sub(r"\.[a-z0-9]{1,5}$", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"[-_]+", " ", candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        return candidate[:160] or url[:160]
+
+    @staticmethod
+    def _is_safe_public_url(url: str) -> bool:
+        if not url.lower().startswith(("http://", "https://")):
+            return False
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        if not host or host == "localhost":
+            return False
+        if host.endswith((".local", ".lan", ".internal", ".home", ".localdomain")):
+            return False
+        if "." not in host and not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        return not (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        )
+
     @classmethod
-    def _content_to_new_queries(cls, content: str, source_title: str) -> list[str]:
+    def _content_to_new_queries(
+        cls,
+        content: str,
+        source_title: str,
+        query: str = "",
+    ) -> list[str]:
         """Extract 2-4 focused keyword phrases from fetched page content."""
         # Pick the most frequent non-stop content words.
         words = re.findall(r"\b[a-zA-Z][a-zA-Z-]{3,}\b", content.lower())
@@ -965,10 +1508,53 @@ class DeepResearchEngine:
             "paper",
             "work",
             "using",
+            "https",
+            "http",
+            "www",
+            "doi",
+            "arxiv",
+            "zenodo",
+            "record",
+            "records",
+            "download",
+            "license",
+            "copyright",
+            "manifest",
+            "version",
+            "supplementary",
+        }
+        anchor_stop = {
+            "how",
+            "build",
+            "building",
+            "general",
+            "purpose",
+            "deep",
+            "agent",
+            "agents",
+            "system",
+            "systems",
+            "research",
         }
         counts = Counter(w for w in words if w not in stop and len(w) > 4)
         top_terms = [w for w, _ in counts.most_common(8)]
         if not top_terms:
+            return []
+        anchor_terms = {
+            term
+            for term in cls._entity_terms_from_query(query)
+            if term and len(term) >= 4
+        }
+        anchor_terms.update(
+            word
+            for word in cls._keywords(query)
+            if word not in anchor_stop and len(word) >= 4
+        )
+        source_text = f"{source_title} {content}".lower()
+        matching_anchors = [
+            term for term in anchor_terms if term.lower() in source_text
+        ]
+        if query and not matching_anchors:
             return []
         # Combine title keywords with top content terms.
         title_words = [
@@ -976,12 +1562,35 @@ class DeepResearchEngine:
             for w in re.findall(r"\b[a-zA-Z]{4,}\b", source_title.lower())
             if w not in stop
         ][:3]
+        anchor_prefix = " ".join(matching_anchors[:2]).strip()
         queries: list[str] = []
         if top_terms[:3]:
-            queries.append(" ".join(top_terms[:3]))
+            candidate = " ".join(top_terms[:3])
+            if anchor_prefix and not any(
+                term in candidate for term in matching_anchors
+            ):
+                candidate = f"{anchor_prefix} {candidate}".strip()
+            queries.append(candidate)
         if title_words and top_terms[:2]:
-            queries.append(f"{' '.join(title_words[:2])} {' '.join(top_terms[:2])}")
-        return queries[:4]
+            candidate = f"{' '.join(title_words[:2])} {' '.join(top_terms[:2])}".strip()
+            if anchor_prefix and not any(
+                term in candidate for term in matching_anchors
+            ):
+                candidate = f"{anchor_prefix} {candidate}".strip()
+            queries.append(candidate)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in queries:
+            normalized = cls._normalize_title(candidate)
+            if not normalized or normalized in seen:
+                continue
+            if query and not any(
+                term in candidate.lower() for term in matching_anchors
+            ):
+                continue
+            seen.add(normalized)
+            deduped.append(candidate[:80])
+        return deduped[:4]
 
     def _citation_chase(
         self,
@@ -1020,7 +1629,7 @@ class DeepResearchEngine:
                         all_chased.append(c)
             # Enrich the newly discovered sources before the next depth hop.
             if next_frontier and citation_depth > 1:
-                self._enrich_top_sources(next_frontier[:8])
+                self._enrich_top_sources(next_frontier[:8], query)
             frontier = next_frontier
         return all_chased
 
@@ -1139,12 +1748,14 @@ class DeepResearchEngine:
         digest_path = artifact_dir / "digest.json"
         plan_path = artifact_dir / "research_plan.json"
         claim_trace_path = artifact_dir / "claim_trace.json"
+        findings_path = artifact_dir / "findings.json"
         diagnostics_path = artifact_dir / "provider_diagnostics.json"
         analysis_report_path = artifact_dir / "analysis_report.md"
         paper_report_path = artifact_dir / "paper_report.md"
         retrieval_metrics_path = artifact_dir / "retrieval_metrics.json"
         evidence_graph_path = artifact_dir / "evidence_graph.json"
         benchmark_adapters_path = artifact_dir / "benchmark_adapters.json"
+        findings = self._finding_ledger(query, sources, plan)
         retrieval_payload = {
             "coverage": retrieval["coverage"],
             "passes": retrieval["passes"],
@@ -1205,20 +1816,24 @@ class DeepResearchEngine:
                     "objective": objective,
                     "query": query,
                     "query_variants": query_variants,
+                    "source_seeds": plan.get("source_seeds") or [],
                     "max_sources": settings.max_sources,
                     "per_provider": settings.per_provider,
                     "core_question": plan["core_question"],
                     "subquestions": plan["subquestions"],
                     "comparative_axes": plan["comparative_axes"],
                     "evidence_requirements": plan["evidence_requirements"],
+                    "perspectives": plan.get("perspectives") or [],
                     "pc_context": pc_context_info,
                     "coverage": retrieval["coverage"],
                     "stop_reason": retrieval["stop_reason"],
                     "token_strategy": (
-                        "structured scholarly APIs, software repository "
-                        "search, optional model observations, exact "
-                        "dedupe, plan-first query decomposition, "
-                        "relevance ranking, compressed digest artifacts"
+                        "structured scholarly APIs, broad web search, "
+                        "explicit URL seeding, software repository search, "
+                        "optional model observations, exact dedupe, plan-first "
+                        "multi-perspective query decomposition, finding "
+                        "support/conflict ledger, relevance ranking, "
+                        "compressed digest artifacts"
                     ),
                 },
                 indent=2,
@@ -1250,9 +1865,13 @@ class DeepResearchEngine:
             json.dumps(retrieval_payload, indent=2),
             encoding="utf-8",
         )
+        findings_path.write_text(
+            json.dumps(findings, indent=2),
+            encoding="utf-8",
+        )
         claim_trace_path.write_text(
             json.dumps(
-                self._claim_trace(objective, summary, sources),
+                self._claim_trace(objective, summary, findings),
                 indent=2,
             ),
             encoding="utf-8",
@@ -1264,6 +1883,7 @@ class DeepResearchEngine:
                     sources,
                     retrieval,
                     pc_context_info,
+                    findings,
                 ),
                 indent=2,
             ),
@@ -1285,6 +1905,7 @@ class DeepResearchEngine:
             str(analysis_report_path.relative_to(self.workspace_root)),
             str(paper_report_path.relative_to(self.workspace_root)),
             str(retrieval_metrics_path.relative_to(self.workspace_root)),
+            str(findings_path.relative_to(self.workspace_root)),
             str(claim_trace_path.relative_to(self.workspace_root)),
             str(evidence_graph_path.relative_to(self.workspace_root)),
             str(benchmark_adapters_path.relative_to(self.workspace_root)),
@@ -1408,6 +2029,7 @@ class DeepResearchEngine:
         sources: list[ResearchSource],
         retrieval: dict[str, Any],
         pc_context_info: dict[str, Any],
+        findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         nodes: list[dict[str, Any]] = [
             {
@@ -1417,8 +2039,10 @@ class DeepResearchEngine:
             }
         ]
         edges: list[dict[str, Any]] = []
+        source_ids: dict[str, str] = {}
         for index, source in enumerate(sources, start=1):
             source_id = f"source_{index}"
+            source_ids[source.title] = source_id
             nodes.append(
                 {
                     "id": source_id,
@@ -1429,13 +2053,46 @@ class DeepResearchEngine:
                     "grade": source.evidence_grade,
                 }
             )
-            edges.append(
-                {
-                    "from": "objective",
-                    "to": source_id,
-                    "relation": "supported-by",
-                }
-            )
+        if findings:
+            for index, finding in enumerate(findings, start=1):
+                finding_id = f"finding_{index}"
+                nodes.append(
+                    {
+                        "id": finding_id,
+                        "type": "finding",
+                        "perspective": finding.get("perspective"),
+                        "label": finding.get("finding"),
+                        "confidence": finding.get("confidence"),
+                        "support_count": finding.get("support_count"),
+                    }
+                )
+                edges.append(
+                    {
+                        "from": "objective",
+                        "to": finding_id,
+                        "relation": "answered-by",
+                    }
+                )
+                for supporting in finding.get("supporting_sources") or []:
+                    source_id = source_ids.get(str(supporting.get("title") or ""))
+                    if source_id is None:
+                        continue
+                    edges.append(
+                        {
+                            "from": finding_id,
+                            "to": source_id,
+                            "relation": "supported-by",
+                        }
+                    )
+        else:
+            for source_id in source_ids.values():
+                edges.append(
+                    {
+                        "from": "objective",
+                        "to": source_id,
+                        "relation": "supported-by",
+                    }
+                )
         nodes.append(
             {
                 "id": "retrieval",
@@ -1470,6 +2127,220 @@ class DeepResearchEngine:
             "nodes": nodes,
             "edges": edges,
         }
+
+    def _finding_ledger(
+        self,
+        query: str,
+        sources: list[ResearchSource],
+        plan: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        perspectives = (plan or {}).get("perspectives") or self._research_perspectives(
+            query,
+            query,
+            "standard",
+            self._looks_like_software_agent_query(query),
+            self._looks_like_math_query(query),
+        )
+        findings: list[dict[str, Any]] = []
+        used_titles: set[str] = set()
+        for index, perspective in enumerate(perspectives, start=1):
+            matched = self._matched_sources_for_perspective(sources, perspective)
+            if not matched:
+                continue
+            lead = self._finding_lead_source(matched, perspective, used_titles)
+            if lead is None:
+                continue
+            lead_key = self._normalize_title(lead.title)
+            if lead_key:
+                used_titles.add(lead_key)
+            lead_identity = lead.url or lead_key
+            ordered_support = [lead]
+            ordered_support.extend(
+                source
+                for source in matched
+                if (source.url or self._normalize_title(source.title)) != lead_identity
+            )
+            support_count = len(matched)
+            provider_count = len({source.provider for source in matched})
+            contradiction_count = sum(
+                1 for source in matched if source.contradiction_risk >= 0.25
+            )
+            findings.append(
+                {
+                    "finding_id": f"finding_{index}",
+                    "perspective": perspective["name"],
+                    "goal": perspective.get("goal") or "",
+                    "finding": self._finding_text(lead, perspective),
+                    "support_count": support_count,
+                    "provider_count": provider_count,
+                    "contradiction_count": contradiction_count,
+                    "confidence": self._finding_confidence(
+                        matched,
+                        contradiction_count,
+                        provider_count,
+                    ),
+                    "supporting_sources": [
+                        {
+                            "title": source.title,
+                            "url": source.url,
+                            "provider": source.provider,
+                            "evidence_grade": source.evidence_grade,
+                        }
+                        for source in ordered_support[:4]
+                    ],
+                }
+            )
+        findings.sort(
+            key=lambda item: (
+                self._finding_confidence_rank(str(item.get("confidence") or "")),
+                int(item.get("support_count") or 0),
+                int(item.get("provider_count") or 0),
+            ),
+            reverse=True,
+        )
+        return findings[:6]
+
+    @classmethod
+    def _finding_lead_source(
+        cls,
+        matched: list[ResearchSource],
+        perspective: dict[str, Any],
+        used_titles: set[str],
+    ) -> ResearchSource | None:
+        if not matched:
+            return None
+        unused = [
+            source
+            for source in matched
+            if cls._normalize_title(source.title) not in used_titles
+        ]
+        pool = unused or matched
+        return max(
+            pool,
+            key=lambda source: cls._perspective_lead_score(source, perspective),
+        )
+
+    @classmethod
+    def _perspective_lead_score(
+        cls,
+        source: ResearchSource,
+        perspective: dict[str, Any],
+    ) -> tuple[int, int, int, int, float, int]:
+        focus_terms = cls._perspective_focus_terms(perspective)
+        title = source.title.lower()
+        abstract = source.abstract.lower()
+        title_hits = sum(1 for term in focus_terms if term in title)
+        abstract_hits = sum(1 for term in focus_terms if term in abstract)
+        sentence_hits = max(
+            (
+                sum(1 for term in focus_terms if term in sentence.lower())
+                for sentence in _sentences(source.abstract)
+            ),
+            default=0,
+        )
+        return (
+            title_hits,
+            sentence_hits,
+            abstract_hits,
+            cls._evidence_grade_rank(source.evidence_grade),
+            source.score,
+            source.citation_count,
+        )
+
+    @classmethod
+    def _perspective_focus_terms(
+        cls,
+        perspective: dict[str, Any],
+    ) -> list[str]:
+        perspective_name = str(perspective.get("name") or "").lower()
+        focus_terms = [
+            str(keyword).lower()
+            for keyword in (perspective.get("keywords") or [])
+            if str(keyword).strip()
+        ]
+        focus_terms.extend(
+            token for token in re.split(r"[-\s]+", perspective_name) if len(token) >= 4
+        )
+        focus_terms.extend(
+            term
+            for term in cls._keywords(str(perspective.get("goal") or ""))
+            if len(term) >= 4
+        )
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for term in focus_terms:
+            if term in seen:
+                continue
+            seen.add(term)
+            deduped.append(term)
+        return deduped
+
+    @classmethod
+    def _finding_text(
+        cls,
+        source: ResearchSource,
+        perspective: dict[str, Any] | None = None,
+    ) -> str:
+        sentence = _sentences(source.abstract)
+        if perspective is not None and sentence:
+            focus_terms = cls._perspective_focus_terms(perspective)
+            ranked_sentences = sorted(
+                sentence,
+                key=lambda item: (
+                    sum(1 for term in focus_terms if term in item.lower()),
+                    len(item),
+                ),
+                reverse=True,
+            )
+            best = ranked_sentences[0]
+            if any(term in best.lower() for term in focus_terms):
+                return best[:220]
+        if sentence:
+            return sentence[0][:220]
+        return source.title[:220]
+
+    @staticmethod
+    def _finding_confidence(
+        matched: list[ResearchSource],
+        contradiction_count: int,
+        provider_count: int,
+    ) -> str:
+        strong_count = sum(
+            1
+            for source in matched
+            if source.evidence_grade in {"strong", "tool-observation"}
+        )
+        moderate_or_better = sum(
+            1
+            for source in matched
+            if source.evidence_grade in {"strong", "moderate", "tool-observation"}
+        )
+        if moderate_or_better >= 3 and provider_count >= 2 and contradiction_count == 0:
+            return "high"
+        if moderate_or_better >= 2 and contradiction_count <= 1:
+            return "medium"
+        if strong_count >= 1 or moderate_or_better >= 1:
+            return "low"
+        return "needs-verification"
+
+    @staticmethod
+    def _evidence_grade_rank(evidence_grade: str) -> int:
+        return {
+            "strong": 4,
+            "tool-observation": 3,
+            "moderate": 2,
+            "weak": 1,
+            "ungraded": 0,
+        }.get(evidence_grade, 0)
+
+    @staticmethod
+    def _finding_confidence_rank(confidence: str) -> int:
+        return {
+            "high": 4,
+            "medium": 3,
+            "low": 2,
+            "needs-verification": 1,
+        }.get(confidence, 0)
 
     def _brief_markdown(
         self,
@@ -1528,6 +2399,7 @@ class DeepResearchEngine:
         sources: list[ResearchSource],
         depth: str = "standard",
         plan: dict[str, Any] | None = None,
+        query: str = "",
     ) -> str:
         if not sources:
             return (
@@ -1535,18 +2407,34 @@ class DeepResearchEngine:
                 f"providers for: {objective}. Check network policy, API "
                 "availability, or attach MCP research servers."
             )
-        abstract_text = " ".join(source.abstract for source in sources)
-        keywords = self._keywords(abstract_text)
-        top_titles = "; ".join(source.title for source in sources[:3])
-        theme_text = ", ".join(keywords[:8]) or "source relevance"
+        findings = self._finding_ledger(query or objective, sources, plan)
+        perspective_coverage = self._perspective_coverage(
+            sources,
+            (plan or {}).get("perspectives") or [],
+        )
         subquestion_count = len((plan or {}).get("subquestions", []))
+        leading_findings = "; ".join(
+            f"{finding['perspective']}: {finding['finding']}"
+            for finding in findings[:3]
+        ) or "; ".join(source.title for source in sources[:3])
+        missing_perspectives = (
+            ", ".join(perspective_coverage["missing"][:3])
+            or "no major uncovered perspectives detected"
+        )
+        conflict_count = sum(
+            int(finding.get("contradiction_count") or 0) for finding in findings
+        )
         return (
             f"Collected {len(sources)} evidence-backed sources in {depth} "
             "mode for: "
             f"{objective}. "
             f"The research plan tracked {subquestion_count} subquestions. "
-            f"The strongest starting points are: {top_titles}. "
-            f"Recurring themes across abstracts include {theme_text}."
+            "Perspective coverage reached "
+            f"{perspective_coverage['count']}/{perspective_coverage['total']} "
+            "planned angles. "
+            f"Most-supported findings are: {leading_findings}. "
+            f"Open gaps remain in: {missing_perspectives}. "
+            f"Contradiction signals were observed in {conflict_count} finding clusters."
         )
 
     def _build_research_plan(
@@ -1557,26 +2445,34 @@ class DeepResearchEngine:
         pc_context_info: dict[str, Any],
     ) -> dict[str, Any]:
         software_mode = self._looks_like_software_agent_query(query)
-        subquestions = [
-            "What problem scope and evaluation claims are being made?",
-            "Which benchmark suites and task categories are reported?",
-            "What failure modes, safety limits, and uncertainty statements exist?",
-        ]
-        comparative_axes = [
-            "task success rate",
-            "latency and token efficiency",
-            "desktop/browser action reliability",
-            "approval and safety model",
-            "checkpoint and recovery design",
-            "operator observability",
-        ]
-        evidence_requirements = [
-            "peer-reviewed or benchmark-style evidence",
-            "official project documentation and release notes",
-            "reproducible implementation details",
-            "explicitly stated limitations and risks",
-        ]
+        math_mode = self._looks_like_math_query(query)
+        perspectives = self._research_perspectives(
+            query,
+            objective,
+            depth,
+            software_mode,
+            math_mode,
+        )
         if software_mode:
+            subquestions = [
+                "What problem scope and evaluation claims are being made?",
+                "Which benchmark suites and task categories are reported?",
+                "What failure modes, safety limits, and uncertainty statements exist?",
+            ]
+            comparative_axes = [
+                "task success rate",
+                "latency and token efficiency",
+                "desktop/browser action reliability",
+                "approval and safety model",
+                "checkpoint and recovery design",
+                "operator observability",
+            ]
+            evidence_requirements = [
+                "peer-reviewed or benchmark-style evidence",
+                "official project documentation and release notes",
+                "reproducible implementation details",
+                "explicitly stated limitations and risks",
+            ]
             subquestions.extend(
                 [
                     "How do OpenClaw/OpenCode/OpenHands differ in planner-worker topology?",
@@ -1584,6 +2480,47 @@ class DeepResearchEngine:
                     "Which systems expose approval, trust, and durable replay primitives?",
                 ]
             )
+        elif math_mode:
+            subquestions = [
+                "Which unconditional, almost-all, or density results are already established?",
+                "What exact barrier blocks transfer from finite verification or almost-all control to a universal theorem?",
+                "Which proof frameworks engage parity vectors, 2-adic dynamics, return maps, or well-quasi-order arguments?",
+                "Which infinity-to-finite proof strategies succeeded in other hard theorems, and what structure made them work?",
+            ]
+            comparative_axes = [
+                "strength of theorem",
+                "assumptions and prerequisites",
+                "proof mechanism",
+                "finite-to-infinite transfer method",
+                "explicit barrier statement",
+                "constructive certificate leverage",
+            ]
+            evidence_requirements = [
+                "peer-reviewed mathematics sources or primary technical references",
+                "explicit theorem statements and hypotheses",
+                "identified barriers, obstructions, or impossibility statements",
+                "proof sketches or mechanisms tied to the queried dynamics",
+            ]
+        else:
+            subquestions = [
+                "What exact problem statement and accepted prior results define the topic?",
+                "Which methods, reductions, or constructions recur across the literature?",
+                "What explicit limitations, barriers, or open questions remain?",
+            ]
+            comparative_axes = [
+                "strength of result",
+                "assumptions and prerequisites",
+                "method and mechanism",
+                "scope of evidence",
+                "stated limitations",
+                "independent verification",
+            ]
+            evidence_requirements = [
+                "primary or peer-reviewed evidence",
+                "explicit methods and assumptions",
+                "clear limitations or open questions",
+                "independent corroboration when available",
+            ]
         if pc_context_info.get("browser_context_detected"):
             subquestions.append(
                 "How does live browser/app context from the local PC alter the evidence collection sequence?"
@@ -1592,6 +2529,8 @@ class DeepResearchEngine:
         # Entity-focused short queries come FIRST so they are not cut by
         # max_query_variants when the list is later sliced.
         plan_queries = self._entity_queries(query, objective)
+        for perspective in perspectives:
+            plan_queries.extend(perspective.get("queries") or [])
         # Then add short keyword variants of the core query.
         plan_queries.extend(self._query_variants(query, depth))
         # Subquestions are turned into short keyword phrases, NOT appended
@@ -1615,12 +2554,271 @@ class DeepResearchEngine:
             "subquestions": subquestions,
             "comparative_axes": comparative_axes,
             "evidence_requirements": evidence_requirements,
+            "perspectives": perspectives,
             "query_plan": deduped_queries,
         }
 
     @staticmethod
+    def _research_perspectives(
+        query: str,
+        objective: str,
+        depth: str,
+        software_mode: bool,
+        math_mode: bool,
+    ) -> list[dict[str, Any]]:
+        del objective
+        if software_mode:
+            return [
+                {
+                    "name": "overview",
+                    "goal": "Establish the current system landscape and accepted framing.",
+                    "keywords": ["survey", "overview", "state of the art", "landscape"],
+                    "queries": [query, f"{query} overview", f"{query} landscape"],
+                },
+                {
+                    "name": "architecture",
+                    "goal": "Compare planner-worker topology, grounding, and execution design.",
+                    "keywords": [
+                        "architecture",
+                        "planner",
+                        "worker",
+                        "grounding",
+                        "control",
+                    ],
+                    "queries": [f"{query} architecture", f"{query} planner worker"],
+                },
+                {
+                    "name": "evaluation",
+                    "goal": "Find benchmark results, task suites, and verification evidence.",
+                    "keywords": [
+                        "benchmark",
+                        "evaluation",
+                        "success rate",
+                        "verification",
+                        "osworld",
+                        "webarena",
+                    ],
+                    "queries": [f"{query} benchmark", f"{query} evaluation"],
+                },
+                {
+                    "name": "safety",
+                    "goal": "Find approval, safety, and trust-boundary evidence.",
+                    "keywords": [
+                        "safety",
+                        "approval",
+                        "trust",
+                        "policy",
+                        "risk",
+                        "guardrail",
+                    ],
+                    "queries": [
+                        f"{query} safety approval",
+                        f"{query} risk limitations",
+                    ],
+                },
+                {
+                    "name": "failure-analysis",
+                    "goal": "Surface failure modes, repairs, and uncertainty statements.",
+                    "keywords": [
+                        "failure",
+                        "limitation",
+                        "repair",
+                        "recovery",
+                        "uncertainty",
+                    ],
+                    "queries": [f"{query} failure analysis", f"{query} limitations"],
+                },
+                {
+                    "name": "operations",
+                    "goal": "Check deployment, observability, and operator workflow fit.",
+                    "keywords": [
+                        "deployment",
+                        "observability",
+                        "workflow",
+                        "operator",
+                        "production",
+                    ],
+                    "queries": [f"{query} deployment", f"{query} operator workflow"],
+                },
+            ]
+        if math_mode:
+            return [
+                {
+                    "name": "established-results",
+                    "goal": "Anchor the search in accepted unconditional results.",
+                    "keywords": [
+                        "theorem",
+                        "result",
+                        "almost all",
+                        "density",
+                        "orbits",
+                        "verification",
+                    ],
+                    "queries": [
+                        query,
+                        f"{query} established results",
+                        f"{query} unconditional results",
+                    ],
+                },
+                {
+                    "name": "proof-barriers",
+                    "goal": "Identify exact obstructions that block the missing bridge.",
+                    "keywords": [
+                        "barrier",
+                        "obstruction",
+                        "limitation",
+                        "cannot",
+                        "open problem",
+                    ],
+                    "queries": [f"{query} theorem barrier", f"{query} obstruction"],
+                },
+                {
+                    "name": "proof-mechanisms",
+                    "goal": "Collect mechanisms that could transfer local control into global structure.",
+                    "keywords": [
+                        "proof",
+                        "mechanism",
+                        "transfer",
+                        "conjugacy",
+                        "return map",
+                        "2-adic",
+                    ],
+                    "queries": [f"{query} mechanism", f"{query} transfer method"],
+                },
+                {
+                    "name": "computation",
+                    "goal": "Track finite verification, computation, and certificate leverage.",
+                    "keywords": [
+                        "computation",
+                        "verification",
+                        "finite",
+                        "certificate",
+                        "algorithm",
+                    ],
+                    "queries": [f"{query} finite verification", f"{query} computation"],
+                },
+                {
+                    "name": "analogies",
+                    "goal": "Search for analogous infinity-to-finite proof strategies in other theorems.",
+                    "keywords": [
+                        "analogy",
+                        "related theorem",
+                        "transfer",
+                        "well-quasi-order",
+                        "compactness",
+                    ],
+                    "queries": [
+                        f"{query} analogous theorems",
+                        f"{query} infinity to finite",
+                    ],
+                },
+            ]
+        perspectives = [
+            {
+                "name": "overview",
+                "goal": "Establish accepted framing, definitions, and prior work.",
+                "keywords": [
+                    "overview",
+                    "survey",
+                    "review",
+                    "background",
+                    "state of the art",
+                ],
+                "queries": [query, f"{query} overview", f"{query} survey"],
+            },
+            {
+                "name": "mechanisms",
+                "goal": "Collect recurring methods, models, or mechanisms.",
+                "keywords": [
+                    "method",
+                    "approach",
+                    "framework",
+                    "mechanism",
+                    "model",
+                    "process",
+                ],
+                "queries": [f"{query} methods", f"{query} approach"],
+            },
+            {
+                "name": "evidence",
+                "goal": "Identify direct studies, experiments, benchmarks, or measurements.",
+                "keywords": [
+                    "evaluation",
+                    "experiment",
+                    "study",
+                    "trial",
+                    "measurement",
+                    "result",
+                ],
+                "queries": [f"{query} evidence", f"{query} evaluation"],
+            },
+            {
+                "name": "limitations",
+                "goal": "Surface risks, critiques, and open problems.",
+                "keywords": [
+                    "limitation",
+                    "risk",
+                    "challenge",
+                    "critique",
+                    "uncertainty",
+                    "failure",
+                ],
+                "queries": [f"{query} limitations", f"{query} criticism"],
+            },
+            {
+                "name": "applications",
+                "goal": "Check practical impact, adoption, or deployment relevance.",
+                "keywords": [
+                    "application",
+                    "deployment",
+                    "impact",
+                    "adoption",
+                    "workflow",
+                    "use case",
+                ],
+                "queries": [f"{query} applications", f"{query} adoption"],
+            },
+            {
+                "name": "alternatives",
+                "goal": "Compare alternatives, baselines, or competing explanations.",
+                "keywords": [
+                    "alternative",
+                    "comparison",
+                    "baseline",
+                    "trade-off",
+                    "versus",
+                    "competitor",
+                ],
+                "queries": [f"{query} comparison", f"{query} alternatives"],
+            },
+        ]
+        if depth == "quick":
+            return perspectives[:4]
+        return perspectives
+
+    @staticmethod
     def _entity_queries(query: str, objective: str) -> list[str]:
         lower = f"{query} {objective}".lower()
+        if DeepResearchEngine._looks_like_math_query(lower):
+            focus_terms = DeepResearchEngine._math_focus_terms(lower)
+            focused: list[str] = []
+            if any("collatz" in term.lower() for term in focus_terms):
+                focused.extend(
+                    [
+                        "Collatz conjecture",
+                        "Collatz almost all",
+                        "Collatz finite verification",
+                        "Collatz universal theorem",
+                    ]
+                )
+            for term in focus_terms:
+                if term == "Collatz conjecture":
+                    continue
+                if "collatz" in lower and "collatz" not in term.lower():
+                    focused.append(f"Collatz {term}")
+                else:
+                    focused.append(term)
+            return focused
         entities = []
         for name in ("openclaw", "opencode", "openhands", "agentos"):
             if name in lower:
@@ -1653,15 +2851,22 @@ class DeepResearchEngine:
                     "OSWorld WebArena computer use evaluation",
                 ]
             )
-        # Generic LLM-agent queries follow to ensure scholarly providers get
-        # non-entity fallback queries when no specific entities are present.
-        focused.extend(
-            [
-                "LLM agent benchmark evaluation",
-                "autonomous agent task planning execution",
-                "AI agent computer use evaluation",
-            ]
-        )
+        if DeepResearchEngine._looks_like_software_agent_query(lower):
+            focused.extend(
+                [
+                    "LLM agent benchmark evaluation",
+                    "autonomous agent task planning execution",
+                    "AI agent computer use evaluation",
+                ]
+            )
+            if not entities and "research" in lower:
+                focused.extend(
+                    [
+                        "AI research agent evaluation",
+                        "automated literature review agent",
+                        "agentic technical due diligence system",
+                    ]
+                )
         return focused
 
     @staticmethod
@@ -1874,7 +3079,8 @@ class DeepResearchEngine:
         )
         for prefix in prefixes:
             cleaned = cleaned.replace(prefix, "")
-        return cleaned[:240].strip() or objective[:240]
+        distilled = DeepResearchEngine._query_core_terms(cleaned)
+        return distilled[:240].strip() or cleaned[:240].strip() or objective[:240]
 
     @staticmethod
     def _split_depth(objective: str) -> tuple[str, str]:
@@ -1914,21 +3120,45 @@ class DeepResearchEngine:
         into focused terms before expansion."""
         core = cls._query_core_terms(query)
         lower = core.lower()
+        software_mode = cls._looks_like_software_agent_query(query)
+        math_mode = cls._looks_like_math_query(query)
         variants: list[str] = []
         # Always start with the distilled core phrase.
         if core:
             variants.append(core)
-        # Add short thematic expansions.
-        if depth in {"standard", "multi-hour"}:
-            if core:
+        if math_mode:
+            math_focus = cls._math_focus_terms(query)
+            variants.extend(
+                [
+                    f"{core} theorem",
+                    f"{core} proof barrier",
+                ]
+            )
+            if depth == "multi-hour":
+                variants.extend(
+                    [
+                        f"{core} almost all",
+                        f"{core} finite verification",
+                        f"{core} 2-adic",
+                        f"{core} density results",
+                        "Collatz conjecture unconditional results",
+                    ]
+                )
+            for term in math_focus:
+                if term.lower() == "collatz conjecture":
+                    continue
+                variants.append(
+                    f"Collatz {term}" if "collatz" in query.lower() else term
+                )
+        elif software_mode:
+            if depth in {"standard", "multi-hour"} and core:
                 variants.extend(
                     [
                         f"{core} evaluation",
                         f"{core} benchmark",
                     ]
                 )
-        if depth == "multi-hour":
-            if core:
+            if depth == "multi-hour" and core:
                 variants.extend(
                     [
                         f"{core} survey",
@@ -1938,11 +3168,23 @@ class DeepResearchEngine:
                         f"{core} systematic review",
                     ]
                 )
-        # Domain-specific short phrases.
+        else:
+            if depth in {"standard", "multi-hour"} and core:
+                variants.append(f"{core} literature")
+                variants.append(f"{core} prior work")
+            if depth == "multi-hour" and core:
+                variants.extend(
+                    [
+                        f"{core} survey",
+                        f"{core} limitations",
+                        f"{core} open problems",
+                        f"{core} review",
+                    ]
+                )
         if any(t in lower for t in ("desktop", "computer use", "gui")):
             variants.append("GUI agent computer use evaluation")
             variants.append("LLM agent desktop control benchmark")
-        if cls._looks_like_software_agent_query(query):
+        if software_mode:
             variants.append("LLM autonomous agent WebArena OSWorld")
             variants.append("autonomous agent planning execution evaluation")
         deduped: list[str] = []
@@ -1970,6 +3212,54 @@ class DeepResearchEngine:
         for prefix in prefixes:
             if cleaned.lower().startswith(prefix.lower()):
                 cleaned = cleaned[len(prefix) :].strip()
+        cleaned = re.sub(
+            (
+                r"\busing\s+https?://[^\s<>()]+"
+                r"(?:\s+and\s+https?://[^\s<>()]+)*"
+                r"\s+as anchor sources\b"
+            ),
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"https?://[^\s<>()]+", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b[a-z0-9_./\\-]+\.(?:md|txt|json|ya?ml)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        boilerplate_patterns = (
+            r"\bbased on\b",
+            r"\bperform(?:ing)? deep research on\b",
+            r"\bperform research on\b",
+            r"\baccepted literature\b",
+            r"\bplausible proof strategies\b",
+            r"\bfocusing on\b",
+            r"\bthe exact missing\b",
+            r"\bas anchor sources\b",
+            r"\bthen expand outward to\b",
+            r"\bcorroborat\w*\b",
+            r"^how to build (?:a|an|the)\b",
+            r"^how to\b",
+            r"^build (?:a|an|the)\b",
+        )
+        for pattern in boilerplate_patterns:
+            cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-")
+        if DeepResearchEngine._looks_like_math_query(cleaned):
+            focus_terms = DeepResearchEngine._math_focus_terms(cleaned)
+            if focus_terms:
+                return " ".join(term.lower() for term in focus_terms[:4])[:70].strip()
+        if DeepResearchEngine._looks_like_software_agent_query(cleaned):
+            software_focus: list[str] = []
+            lower = cleaned.lower()
+            if "deep research" in lower:
+                software_focus.append("deep research agent")
+            elif "research" in lower and "agent" in lower:
+                software_focus.append("research agent")
+            if software_focus:
+                return " ".join(software_focus[:2])[:70].strip()
         # If still long, take the first sentence or first 60 chars of words.
         if len(cleaned) > 70:
             first_sentence = re.split(r"[.!?;]", cleaned)[0].strip()
@@ -1993,13 +3283,78 @@ class DeepResearchEngine:
 
     @staticmethod
     def _dedupe_sources(sources: list[ResearchSource]) -> list[ResearchSource]:
-        by_title: dict[str, ResearchSource] = {}
+        by_identity: dict[str, ResearchSource] = {}
+        deduped: list[ResearchSource] = []
         for source in sources:
-            key = DeepResearchEngine._normalize_title(source.title)
-            existing = by_title.get(key)
-            if existing is None or source.score > existing.score:
-                by_title[key] = source
-        return list(by_title.values())
+            keys = DeepResearchEngine._source_identity_keys(source)
+            existing = next(
+                (by_identity[key] for key in keys if key in by_identity),
+                None,
+            )
+            if existing is None:
+                deduped.append(source)
+                for key in keys:
+                    by_identity[key] = source
+                continue
+
+            DeepResearchEngine._merge_source_records(existing, source)
+            for key in keys:
+                by_identity[key] = existing
+            for key in DeepResearchEngine._source_identity_keys(existing):
+                by_identity[key] = existing
+        return deduped
+
+    @staticmethod
+    def _merge_source_records(existing: ResearchSource, source: ResearchSource) -> None:
+        source_wins = source.score > existing.score
+        if source_wins:
+            existing.provider = source.provider
+            existing.title = source.title
+            existing.url = source.url
+            existing.year = source.year
+            existing.authors = list(source.authors)
+        elif not existing.url and source.url:
+            existing.url = source.url
+        elif not existing.authors and source.authors:
+            existing.authors = list(source.authors)
+        elif existing.year is None and source.year is not None:
+            existing.year = source.year
+
+        if DeepResearchEngine._abstract_quality(
+            source.abstract
+        ) > DeepResearchEngine._abstract_quality(existing.abstract):
+            existing.abstract = source.abstract
+        existing.citation_count = max(existing.citation_count, source.citation_count)
+        existing.score = max(existing.score, source.score)
+
+    @staticmethod
+    def _source_identity_keys(source: ResearchSource) -> list[str]:
+        keys: list[str] = []
+        if source.url:
+            parsed = urllib.parse.urlsplit(source.url.strip())
+            if parsed.scheme and parsed.netloc:
+                normalized_url = urllib.parse.urlunsplit(
+                    (
+                        parsed.scheme.lower(),
+                        parsed.netloc.lower(),
+                        parsed.path.rstrip("/"),
+                        "",
+                        "",
+                    )
+                )
+                keys.append(f"url:{normalized_url}")
+        title_key = DeepResearchEngine._normalize_title(source.title)
+        if title_key:
+            keys.append(f"title:{title_key}")
+        return keys
+
+    @staticmethod
+    def _abstract_quality(text: str) -> tuple[int, int]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return (0, 0)
+        generic = cleaned.lower().startswith("generic web result for ")
+        return (0 if generic else 1, len(cleaned))
 
     # Maximum proportion of final selected sources from any single provider.
     _MAX_PROVIDER_FRACTION = 0.5
@@ -2015,8 +3370,14 @@ class DeepResearchEngine:
         if not query_terms:
             query_terms = set(re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", query))
         generic_terms = {
+            "how",
             "agent",
             "agents",
+            "build",
+            "building",
+            "deep",
+            "general",
+            "purpose",
             "model",
             "models",
             "system",
@@ -2063,14 +3424,21 @@ class DeepResearchEngine:
         relevance = max(entity_relevance, term_relevance)
         recency = cls._recency_score(source.year)
         citation_strength = min(source.citation_count, 1000) / 1000
+        credibility_score, credibility_penalty, quality_flags = cls._source_credibility(
+            source,
+            query,
+        )
         contradiction = cls._contradiction_risk(source.abstract)
         # Mutate the source in place (existing pattern).
         source.relevance = relevance
         source.recency = recency
         source.citation_strength = citation_strength
+        source.credibility_score = credibility_score
         source.contradiction_risk = contradiction
+        source.quality_flags = quality_flags
         if source.provider == "gemini-flash":
             source.relevance = max(relevance, 0.65)
+            source.credibility_score = max(credibility_score, 0.7)
             source.evidence_grade = "tool-observation"
             base = 80.0 + recency * 6.0 - contradiction * 4.0
             source.score = base
@@ -2091,10 +3459,12 @@ class DeepResearchEngine:
                     return 0.0
             effective_relevance = max(relevance, 0.1 if entity_hits else 0.0)
             base = (
-                effective_relevance * 60.0
-                + citation_strength * 30.0
-                + recency * 10.0
+                effective_relevance * 54.0
+                + citation_strength * 26.0
+                + recency * 8.0
+                + credibility_score * 18.0
                 - contradiction * 6.0
+                - credibility_penalty
             )
             if source.provider == "semantic-scholar":
                 base += 4.0
@@ -2108,8 +3478,10 @@ class DeepResearchEngine:
                 "benchmark",
                 "evaluation",
                 "computer use",
-                "desktop",
-                "browser",
+                "desktop agent",
+                "desktop control",
+                "browser agent",
+                "browser automation",
             }
             benchmark_hits = sum(1 for t in benchmark_terms if t in haystack)
             if entity_terms and entity_hits == 0 and benchmark_hits == 0:
@@ -2125,6 +3497,7 @@ class DeepResearchEngine:
                 + term_relevance * 12.0
                 + benchmark_hits * 4.0
                 + recency * 5.0
+                + credibility_score * 4.0
                 + min(citation_strength, 0.35) * 6.0
                 - contradiction * 2.0
             )
@@ -2133,9 +3506,172 @@ class DeepResearchEngine:
             return base
         # software-reference and other providers
         source.evidence_grade = cls._evidence_grade(source)
-        base = 20.0 + relevance * 20.0
+        base = 20.0 + relevance * 20.0 + credibility_score * 6.0
         source.score = base
         return base
+
+    @classmethod
+    def _source_credibility(
+        cls,
+        source: ResearchSource,
+        query: str,
+    ) -> tuple[float, float, list[str]]:
+        current_year = datetime.now(UTC).year
+        title = source.title.lower()
+        abstract = source.abstract.lower()
+        url = source.url.lower()
+        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+        credibility = 0.35
+        penalty = 0.0
+        flags: list[str] = []
+
+        if source.provider in {"openalex", "semantic-scholar", "crossref"}:
+            credibility += 0.15
+        if any(
+            host in url
+            for host in (
+                "doi.org/",
+                "acm.org",
+                "springer",
+                "sciencedirect",
+                "wiley",
+                "nature.com",
+            )
+        ):
+            credibility += 0.08
+        if source.citation_count >= 50:
+            credibility += 0.25
+        elif source.citation_count >= 10:
+            credibility += 0.16
+        elif source.citation_count >= 3:
+            credibility += 0.08
+        if source.year is not None and source.year <= current_year - 3:
+            credibility += 0.05
+        if (
+            source.year is not None
+            and source.year >= current_year - 1
+            and source.citation_count == 0
+        ):
+            penalty += 4.0
+            flags.append("recent-uncited")
+
+        if host.endswith(".gov") or host.endswith(".edu"):
+            credibility += 0.18
+        if (
+            host.startswith("docs.")
+            or host.startswith("developer.")
+            or host
+            in {
+                "learn.microsoft.com",
+                "developer.mozilla.org",
+                "docs.python.org",
+            }
+            or host.endswith(".readthedocs.io")
+        ):
+            credibility += 0.1
+        if "wikipedia.org" in host:
+            credibility += 0.05
+        if any(
+            marker in url
+            for marker in ("/docs", "/documentation", "/manual", "/reference")
+        ):
+            credibility += 0.06
+
+        if any(
+            host in url
+            for host in (
+                "arxiv.org",
+                "zenodo.org",
+                "figshare.com",
+                "osf.io",
+                "biorxiv.org",
+                "medrxiv.org",
+            )
+        ):
+            penalty += 3.0
+            flags.append("preprint-or-repository")
+
+        if re.search(r"\bv\d+(?:\.\d+){0,3}\b", title):
+            penalty += 6.0
+            flags.append("versioned-release")
+
+        packaging_markers = (
+            "proof package",
+            "review manuscript",
+            "lemma stock",
+            "manifest",
+            "demo",
+            "aux",
+            "workflow package",
+        )
+        if any(marker in title or marker in abstract for marker in packaging_markers):
+            penalty += 8.0
+            flags.append("package-like-source")
+
+        if cls._looks_like_math_query(query):
+            accepted_markers = (
+                "almost all",
+                "bounded values",
+                "stopping time",
+                "stopping times",
+                "2-adic",
+                "p-adic",
+                "de bruijn",
+                "verification limit",
+                "finite verification",
+                "density",
+                "orbits",
+                "conjugacy",
+            )
+            if any(
+                marker in title or marker in abstract for marker in accepted_markers
+            ):
+                credibility += 0.12
+            speculative_markers = (
+                "is true for all positive integers",
+                "complete resolution",
+                "conquered by",
+                "complete hand-verification",
+                "proof-completion",
+                "final gate",
+                "active-route",
+                "blur-knob",
+                "settles the collatz conjecture",
+                "we prove the collatz conjecture",
+                "proof of the collatz conjecture",
+                "complete proof of the collatz conjecture",
+                "human-llm collaboration",
+            )
+            unsupported_proof_title_markers = (
+                "proof of the collatz conjecture",
+                "solution to the collatz conjecture",
+                "solves the collatz conjecture",
+                "collatz conjecture is true",
+                "resolution of the collatz conjecture",
+                "block format solves the collatz conjecture",
+                "human-llm collaboration",
+            )
+            if (
+                "collatz" in query.lower()
+                and any(marker in title for marker in unsupported_proof_title_markers)
+                and source.citation_count <= 2
+            ):
+                penalty += 22.0
+                flags.append("unsupported-proof-title")
+            if (
+                source.citation_count == 0
+                and source.year is not None
+                and source.year >= current_year - 1
+                and any(
+                    marker in title or marker in abstract
+                    for marker in speculative_markers
+                )
+            ):
+                penalty += 26.0
+                flags.append("speculative-proof-claim")
+
+        credibility = max(0.0, min(credibility, 1.0))
+        return credibility, penalty, flags
 
     @classmethod
     def _enforce_provider_diversity(
@@ -2176,17 +3712,36 @@ class DeepResearchEngine:
 
         selected: list[ResearchSource] = []
 
+        def append_preferred(
+            provider: str,
+            predicate: Any | None = None,
+        ) -> bool:
+            provider_sources = by_provider.get(provider) or []
+            for index, source in enumerate(provider_sources):
+                if predicate is not None and not predicate(source):
+                    continue
+                selected.append(source)
+                del provider_sources[index]
+                return True
+            return False
+
+        # Preserve at least one explicit user/context anchor when it remains
+        # relevant enough to rank, otherwise explicit sources disappear behind
+        # generic search hits.
+        append_preferred(
+            "seed-url",
+            lambda source: source.relevance >= 0.2 or source.credibility_score >= 0.35,
+        )
+
         # Prefer at least one scholarly source when available.
         scholarly_order = ("openalex", "semantic-scholar", "crossref")
         for provider in scholarly_order:
-            if by_provider.get(provider):
-                selected.append(by_provider[provider].pop(0))
+            if append_preferred(provider):
                 break
 
         # Prefer at least one code/provider source for software comparisons.
         if DeepResearchEngine._looks_like_software_agent_query(query):
-            if by_provider.get("github-repositories"):
-                selected.append(by_provider["github-repositories"].pop(0))
+            append_preferred("github-repositories")
 
         # Fill remaining slots by global ranking while avoiding duplicates.
         selected_urls = {s.url for s in selected}
@@ -2202,6 +3757,7 @@ class DeepResearchEngine:
     @staticmethod
     def _entity_terms_from_query(query: str) -> set[str]:
         lower = query.lower()
+        software_mode = DeepResearchEngine._looks_like_software_agent_query(query)
         entities = {
             "openclaw",
             "opencode",
@@ -2213,7 +3769,20 @@ class DeepResearchEngine:
             "computeruse",
             "windows",
         }
-        return {e for e in entities if e in lower}
+        matched = {e for e in entities if e in lower}
+        if "research" in lower and "agent" in lower:
+            matched.add("research agent")
+        if "deep research" in lower:
+            matched.add("deep research")
+        if not software_mode and "literature" in lower and "review" in lower:
+            matched.add("literature review")
+        if not software_mode and "technical" in lower and "diligence" in lower:
+            matched.add("technical due diligence")
+        if not software_mode and "market" in lower and "intelligence" in lower:
+            matched.add("market intelligence")
+        if not software_mode and "safety" in lower and "critical" in lower:
+            matched.add("safety critical")
+        return matched
 
     @staticmethod
     def _quality_summary(sources: list[ResearchSource]) -> str:
@@ -2224,13 +3793,17 @@ class DeepResearchEngine:
             f"{grade}: {count}" for grade, count in sorted(grades.items())
         )
         average_relevance = sum(source.relevance for source in sources) / len(sources)
+        average_credibility = sum(source.credibility_score for source in sources) / len(
+            sources
+        )
         risk = max(
             (source.contradiction_risk for source in sources),
             default=0.0,
         )
         return (
             f"Evidence grades: {strongest}. Average relevance is "
-            f"{average_relevance:.2f}; maximum contradiction risk is "
+            f"{average_relevance:.2f}; average credibility is "
+            f"{average_credibility:.2f}; maximum contradiction risk is "
             f"{risk:.2f}."
         )
 
@@ -2238,30 +3811,39 @@ class DeepResearchEngine:
     def _claim_trace(
         objective: str,
         summary: str,
-        sources: list[ResearchSource],
+        findings: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        unique_sources = {
+            source["url"]
+            for finding in findings
+            for source in (finding.get("supporting_sources") or [])
+            if source.get("url")
+        }
         return {
             "objective": objective,
+            "summary": summary,
             "claims": [
                 {
-                    "claim_id": f"claim_{index}",
-                    "claim": claim,
-                    "supporting_sources": [
-                        {
-                            "title": source.title,
-                            "url": source.url,
-                            "provider": source.provider,
-                            "evidence_grade": source.evidence_grade,
-                        }
-                        for source in sources[:5]
-                    ],
+                    "claim_id": finding.get("finding_id") or f"claim_{index}",
+                    "claim": finding.get("finding") or "",
+                    "perspective": finding.get("perspective") or "",
+                    "confidence": finding.get("confidence") or "needs-verification",
+                    "support_count": finding.get("support_count") or 0,
+                    "provider_count": finding.get("provider_count") or 0,
+                    "contradiction_count": finding.get("contradiction_count") or 0,
+                    "supporting_sources": finding.get("supporting_sources") or [],
                 }
-                for index, claim in enumerate(_sentences(summary), start=1)
+                for index, finding in enumerate(findings, start=1)
             ],
-            "source_count": len(sources),
-            "minimum_grade": min(
-                (source.evidence_grade for source in sources),
-                default="ungraded",
+            "source_count": len(unique_sources),
+            "minimum_confidence": min(
+                (
+                    DeepResearchEngine._finding_confidence_rank(
+                        str(finding.get("confidence") or "")
+                    )
+                    for finding in findings
+                ),
+                default=0,
             ),
         }
 
@@ -2281,9 +3863,8 @@ class DeepResearchEngine:
             "contradict",
             "inconsistent",
             "mixed evidence",
-            "however",
-            "limitation",
-            "limitations",
+            "debated",
+            "controvers",
         )
         matches = sum(1 for marker in markers if marker in lower)
         return min(matches / 4, 1.0)
@@ -2292,30 +3873,153 @@ class DeepResearchEngine:
     def _evidence_grade(source: ResearchSource) -> str:
         if source.provider == "gemini-flash":
             return "tool-observation"
-        if source.relevance >= 0.7 and source.citation_strength >= 0.2:
+        if (
+            source.credibility_score < 0.25
+            or "speculative-proof-claim" in source.quality_flags
+            or "unsupported-proof-title" in source.quality_flags
+        ):
+            return "weak"
+        if (
+            source.relevance >= 0.7
+            and source.citation_strength >= 0.2
+            and source.credibility_score >= 0.55
+        ):
             return "strong"
-        if source.relevance >= 0.45:
+        if source.relevance >= 0.45 and source.credibility_score >= 0.35:
+            return "moderate"
+        if (
+            source.relevance >= 0.25
+            and source.credibility_score >= 0.72
+            and source.citation_strength >= 0.02
+        ):
             return "moderate"
         return "weak"
+
+    @classmethod
+    def _is_low_signal_query_variant(cls, variant: str, query: str = "") -> bool:
+        lower = variant.lower().strip()
+        if not lower:
+            return True
+        if "http://" in lower or "https://" in lower or "www." in lower:
+            return True
+        if cls._looks_like_math_query(query):
+            if any(
+                marker in lower
+                for marker in (
+                    "benchmark",
+                    "evaluation",
+                    "failure analysis",
+                    "repository architecture",
+                    "implementation",
+                )
+            ):
+                return True
+        noise_tokens = {
+            "https",
+            "http",
+            "www",
+            "display",
+            "record",
+            "records",
+            "download",
+            "license",
+            "copyright",
+            "manifest",
+            "mobile",
+            "padding",
+            "sha",
+            "share",
+            "theme",
+            "toggle",
+            "blur",
+            "knob",
+            "aux",
+            "demo",
+        }
+        words = re.findall(r"\b[a-z0-9.-]+\b", lower)
+        if len(words) < 2:
+            return True
+        noise_hits = sum(1 for word in words if word in noise_tokens)
+        return noise_hits >= 2 and noise_hits >= max(2, len(words) // 2)
 
     @staticmethod
     def _looks_like_software_agent_query(query: str) -> bool:
         lower = query.lower()
         markers = (
             "agentos",
+            "analyst system",
             "browser research",
             "computer use",
             "desktop agent",
+            "deep research",
             "github",
+            "literature review agent",
             "local pc",
+            "market intelligence",
             "openclaw",
             "opencode",
             "openhands",
             "orchestrator",
             "pc agent",
+            "research agent",
+            "safety-critical",
             "software agent",
+            "technical due diligence",
         )
         return any(marker in lower for marker in markers)
+
+    @staticmethod
+    def _looks_like_math_query(query: str) -> bool:
+        lower = query.lower()
+        markers = (
+            "collatz",
+            "conjecture",
+            "theorem",
+            "lemma",
+            "proof",
+            "2-adic",
+            "number theory",
+            "density",
+            "ostrowski",
+            "residue",
+            "well-quasi-order",
+            "wqo",
+        )
+        return any(marker in lower for marker in markers)
+
+    @staticmethod
+    def _math_focus_terms(query: str) -> list[str]:
+        lower = query.lower()
+        focus_map = (
+            ("collatz conjecture", "Collatz conjecture"),
+            ("collatz bridge", "Collatz bridge"),
+            ("collatz", "Collatz conjecture"),
+            ("almost-all", "almost all"),
+            ("almost all", "almost all"),
+            ("finite verification", "finite verification"),
+            ("universal theorem", "universal theorem"),
+            ("lemma ub", "Lemma UB"),
+            ("2-adic conjugacy", "2-adic conjugacy"),
+            ("2-adic", "2-adic"),
+            ("deterministic pointwise transfer", "pointwise transfer"),
+            ("mechanical carry forcing", "mechanical carry forcing"),
+            ("peel-chain no-crossing", "peel-chain no-crossing"),
+            ("ostrowski return-block cocycles", "Ostrowski return-block cocycles"),
+            ("ostrowski", "Ostrowski"),
+            ("critical-density boundary", "critical density"),
+            ("critical density", "critical density"),
+            ("lopez-stoll", "Lopez-Stoll"),
+            ("infinity-to-finite", "infinity-to-finite transfer"),
+            ("hard theorems", "hard theorems"),
+        )
+        focused: list[str] = []
+        seen: set[str] = set()
+        for marker, label in focus_map:
+            if marker not in lower or label in seen:
+                continue
+            focused.append(label)
+            seen.add(label)
+        return focused
 
     @staticmethod
     def _software_reference_sources(query: str) -> list[ResearchSource]:

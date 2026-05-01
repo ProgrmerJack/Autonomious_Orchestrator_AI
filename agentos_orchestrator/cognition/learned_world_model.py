@@ -9,14 +9,19 @@ which is more stable for UI dynamics where most of the state doesn't change.
 
 from __future__ import annotations
 
-import json
 import math
+import os
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    import cupy as cp  # type: ignore[import-not-found]
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional GPU dependency
+    cp = None
 
 from agentos_orchestrator.os_control.base import UiAction
 from agentos_orchestrator.cognition.mcts_simulator import WorldState
@@ -34,6 +39,8 @@ class MLPConfig:
     min_training_samples: int = 8
     max_training_samples: int = 10_000
     noise_std: float = 0.05
+    train_interval: int = 32
+    device: str = "auto"
 
 
 class MLPDynamics:
@@ -46,19 +53,21 @@ class MLPDynamics:
     def __init__(self, config: MLPConfig | None = None) -> None:
         self.config = config or MLPConfig()
         cfg = self.config
+        self.xp = _resolve_array_module(cfg.device)
+        self.using_gpu = self.xp is not np
         # Xavier init
-        self.W1 = np.random.randn(
+        self.W1 = self.xp.random.randn(
             cfg.state_dim + cfg.action_dim, cfg.hidden_dim
-        ).astype(np.float32) * np.sqrt(2.0 / (cfg.state_dim + cfg.action_dim))
-        self.b1 = np.zeros(cfg.hidden_dim, dtype=np.float32)
-        self.W2 = np.random.randn(cfg.hidden_dim, cfg.hidden_dim).astype(
-            np.float32
-        ) * np.sqrt(2.0 / cfg.hidden_dim)
-        self.b2 = np.zeros(cfg.hidden_dim, dtype=np.float32)
-        self.W3 = np.random.randn(cfg.hidden_dim, cfg.state_dim).astype(
-            np.float32
-        ) * np.sqrt(2.0 / cfg.hidden_dim)
-        self.b3 = np.zeros(cfg.state_dim, dtype=np.float32)
+        ).astype(self.xp.float32) * math.sqrt(2.0 / (cfg.state_dim + cfg.action_dim))
+        self.b1 = self.xp.zeros(cfg.hidden_dim, dtype=self.xp.float32)
+        self.W2 = self.xp.random.randn(cfg.hidden_dim, cfg.hidden_dim).astype(
+            self.xp.float32
+        ) * math.sqrt(2.0 / cfg.hidden_dim)
+        self.b2 = self.xp.zeros(cfg.hidden_dim, dtype=self.xp.float32)
+        self.W3 = self.xp.random.randn(cfg.hidden_dim, cfg.state_dim).astype(
+            self.xp.float32
+        ) * math.sqrt(2.0 / cfg.hidden_dim)
+        self.b3 = self.xp.zeros(cfg.state_dim, dtype=self.xp.float32)
         # Momentum buffers
         self.vW1 = np.zeros_like(self.W1)
         self.vb1 = np.zeros_like(self.b1)
@@ -72,13 +81,16 @@ class MLPDynamics:
 
     def forward(self, state_vec: np.ndarray, action_vec: np.ndarray) -> np.ndarray:
         """Predict state delta given current state and action."""
-        x = np.concatenate(
-            [state_vec.astype(np.float32), action_vec.astype(np.float32)]
+        x = self.xp.concatenate(
+            [
+                self.xp.asarray(state_vec, dtype=self.xp.float32),
+                self.xp.asarray(action_vec, dtype=self.xp.float32),
+            ]
         )
-        h1 = np.maximum(0, x @ self.W1 + self.b1)  # ReLU
-        h2 = np.maximum(0, h1 @ self.W2 + self.b2)  # ReLU
+        h1 = self.xp.maximum(0, x @ self.W1 + self.b1)  # ReLU
+        h2 = self.xp.maximum(0, h1 @ self.W2 + self.b2)  # ReLU
         delta = h2 @ self.W3 + self.b3
-        return delta.astype(np.float32)
+        return _to_numpy(delta).astype(np.float32)
 
     def train_step(
         self,
@@ -87,18 +99,22 @@ class MLPDynamics:
         next_state_vec: np.ndarray,
     ) -> float:
         """Online SGD update. Returns loss."""
+        xp = self.xp
+        state_vec = xp.asarray(state_vec, dtype=xp.float32)
+        action_vec = xp.asarray(action_vec, dtype=xp.float32)
+        next_state_vec = xp.asarray(next_state_vec, dtype=xp.float32)
         target_delta = next_state_vec - state_vec
         # Forward
-        x = np.concatenate([state_vec, action_vec])
+        x = xp.concatenate([state_vec, action_vec])
         z1 = x @ self.W1 + self.b1
-        h1 = np.maximum(0, z1)
+        h1 = xp.maximum(0, z1)
         z2 = h1 @ self.W2 + self.b2
-        h2 = np.maximum(0, z2)
+        h2 = xp.maximum(0, z2)
         pred_delta = h2 @ self.W3 + self.b3
         # Loss = MSE
-        loss = float(np.mean((pred_delta - target_delta) ** 2))
+        loss = float(_to_numpy(xp.mean((pred_delta - target_delta) ** 2)))
         # Backward
-        d_out = 2 * (pred_delta - target_delta) / len(target_delta)
+        d_out = 2 * (pred_delta - target_delta) / target_delta.shape[0]
         dW3 = h2.reshape(-1, 1) @ d_out.reshape(1, -1)
         db3 = d_out
         dh2 = d_out @ self.W3.T
@@ -139,24 +155,44 @@ class MLPDynamics:
         )
         if len(self._buffer) > self.config.max_training_samples:
             self._buffer.pop(0)
-        if len(self._buffer) >= self.config.min_training_samples:
-            # Train on a random sample from buffer
+        if (
+            len(self._buffer) >= self.config.min_training_samples
+            and len(self._buffer) % max(1, self.config.train_interval) == 0
+        ):
+            return self.flush_training(steps=1)
+        return None
+
+    def flush_training(self, *, steps: int) -> float | None:
+        """Run a bounded number of SGD updates after bulk ingestion."""
+        if len(self._buffer) < self.config.min_training_samples or steps <= 0:
+            return None
+        loss: float | None = None
+        for _ in range(steps):
             idx = np.random.randint(0, len(self._buffer))
             s, a, ns = self._buffer[idx]
-            return self.train_step(s, a, ns)
-        return None
+            loss = self.train_step(s, a, ns)
+        return loss
+
+    @property
+    def buffer_size(self) -> int:
+        return len(self._buffer)
+
+    @property
+    def training_step_count(self) -> int:
+        return self._training_steps
 
     def save(self, path: str | Path) -> None:
         """Serialize model weights."""
         data = {
-            "W1": self.W1,
-            "b1": self.b1,
-            "W2": self.W2,
-            "b2": self.b2,
-            "W3": self.W3,
-            "b3": self.b3,
+            "W1": _to_numpy(self.W1),
+            "b1": _to_numpy(self.b1),
+            "W2": _to_numpy(self.W2),
+            "b2": _to_numpy(self.b2),
+            "W3": _to_numpy(self.W3),
+            "b3": _to_numpy(self.b3),
             "buffer": self._buffer,
             "steps": self._training_steps,
+            "using_gpu": self.using_gpu,
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -167,16 +203,16 @@ class MLPDynamics:
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
-            self.W1 = data["W1"]
-            self.b1 = data["b1"]
-            self.W2 = data["W2"]
-            self.b2 = data["b2"]
-            self.W3 = data["W3"]
-            self.b3 = data["b3"]
+            self.W1 = self.xp.asarray(data["W1"], dtype=self.xp.float32)
+            self.b1 = self.xp.asarray(data["b1"], dtype=self.xp.float32)
+            self.W2 = self.xp.asarray(data["W2"], dtype=self.xp.float32)
+            self.b2 = self.xp.asarray(data["b2"], dtype=self.xp.float32)
+            self.W3 = self.xp.asarray(data["W3"], dtype=self.xp.float32)
+            self.b3 = self.xp.asarray(data["b3"], dtype=self.xp.float32)
             self._buffer = data.get("buffer", [])
             self._training_steps = data.get("steps", 0)
             return True
-        except Exception:
+        except (OSError, EOFError, KeyError, TypeError, ValueError, pickle.PickleError):
             return False
 
 
@@ -283,13 +319,19 @@ class LearnedGenerativeWorldModel:
         self.checkpoint_path = checkpoint_path
         self.encoder = StateEncoder(dim=64)
         self.dynamics = MLPDynamics(
-            MLPConfig(state_dim=64, action_dim=16, hidden_dim=128)
+            MLPConfig(
+                state_dim=64,
+                action_dim=16,
+                hidden_dim=128,
+                device=os.environ.get("AGENTOS_WORLD_MODEL_DEVICE", "auto"),
+            )
         )
         if checkpoint_path:
             self.dynamics.load(checkpoint_path)
         self._real_transitions: list[
             tuple[dict[str, Any], UiAction, dict[str, Any]]
         ] = []
+        self._real_transition_history_limit = 2048
         self._fallback_used_count = 0
         self._model_used_count = 0
 
@@ -299,7 +341,7 @@ class LearnedGenerativeWorldModel:
         a_vec = self.encoder.encode_action(action)
 
         # Check if we have enough training data for the model
-        if len(self.dynamics._buffer) >= self.dynamics.config.min_training_samples:
+        if self.dynamics.buffer_size >= self.dynamics.config.min_training_samples:
             pred_delta = self.dynamics.forward(s_vec, a_vec)
             # Add learned noise for stochasticity
             pred_delta += (
@@ -390,7 +432,7 @@ class LearnedGenerativeWorldModel:
             UiAction(action_type="scroll", selector="app-window", value="-3")
         )
         # If we've seen this state before, prefer previously successful actions
-        for past_s, past_a, past_ns in self._real_transitions[-20:]:
+        for past_s, past_a, _past_ns in self._real_transitions[-20:]:
             if self._state_similarity(past_s, vec) > 0.8:
                 actions.append(past_a)
         return actions
@@ -403,13 +445,33 @@ class LearnedGenerativeWorldModel:
     ) -> float | None:
         """Record a real transition and train the model online."""
         self._real_transitions.append((before, action, after))
+        if len(self._real_transitions) > self._real_transition_history_limit:
+            self._real_transitions.pop(0)
         s_vec = self.encoder.encode_state(before)
         a_vec = self.encoder.encode_action(action)
         ns_vec = self.encoder.encode_state(after)
         loss = self.dynamics.record_transition(s_vec, a_vec, ns_vec)
-        if self.checkpoint_path and self.dynamics._training_steps % 100 == 0:
+        if self.checkpoint_path and self.dynamics.training_step_count % 100 == 0:
             self.dynamics.save(self.checkpoint_path)
         return loss
+
+    def save_checkpoint(self) -> Path | None:
+        if not self.checkpoint_path:
+            return None
+        self.dynamics.save(self.checkpoint_path)
+        return Path(self.checkpoint_path)
+
+    def finalize_training(self, *, extra_steps: int | None = None) -> float | None:
+        if extra_steps is None:
+            extra_steps = min(
+                512,
+                max(
+                    16,
+                    self.dynamics.buffer_size
+                    // max(1, self.dynamics.config.train_interval),
+                ),
+            )
+        return self.dynamics.flush_training(steps=extra_steps)
 
     @staticmethod
     def _physics_fallback(
@@ -422,7 +484,8 @@ class LearnedGenerativeWorldModel:
             next_state = dict(state)
         if action.action_type == "click":
             next_state["focused_element"] = action.selector
-            next_state["click_count"] = next_state.get("click_count", 0) + 1
+            current_click_count = next_state.get("click_count", 0)
+            next_state["click_count"] = _coerce_int(current_click_count) + 1
         elif action.action_type == "type" and action.value:
             next_state["has_unsaved_changes"] = True
             next_state["last_typed_length"] = len(action.value)
@@ -435,7 +498,8 @@ class LearnedGenerativeWorldModel:
         elif action.action_type == "open_url":
             next_state["app_context"] = "browser"
             next_state["url_opened"] = True
-        recent = next_state.get("recent_actions", [])
+        recent_value = next_state.get("recent_actions", [])
+        recent = list(recent_value) if isinstance(recent_value, list) else []
         recent.append(action.action_type)
         next_state["recent_actions"] = recent[-10:]
         return next_state
@@ -453,7 +517,10 @@ class LearnedGenerativeWorldModel:
         state["node_count"] = max(0, int(vec[0] * 100))
         state["enabled_count"] = max(0, int(vec[1] * 100))
         state["focused_count"] = max(0, int(vec[2] * 10))
-        state["click_count"] = state.get("click_count", 0) + max(0, int(vec[3] * 20))
+        current_click_count = state.get("click_count", 0)
+        state["click_count"] = _coerce_int(current_click_count) + max(
+            0, int(vec[3] * 20)
+        )
         state["has_unsaved_changes"] = bool(vec[4] > 0.5)
         return state
 
@@ -465,3 +532,31 @@ class LearnedGenerativeWorldModel:
             return 0.0
         matches = sum(1 for k in keys if a.get(k) == b.get(k))
         return matches / len(keys)
+
+
+def _resolve_array_module(device: str):
+    if device == "cpu":
+        return np
+    if cp is None:
+        return np
+    if device == "gpu":
+        return cp
+    try:
+        cp.cuda.runtime.getDeviceCount()
+    except (AttributeError, RuntimeError):
+        return np
+    return cp
+
+
+def _to_numpy(value):
+    if cp is not None and isinstance(value, cp.ndarray):
+        return cp.asnumpy(value)
+    return np.asarray(value)
+
+
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0

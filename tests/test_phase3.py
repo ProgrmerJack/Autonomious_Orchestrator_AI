@@ -39,6 +39,7 @@ from agentos_orchestrator.cognition.hierarchical_task_decomposer import (
 # Helpers                                                                     #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def _white_screenshot(size: tuple[int, int] = (640, 480)) -> Image.Image:
     img = Image.new("RGB", size, color=(240, 240, 240))
     draw = ImageDraw.Draw(img)
@@ -61,6 +62,7 @@ def _dark_screenshot(size: tuple[int, int] = (640, 480)) -> Image.Image:
 # ─────────────────────────────────────────────────────────────────────────── #
 # ToolExecutor tests                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class ToolExecutorBasicTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -115,7 +117,7 @@ class ToolExecutorBasicTests(unittest.TestCase):
         req = QuantAnalysisRequest(
             objective="write a file",
             code=(
-                'import os\n'
+                "import os\n"
                 'with open("output.txt", "w") as f:\n'
                 '    f.write("artefact")\n'
             ),
@@ -141,6 +143,7 @@ class ToolExecutorBasicTests(unittest.TestCase):
     def test_pandas_available_in_sandbox(self) -> None:
         try:
             import importlib
+
             importlib.import_module("pandas")
         except ModuleNotFoundError:
             self.skipTest("pandas not installed in venv")
@@ -211,6 +214,7 @@ class ToolExecutorSecurityTests(unittest.TestCase):
     def test_write_outside_sandbox_blocked(self) -> None:
         # Try to write to the workspace root (outside the run_dir)
         import os
+
         parent = str(Path(self._tmpdir).parent).replace("\\", "/")
         req = QuantAnalysisRequest(
             objective="path escape",
@@ -254,10 +258,43 @@ class ToolExecutorTemplateTests(unittest.TestCase):
         # It should compile without syntax errors
         compile(code, "<generated>", "exec")
 
+    def test_build_http_probe_code_generates_valid_python(self) -> None:
+        executor = ToolExecutor(workspace_root=tempfile.mkdtemp())
+        code = executor.build_http_probe_code(["http://127.0.0.1:8000/api"])
+        self.assertIn("urllib.request", code)
+        self.assertIn("RESULT: control_probe=", code)
+        compile(code, "<http_probe>", "exec")
+
+    def test_build_api_workflow_code_generates_valid_python(self) -> None:
+        executor = ToolExecutor(workspace_root=tempfile.mkdtemp())
+        code = executor.build_api_workflow_code(
+            {
+                "steps": [
+                    {
+                        "name": "probe_surface",
+                        "method": "OPTIONS",
+                        "url": "http://127.0.0.1:8000/v1/search",
+                        "json_body": None,
+                    },
+                    {
+                        "name": "execute_objective",
+                        "method": "POST",
+                        "url": "http://127.0.0.1:8000/v1/search",
+                        "json_body": {"query": "hello"},
+                    },
+                ],
+                "auth_env_keys": ["API_KEY"],
+            }
+        )
+        self.assertIn("RESULT: api_workflow=", code)
+        self.assertIn("urllib.request", code)
+        compile(code, "<api_workflow>", "exec")
+
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # VLMAdapter tests                                                            #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class ClassicalVLMAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -320,7 +357,9 @@ class ClassicalVLMAdapterTests(unittest.TestCase):
             create_adapter("nonexistent_model_xyz")
 
     def test_vlm_element_cx_cy(self) -> None:
-        elem = VLMElement(x=100, y=200, width=60, height=30, label="OK", element_type="button")
+        elem = VLMElement(
+            x=100, y=200, width=60, height=30, label="OK", element_type="button"
+        )
         self.assertEqual(elem.cx, 130)
         self.assertEqual(elem.cy, 215)
 
@@ -329,12 +368,16 @@ class ClassicalVLMAdapterTests(unittest.TestCase):
         interactive = scene.interactive_elements
         self.assertIsInstance(interactive, list)
         for e in interactive:
-            self.assertIn(e.element_type, {"button", "text_field", "checkbox", "dropdown", "slider"})
+            self.assertIn(
+                e.element_type,
+                {"button", "text_field", "checkbox", "dropdown", "slider"},
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Decomposer: new patterns                                                    #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class DecomposerPhase3PatternTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -347,7 +390,9 @@ class DecomposerPhase3PatternTests(unittest.TestCase):
         self.assertIn("run_analysis_code", names)
 
     def test_quantitative_analysis_triggers_analysis_hierarchy(self) -> None:
-        h = self.decomposer.decompose("compute quantitative analysis of portfolio volatility")
+        h = self.decomposer.decompose(
+            "compute quantitative analysis of portfolio volatility"
+        )
         names = [opt.name for opt in h.execution_sequence]
         self.assertIn("collect_data_via_tool", names)
 

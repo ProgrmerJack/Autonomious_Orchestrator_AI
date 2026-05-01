@@ -215,7 +215,7 @@ class AgentRuntimeState:
                 kind="modal",
                 description=f"Modal active: {frame.active_modal}",
                 evidence=json.dumps(diff, sort_keys=True),
-                repair_hint="Resolve the modal before continuing the parent goal.",
+                repair_hint=("Resolve the modal before continuing the parent goal."),
             )
         return frame
 
@@ -246,9 +246,20 @@ class AgentRuntimeState:
         expected_observation: str = "",
         receipt: str = "",
     ) -> ActionRecord:
-        record = ActionRecord.from_action(action, expected_observation, receipt)
+        record = ActionRecord.from_action(
+            action,
+            expected_observation,
+            receipt,
+        )
         self.last_actions.append(record)
         return record
+
+    def resolve_active_blockers(self, reason: str = "") -> None:
+        for blocker in self.blocker_stack:
+            if blocker.active:
+                blocker.active = False
+                if reason:
+                    blocker.repair_hint = reason
 
     def evaluate_outcome(
         self,
@@ -260,16 +271,19 @@ class AgentRuntimeState:
     ) -> OutcomeEvaluation:
         diff = diff_ui_states(before, after)
         observed = _observed_summary(receipt, diff)
-        failure_reason = _failure_reason(receipt)
-        new_blocker = _new_blocker(before, after, receipt)
+        receipt_info = _parse_receipt(receipt)
+        failure_reason = _failure_reason(receipt, receipt_info)
+        new_blocker = _new_blocker(before, after, receipt, failure_reason)
         repair = _repair_hint(failure_reason, new_blocker)
+        expected = expected_observation or _default_expected(action)
         matched = failure_reason is None and (
             bool(diff)
             or action.action_type in {"tool", "explore", "hotkey", "type"}
-            or _receipt_indicates_success(receipt)
+            or _receipt_indicates_success(receipt, receipt_info)
+            or _expected_matches_observed(expected, observed)
         )
         evaluation = OutcomeEvaluation(
-            expected=expected_observation or _default_expected(action),
+            expected=expected,
             observed=observed,
             matched=matched,
             failure_reason=failure_reason,
@@ -277,6 +291,11 @@ class AgentRuntimeState:
             suggested_repair=repair,
         )
         self.recent_reflections.append(evaluation)
+        repair_marker = action.metadata.get("repair_plan") or action.metadata.get(
+            "repair_kind"
+        )
+        if matched and repair_marker:
+            self.resolve_active_blockers("Resolved by successful repair action.")
         if new_blocker:
             self.add_blocker(
                 kind="runtime",
@@ -382,6 +401,15 @@ def _mark_ids(mark_payload: dict[str, Any]) -> list[int]:
 
 def _observed_summary(receipt: str, diff: dict[str, Any]) -> str:
     chunks = []
+    receipt_info = _parse_receipt(receipt)
+    if receipt_info:
+        compact = {
+            key: receipt_info[key]
+            for key in ("status", "success", "reason", "error")
+            if key in receipt_info
+        }
+        if compact:
+            chunks.append("receipt_info=" + json.dumps(compact, sort_keys=True))
     if receipt:
         chunks.append(f"receipt={str(receipt)[:500]}")
     if diff:
@@ -389,7 +417,40 @@ def _observed_summary(receipt: str, diff: dict[str, Any]) -> str:
     return "; ".join(chunks) or "No visible state change was detected."
 
 
-def _failure_reason(receipt: str) -> str | None:
+def _parse_receipt(receipt: str) -> dict[str, Any]:
+    if not receipt:
+        return {}
+    try:
+        parsed = json.loads(str(receipt))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _failure_reason(
+    receipt: str,
+    receipt_info: dict[str, Any] | None = None,
+) -> str | None:
+    receipt_info = receipt_info or _parse_receipt(receipt)
+    status = str(receipt_info.get("status", "")).lower()
+    if receipt_info.get("success") is False:
+        return str(
+            receipt_info.get("error")
+            or receipt_info.get("reason")
+            or "Tool or backend reported unsuccessful execution."
+        )
+    if status in {"blocked", "policy-blocked"}:
+        return str(receipt_info.get("reason") or "Action was blocked by policy.")
+    if status in {"selector-not-found", "target-not-found"}:
+        return "Target selector or required resource was not found."
+    if status in {"invalid", "validation-error"}:
+        return "The UI rejected the submitted value as invalid."
+    if status in {"error", "failed", "exception"}:
+        return str(
+            receipt_info.get("error")
+            or receipt_info.get("reason")
+            or "Backend receipt reported a failure."
+        )
     lower = str(receipt or "").lower()
     if "blocked" in lower:
         return "Action was blocked by policy or backend."
@@ -406,10 +467,13 @@ def _new_blocker(
     before: AbstractUIState | None,
     after: AbstractUIState,
     receipt: str,
+    failure_reason: str | None = None,
 ) -> str | None:
-    if after.active_modal and (before is None or before.active_modal != after.active_modal):
+    if after.active_modal and (
+        before is None or before.active_modal != after.active_modal
+    ):
         return f"New modal requires resolution: {after.active_modal}"
-    reason = _failure_reason(receipt)
+    reason = failure_reason or _failure_reason(receipt)
     if reason:
         return reason
     return None
@@ -430,9 +494,60 @@ def _repair_hint(failure_reason: str | None, new_blocker: str | None) -> str | N
     return "Replan using the latest observation and failure evidence."
 
 
-def _receipt_indicates_success(receipt: str) -> bool:
+def _receipt_indicates_success(
+    receipt: str,
+    receipt_info: dict[str, Any] | None = None,
+) -> bool:
+    receipt_info = receipt_info or _parse_receipt(receipt)
+    if receipt_info.get("success") is True:
+        return True
+    status = str(receipt_info.get("status", "")).lower()
+    if status in {
+        "ok",
+        "success",
+        "executed",
+        "file-op-executed",
+        "value-set",
+        "hotkey-sent",
+        "drawn",
+        "invoked",
+        "launched",
+        "typed",
+    }:
+        return True
     lower = str(receipt or "").lower()
     return any(token in lower for token in ("executed", "success", "ok", "saved"))
+
+
+def _expected_matches_observed(expected: str, observed: str) -> bool:
+    expected_lower = expected.lower().strip()
+    observed_lower = observed.lower()
+    if not expected_lower or not observed_lower:
+        return False
+    if expected_lower in observed_lower:
+        return True
+    ignored = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "will",
+        "should",
+    }
+    tokens = [
+        token.strip(".,:;()[]{}\"'")
+        for token in expected_lower.split()
+        if len(token.strip(".,:;()[]{}\"'")) > 3
+        and token.strip(".,:;()[]{}\"'") not in ignored
+    ]
+    if not tokens:
+        return False
+    required_matches = 1 if len(tokens) < 4 else 2
+    return sum(1 for token in tokens[:8] if token in observed_lower) >= required_matches
 
 
 def _default_expected(action: UiAction) -> str:

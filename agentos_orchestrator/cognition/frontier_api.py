@@ -111,29 +111,29 @@ class FrontierPrompt:
             "observable evidence only.\n\n"
             "Schema:\n"
             "{\n"
-            "  \"orientation\": {\n"
-            "    \"what_changed\": \"observable temporal/state change\",\n"
-            "    \"current_blocker\": \"blocking UI fact or null\",\n"
-            "    \"relevant_history\": [\"recent action/state facts\"]\n"
+            '  "orientation": {\n'
+            '    "what_changed": "observable temporal/state change",\n'
+            '    "current_blocker": "blocking UI fact or null",\n'
+            '    "relevant_history": ["recent action/state facts"]\n'
             "  },\n"
-            "  \"hypothesis\": {\n"
-            "    \"claim\": \"why this action should help\",\n"
-            "    \"expected_observation\": \"what should be true next\",\n"
-            "    \"risk\": \"low|medium|high\"\n"
+            '  "hypothesis": {\n'
+            '    "claim": "why this action should help",\n'
+            '    "expected_observation": "what should be true next",\n'
+            '    "risk": "low|medium|high"\n'
             "  },\n"
-            "  \"action\": \"click|double_click|type|hover|focus|select|drag|scroll|tool|explore\",\n"
-            "  \"target_id\": 1,\n"
-            "  \"text\": null,\n"
-            "  \"tool\": null,\n"
-            "  \"code\": null,\n"
-            "  \"confidence\": 0.0,\n"
-            "  \"grounding\": {\n"
-            "    \"state_evidence\": \"focus/modal/task facts used\",\n"
-            "    \"visual_evidence\": \"visible UI evidence used\",\n"
-            "    \"target_mapping\": \"Tag N is the exact target\"\n"
+            '  "action": "click|double_click|type|hover|focus|select|drag|scroll|tool|explore",\n'
+            '  "target_id": 1,\n'
+            '  "text": null,\n'
+            '  "tool": null,\n'
+            '  "code": null,\n'
+            '  "confidence": 0.0,\n'
+            '  "grounding": {\n'
+            '    "state_evidence": "focus/modal/task facts used",\n'
+            '    "visual_evidence": "visible UI evidence used",\n'
+            '    "target_mapping": "Tag N is the exact target"\n'
             "  },\n"
-            "  \"rationale\": \"brief public reason\",\n"
-            "  \"metadata\": {}\n"
+            '  "rationale": "brief public reason",\n'
+            '  "metadata": {}\n'
             "}\n\n"
             "Rules:\n"
             "- orientation and hypothesis are required. They must be based "
@@ -144,8 +144,8 @@ class FrontierPrompt:
             "tool and code, with target_id null.\n"
             "- If the correct tag is ambiguous, missing, occluded, or "
             f"confidence is below {self.confidence_floor:.2f}, output "
-            "{\"action\": \"explore\", \"target_id\": null, "
-            "\"confidence\": <score>, \"grounding\": {...}}.\n"
+            '{"action": "explore", "target_id": null, '
+            '"confidence": <score>, "grounding": {...}}.\n'
             "- Explore is the safe escape hatch; it hands control back to "
             "the local ActiveInferenceExplorer for bounded probing.\n"
         )
@@ -265,7 +265,9 @@ class HTTPFrontierClient:
         }
         data = self._post_json(endpoint, body, headers)
         parts = data.get("content", [])
-        return "\n".join(part.get("text", "") for part in parts if part.get("type") == "text")
+        return "\n".join(
+            part.get("text", "") for part in parts if part.get("type") == "text"
+        )
 
     def _call_gemini(self, prompt: FrontierPrompt) -> str:
         api_key = self._require_api_key()
@@ -312,7 +314,9 @@ class HTTPFrontierClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+            with urllib.request.urlopen(
+                req, timeout=self.config.timeout_seconds
+            ) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
@@ -332,9 +336,7 @@ def extract_json_object(text: str | dict[str, Any]) -> dict[str, Any]:
         pass
     parsed = _scan_first_json_object(stripped)
     if parsed is None:
-        raise ValueError(
-            f"No JSON object found in frontier response: {stripped[:200]}"
-        )
+        raise ValueError(f"No JSON object found in frontier response: {stripped[:200]}")
     return parsed
 
 
@@ -346,9 +348,7 @@ def normalize_decision(
     if isinstance(raw, FrontierDecision):
         return raw
     metadata = (
-        dict(raw.get("metadata", {}))
-        if isinstance(raw.get("metadata"), dict)
-        else {}
+        dict(raw.get("metadata", {})) if isinstance(raw.get("metadata"), dict) else {}
     )
     grounding = raw.get("grounding")
     if isinstance(grounding, dict):
@@ -458,7 +458,7 @@ def _json_object_from_start(text: str, start: int) -> dict[str, Any] | None:
             depth -= 1
             if depth == 0:
                 try:
-                    parsed = json.loads(text[start:index + 1])
+                    parsed = json.loads(text[start : index + 1])
                 except json.JSONDecodeError:
                     return None
                 return parsed if isinstance(parsed, dict) else None
@@ -483,7 +483,9 @@ def default_provider_from_env() -> HTTPFrontierClient | None:
         return HTTPFrontierClient(
             FrontierProviderConfig(
                 provider="anthropic",
-                model=os.environ.get("AGENTOS_FRONTIER_MODEL", "claude-3-5-sonnet-latest"),
+                model=os.environ.get(
+                    "AGENTOS_FRONTIER_MODEL", "claude-3-5-sonnet-latest"
+                ),
                 api_key_env="ANTHROPIC_API_KEY",
                 endpoint=os.environ.get("AGENTOS_FRONTIER_ENDPOINT", ""),
             )

@@ -1,0 +1,32 @@
+{
+  "trace_id": "universal_os_tool_vs_ui_routing",
+  "name": "Universal OS tool versus UI routing",
+  "scope": "universal OS agent mode arbitration",
+  "objective": "Choose deterministic tool execution for code and quantitative tasks instead of unnecessary UI control.",
+  "failure_modes": [
+    "tool_vs_ui_routing"
+  ],
+  "steps": [
+    {
+      "kind": "mode.arbitrate",
+      "expect": "Analysis, compute, code, and script options route to tool mode."
+    },
+    {
+      "kind": "tool.execute",
+      "expect": "The sandbox returns structured stdout, stderr, parsed results, and artifacts."
+    },
+    {
+      "kind": "safety.verify",
+      "expect": "Network and filesystem use remain policy-gated."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "The mode decision and tool receipt are recorded for option-policy training."
+    }
+  ],
+  "expectations": [
+    "The agent does not click through a UI for tasks better solved by code.",
+    "Tool execution remains sandboxed and auditable.",
+    "Mode decisions become supervised examples for the option-policy model."
+  ]
+}

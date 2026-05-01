@@ -138,6 +138,9 @@ class HierarchicalTaskDecomposer:
         """
         lower = objective.lower()
 
+        if self._should_bootstrap_unknown_surface(current_state, lower):
+            return self._build_unknown_surface_hierarchy(objective)
+
         # Try pattern-based decomposition
         hierarchy = self._pattern_decompose(objective, lower, current_state)
         if hierarchy is not None:
@@ -231,12 +234,22 @@ class HierarchicalTaskDecomposer:
         if any(
             kw in lower
             for kw in {
-                "run", "execute", "script", "code", "terminal", "command",
-                "automate", "batch", "pipeline", "compute", "calculate",
+                "run",
+                "execute",
+                "script",
+                "code",
+                "terminal",
+                "command",
+                "automate",
+                "batch",
+                "pipeline",
+                "compute",
+                "calculate",
             }
         ) and not any(
             # Don't intercept when the context is clearly data/quant-only
-            kw in lower for kw in {"stock", "market", "portfolio", "financial", "trading"}
+            kw in lower
+            for kw in {"stock", "market", "portfolio", "financial", "trading"}
         ):
             return self._build_tool_use_hierarchy(objective)
 
@@ -266,10 +279,27 @@ class HierarchicalTaskDecomposer:
         if any(
             kw in lower
             for kw in {
-                "analyse", "analyze", "analysis", "stock", "market", "quant",
-                "quantitative", "data", "statistics", "forecast", "volatility",
-                "portfolio", "trading", "price", "chart", "regression", "correlation",
-                "backtest", "var", "sharpe", "financial",
+                "analyse",
+                "analyze",
+                "analysis",
+                "stock",
+                "market",
+                "quant",
+                "quantitative",
+                "data",
+                "statistics",
+                "forecast",
+                "volatility",
+                "portfolio",
+                "trading",
+                "price",
+                "chart",
+                "regression",
+                "correlation",
+                "backtest",
+                "var",
+                "sharpe",
+                "financial",
             }
         ):
             return self._build_analysis_hierarchy(objective)
@@ -686,9 +716,7 @@ class HierarchicalTaskDecomposer:
             description="Run the generated script in the sandboxed executor",
             initiation_check=lambda s: s.task_progress.get("code_ready", 0) > 0.7,
             policy=["send_to_tool_executor", "monitor_output", "handle_errors"],
-            termination_check=lambda s: (
-                s.task_progress.get("script_complete", 0) > 0.9
-            ),
+            termination_check=lambda s: s.task_progress.get("script_complete", 0) > 0.9,
             success_probability=0.7,
             expected_duration=10,
             preconditions=["Code has been drafted"],
@@ -696,9 +724,7 @@ class HierarchicalTaskDecomposer:
         verify = Option(
             name="verify_script_output",
             description="Check script result is correct and use it",
-            initiation_check=lambda s: (
-                s.task_progress.get("script_complete", 0) > 0.5
-            ),
+            initiation_check=lambda s: s.task_progress.get("script_complete", 0) > 0.5,
             policy=["parse_stdout", "validate_result", "store_artefacts"],
             termination_check=lambda s: s.task_progress.get("verified", 0) > 0.9,
             success_probability=0.85,
@@ -734,6 +760,77 @@ class HierarchicalTaskDecomposer:
                     ),
                     success_probability=0.2,
                     expected_duration=8,
+                ),
+            ],
+        )
+
+    def _build_unknown_surface_hierarchy(self, objective: str) -> TaskHierarchy:
+        """Bootstrap unknown applications before task-specific execution."""
+        return self._build_hierarchy(
+            objective,
+            [
+                Option(
+                    name="orient_surface",
+                    description=(
+                        "Infer the surface purpose, visible landmarks, and the safest "
+                        f"control channels for: {objective}"
+                    ),
+                    initiation_check=lambda s: True,
+                    policy=[
+                        "inspect_window_chrome",
+                        "infer_app_purpose",
+                        "identify_primary_workspace",
+                    ],
+                    termination_check=lambda s: (
+                        s.app_context != "unknown"
+                        or self._interactive_count(s) >= 2
+                        or s.focus_region in {"main", "modal"}
+                    ),
+                    success_probability=0.55,
+                    expected_duration=4,
+                ),
+                Option(
+                    name="discover_affordances",
+                    description=(
+                        "Read the UI, gather documentation or API hints, and test safe "
+                        f"primitive controls for: {objective}"
+                    ),
+                    initiation_check=lambda s: True,
+                    policy=[
+                        "gather_docs_or_api_hints",
+                        "probe_safe_primitives",
+                        "record_affordance_effects",
+                    ],
+                    termination_check=lambda s: (
+                        self._interactive_count(s) >= 2
+                        or s.task_progress.get("understood", 0) > 0.4
+                    ),
+                    success_probability=0.45,
+                    expected_duration=6,
+                    preconditions=["The surface has been oriented"],
+                ),
+                Option(
+                    name="attempt_grounded_objective",
+                    description=(
+                        "Use the best grounded control path to attempt the real objective: "
+                        f"{objective}"
+                    ),
+                    initiation_check=lambda s: (
+                        self._interactive_count(s) > 0
+                        or s.task_progress.get("understood", 0) > 0.2
+                    ),
+                    policy=[
+                        "select_best_affordance",
+                        "execute_grounded_primitive",
+                        "verify_outcome",
+                    ],
+                    termination_check=lambda s: (
+                        s.task_progress.get("task_complete", 0) > 0.7
+                        or s.task_progress.get("grounded_attempt", 0) > 0.6
+                    ),
+                    success_probability=0.35,
+                    expected_duration=8,
+                    preconditions=["At least one control path has been grounded"],
                 ),
             ],
         )
@@ -800,6 +897,39 @@ class HierarchicalTaskDecomposer:
         # Simplified: create from objective as if new
         return self.decompose(objective)
 
+    @staticmethod
+    def _interactive_count(state: AbstractUIState | None) -> int:
+        if state is None:
+            return 0
+        return sum(1 for element in state.elements if element.is_interactive)
+
+    def _should_bootstrap_unknown_surface(
+        self,
+        state: AbstractUIState | None,
+        lower: str,
+    ) -> bool:
+        if state is None:
+            return False
+        if state.app_context not in {"unknown", "other"}:
+            return False
+        if any(
+            kw in lower
+            for kw in {
+                "script",
+                "code",
+                "terminal",
+                "command",
+                "quant",
+                "analysis",
+                "stock",
+                "market",
+                "financial",
+                "backtest",
+            }
+        ):
+            return False
+        return len(state.elements) < 4 or self._interactive_count(state) < 2
+
     def _build_option_library(self) -> None:
         """Pre-populate library of reusable options."""
         common_options = [
@@ -809,6 +939,7 @@ class HierarchicalTaskDecomposer:
             self._build_content_hierarchy("").top_level_options,
             self._build_analysis_hierarchy("").top_level_options,
             self._build_tool_use_hierarchy("").top_level_options,
+            self._build_unknown_surface_hierarchy("").top_level_options,
         ]
         for opts in common_options:
             for opt in opts:

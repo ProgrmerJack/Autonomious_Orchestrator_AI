@@ -26,6 +26,7 @@ class DesktopWorkflowService:
         self.reasoner = DesktopWorkflowReasoner()
         self.max_adaptive_steps = 4
         self._universal_agent: Any | None = None
+        self._universal_backend_id: int | None = None
 
     def enable_universal_mode(
         self,
@@ -52,6 +53,7 @@ class DesktopWorkflowService:
             use_vla=use_vla,
             max_steps=max_steps,
         )
+        self._universal_backend_id = id(backend)
 
     def enable_universal_mode_v2(
         self,
@@ -85,6 +87,24 @@ class DesktopWorkflowService:
             max_steps=max_steps,
             target_latency_ms=target_latency_ms,
         )
+        self._universal_backend_id = id(backend)
+
+    def ensure_universal_mode(self, backend: Any, max_steps: int = 12) -> None:
+        if self._universal_agent is not None and self._universal_backend_id == id(
+            backend
+        ):
+            return
+        try:
+            self.enable_universal_mode_v2(backend, max_steps=max_steps)
+        except (
+            AttributeError,
+            ImportError,
+            ModuleNotFoundError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ):
+            self.enable_universal_mode(backend, max_steps=max_steps)
 
     def plan(self, objective: str):
         return self.planner.plan(objective)
@@ -226,7 +246,9 @@ class DesktopWorkflowService:
         step: Any,
         recovery: dict[str, Any],
     ) -> tuple[str, str]:
-        selector = self._preflight_selector(backend, step.selector, recovery)
+        selector = step.selector
+        if step.action_type != "launch_app":
+            selector = self._preflight_selector(backend, step.selector, recovery)
         receipt = self._perform_step(backend, step, selector)
         selector, receipt = self._retry_with_fallback(
             backend,

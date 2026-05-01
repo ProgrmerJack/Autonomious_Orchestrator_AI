@@ -52,9 +52,7 @@ def analyze_png(value: bytes) -> PngImageSummary:
         color_type=payload.color_type,
         sha256=hashlib.sha256(value).hexdigest(),
         distinct_pixel_count=len(set(pixels)),
-        non_background_pixel_count=sum(
-            1 for pixel in pixels if pixel != background
-        ),
+        non_background_pixel_count=sum(1 for pixel in pixels if pixel != background),
         non_background_bounds=bounds,
     )
 
@@ -110,8 +108,8 @@ def _png_chunks(value: bytes) -> list[tuple[bytes, bytes]]:
     chunks: list[tuple[bytes, bytes]] = []
     offset = len(PNG_SIGNATURE)
     while offset + 8 <= len(value):
-        length = struct.unpack(">I", value[offset:offset + 4])[0]
-        chunk_type = value[offset + 4:offset + 8]
+        length = struct.unpack(">I", value[offset : offset + 4])[0]
+        chunk_type = value[offset + 4 : offset + 8]
         data_start = offset + 8
         data_end = data_start + length
         if data_end + 4 > len(value):
@@ -125,9 +123,7 @@ def _validate_png_payload(payload: _PngPayload) -> None:
     if payload.width <= 0 or payload.height <= 0:
         raise ValueError("PNG image dimensions were not found")
     if payload.interlace != 0:
-        raise ValueError(
-            "Interlaced PNG files are not supported for verification"
-        )
+        raise ValueError("Interlaced PNG files are not supported for verification")
     if payload.bit_depth != 8:
         raise ValueError(f"Unsupported PNG bit depth: {payload.bit_depth}")
     if not payload.idat:
@@ -155,12 +151,10 @@ def _decode_png_pixels(
     pixels: list[bytes] = []
     for _row in range(height):
         if offset >= len(decompressed):
-            raise ValueError(
-                "PNG image data ended before all rows were decoded"
-            )
+            raise ValueError("PNG image data ended before all rows were decoded")
         filter_type = decompressed[offset]
         offset += 1
-        row = bytearray(decompressed[offset:offset + row_length])
+        row = bytearray(decompressed[offset : offset + row_length])
         if len(row) != row_length:
             raise ValueError("PNG scanline length did not match image width")
         offset += row_length
@@ -172,7 +166,7 @@ def _decode_png_pixels(
 
 def _row_pixels(row: bytearray, channels: int) -> list[bytes]:
     return [
-        bytes(row[pixel_offset:pixel_offset + channels])
+        bytes(row[pixel_offset : pixel_offset + channels])
         for pixel_offset in range(0, len(row), channels)
     ]
 
@@ -193,9 +187,7 @@ def _apply_png_filter(
     try:
         handlers[filter_type](row, previous, bytes_per_pixel)
     except KeyError as exc:
-        raise ValueError(
-            f"Unsupported PNG filter type: {filter_type}"
-        ) from exc
+        raise ValueError(f"Unsupported PNG filter type: {filter_type}") from exc
 
 
 def _filter_none(
@@ -243,7 +235,8 @@ def _filter_paeth(
 ) -> None:
     for index, value in enumerate(row):
         row[index] = (
-            value + _paeth_predictor(
+            value
+            + _paeth_predictor(
                 _left(row, bytes_per_pixel, index),
                 previous[index],
                 _upper_left(previous, bytes_per_pixel, index),

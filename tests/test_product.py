@@ -102,6 +102,30 @@ class ProductTests(unittest.TestCase):
             client.golden_traces()["path"],
             "/benchmarks/golden-traces",
         )
+        self.assertEqual(client.eval_pack()["path"], "/benchmarks/eval-pack")
+        self.assertEqual(client.replay_debug()["path"], "/debug/replay")
+        self.assertEqual(
+            client.live_fire_eval(
+                max_tasks=1,
+                windows_safe_pack=True,
+                repeat=2,
+            )["path"],
+            "/benchmarks/live-fire-eval",
+        )
+        self.assertTrue(client.calls[-1][2]["windows_safe_pack"])
+        self.assertEqual(client.calls[-1][2]["repeat"], 2)
+        self.assertEqual(
+            client.live_fire_review()["path"],
+            "/benchmarks/live-fire-review?limit=10",
+        )
+        self.assertEqual(
+            client.promote_live_fire_failure("run", "task")["path"],
+            "/benchmarks/live-fire-review/promote",
+        )
+        self.assertEqual(
+            client.live_fire_shadow_training(["trace.jsonl"])["path"],
+            "/benchmarks/live-fire-shadow-training",
+        )
         self.assertEqual(
             client.pc_debug_selector("name=AgentOS")["path"],
             "/pc/debug-selector",

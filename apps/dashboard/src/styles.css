@@ -421,6 +421,74 @@ article:first-of-type {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
 }
 
+.live-fire-actions {
+    justify-content: flex-start;
+    margin-bottom: 10px;
+}
+
+.milestone-grid {
+    display: grid;
+    gap: 10px;
+    grid-template-columns: repeat(3, minmax(110px, 1fr));
+    margin: 12px 0;
+}
+
+.milestone-grid div {
+    background: #fbfbf9;
+    border: 1px solid #e2e2dd;
+    border-radius: 8px;
+    display: grid;
+    gap: 4px;
+    padding: 11px;
+}
+
+.milestone-grid strong {
+    color: #111111;
+    font-size: 18px;
+}
+
+.milestone-grid span {
+    color: #6f6f68;
+    font-size: 12px;
+}
+
+.failure-list {
+    display: grid;
+    gap: 7px;
+    max-height: 460px;
+    overflow: auto;
+}
+
+.failure-item {
+    align-items: start;
+    background: #fbfbf9;
+    border-color: #e2e2dd;
+    color: #1f1f1f;
+    display: grid;
+    gap: 3px;
+    justify-items: start;
+    min-height: 0;
+    padding: 10px;
+    text-align: left;
+    white-space: normal;
+}
+
+.failure-item:hover,
+.failure-item.active {
+    background: #f0f0ed;
+    border-color: #c9c9c4;
+}
+
+.failure-item span,
+.failure-item small {
+    color: #6f6f68;
+    font-size: 12px;
+}
+
+.shadow-heads {
+    border-top: 1px solid #eeeeea;
+}
+
 @media (max-width: 920px) {
     .app-shell {
         padding: 14px;
@@ -434,7 +502,8 @@ article:first-of-type {
     .status-strip,
     .two-col,
     .pc-layout,
-    .system-grid {
+    .system-grid,
+    .milestone-grid {
         grid-template-columns: 1fr;
     }
 

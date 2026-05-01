@@ -1,0 +1,32 @@
+{
+  "trace_id": "universal_os_delayed_dialog",
+  "name": "Universal OS delayed dialog handling",
+  "scope": "universal OS agent delayed UI state",
+  "objective": "Handle dialogs that appear after a delay without assuming the previous action failed.",
+  "failure_modes": [
+    "delayed_dialog"
+  ],
+  "steps": [
+    {
+      "kind": "action.record",
+      "expect": "The previous action is stored with an expected observation."
+    },
+    {
+      "kind": "runtime.observe",
+      "expect": "A later observation can satisfy the previous expected observation."
+    },
+    {
+      "kind": "outcome.evaluate",
+      "expect": "The evaluator uses receipt and diff evidence before creating a blocker."
+    },
+    {
+      "kind": "replan.defer",
+      "expect": "The agent avoids premature failure while evidence is still arriving."
+    }
+  ],
+  "expectations": [
+    "Expected observations survive across ticks.",
+    "Delayed modal appearance is treated as temporal evidence, not hallucination.",
+    "The final repair decision is based on observed state."
+  ]
+}

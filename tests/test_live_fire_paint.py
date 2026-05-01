@@ -175,10 +175,7 @@ class LiveFirePaintTests(unittest.TestCase):
             self.assertGreaterEqual(backend.snapshot_count, 4)
             self.assertEqual(result.safety_reason, "allowed")
             self.assertTrue(
-                any(
-                    item["action_type"] == "draw_path"
-                    for item in result.receipts
-                )
+                any(item["action_type"] == "draw_path" for item in result.receipts)
             )
 
     def test_paint_live_fire_blocks_path_escape_before_actions(self) -> None:

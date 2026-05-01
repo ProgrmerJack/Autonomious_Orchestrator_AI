@@ -1,0 +1,537 @@
+{
+  "trace_id": "live_fire_browser_03_fill_form_925e0d0f6c",
+  "name": "Live-fire eval failure: browser_03_fill_form",
+  "scope": "universal OS live-fire eval",
+  "objective": "Prevent regression for browser_03_fill_form.",
+  "failure_modes": [
+    "typed value was not observed"
+  ],
+  "steps": [
+    {
+      "kind": "live_fire.execute",
+      "expect": "Task is run safely."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "Failure is recorded."
+    },
+    {
+      "kind": "debug.replay",
+      "expect": "Replay explains failure."
+    },
+    {
+      "kind": "shadow.train",
+      "expect": "Trajectory trains heads."
+    }
+  ],
+  "expectations": [
+    "The failure remains reproducible from the live-fire trace.",
+    "A future run either verifies the task or records a repair."
+  ],
+  "metadata": {
+    "run_id": "windows_uia_safe_pack_20260430_post_reground",
+    "surface": "browser",
+    "intent": "fill_form",
+    "trajectory_path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_browser_03_fill_form.jsonl"
+  },
+  "replay_debug": {
+    "run_count": 1,
+    "runs": [
+      {
+        "path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_browser_03_fill_form.jsonl",
+        "run_id": "windows_uia_safe_pack_20260430_post_reground_browser_03_fill_form",
+        "objective": "On a browser surface, fill form and verify the result.",
+        "step_count": 2,
+        "success": false,
+        "steps": [
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 286,
+                "element_types": {
+                  "button": 97,
+                  "image": 12,
+                  "panel": 146,
+                  "tab": 22,
+                  "text_field": 9
+                },
+                "focus_region": "main",
+                "interactive_count": 136,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 294,
+                "element_types": {
+                  "button": 97,
+                  "image": 12,
+                  "panel": 153,
+                  "tab": 22,
+                  "text_field": 10
+                },
+                "focus_region": "main",
+                "interactive_count": 137,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 294,
+                  "before": 286
+                },
+                "element_types": {
+                  "after": {
+                    "button": 97,
+                    "image": 12,
+                    "panel": 153,
+                    "tab": 22,
+                    "text_field": 10
+                  },
+                  "before": {
+                    "button": 97,
+                    "image": 12,
+                    "panel": 146,
+                    "tab": 22,
+                    "text_field": 9
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.904,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "tabs",
+                    "address bar",
+                    "links",
+                    "forms",
+                    "page actions"
+                  ],
+                  "family": "browser",
+                  "preferred_channels": [
+                    "accessibility",
+                    "dom",
+                    "explore",
+                    "vision"
+                  ],
+                  "repair_recipes": [
+                    "refresh DOM/accessibility",
+                    "escape modal",
+                    "bounded link probe"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "tab_focused",
+                    "field_contains",
+                    "state_changed"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.989,
+                  "app_family": "browser",
+                  "app_signature": "browser:ec0e13d8af6a",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.815,
+                  "confidence": 0.904,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.65,
+                  "evidence": {
+                    "app_context": "browser",
+                    "element_count": 286,
+                    "interactive_count": 136,
+                    "layout_mode": "full",
+                    "node_count": 286,
+                    "sample_names": [
+                      "QA OSD",
+                      "Running applications",
+                      "Widgets 28\u00f8C Partly cloudy",
+                      "27\u00f8C",
+                      "Partly cloudy",
+                      "28\u00f8C",
+                      "Partly cloudy",
+                      "Start"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "hybrid",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "hybrid",
+              "rationale": "Profile recommends combining local structure with semantic guidance.",
+              "should_use_frontier": true
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.989,
+              "app_family": "browser",
+              "app_signature": "browser:ec0e13d8af6a",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.815,
+              "confidence": 0.904,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.65,
+              "evidence": {
+                "app_context": "browser",
+                "element_count": 286,
+                "interactive_count": 136,
+                "layout_mode": "full",
+                "node_count": 286,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "hybrid",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tabs",
+                "address bar",
+                "links",
+                "forms",
+                "page actions"
+              ],
+              "family": "browser",
+              "preferred_channels": [
+                "accessibility",
+                "dom",
+                "explore",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh DOM/accessibility",
+                "escape modal",
+                "bounded link probe"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "tab_focused",
+                "field_contains",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "launch_app",
+              "selector": "browser",
+              "value": "browser",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "browser surface launches.",
+            "verification_contract": {
+              "expected": "browser surface launches.",
+              "kind": "process_launched",
+              "metadata": {
+                "action_type": "launch_app",
+                "selector": "browser"
+              },
+              "path": "",
+              "required": true,
+              "target": "",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": ""
+              },
+              "expected": "browser surface launches.",
+              "kind": "process_launched",
+              "matched": true,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 29332, \"selector\": \"browser\", \"status\": \"launched\"}",
+              "reason": "",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 29332, \"selector\": \"browser\", \"status\": \"launched\"}",
+            "outcome": {
+              "expected": "browser surface launches.",
+              "failure_reason": null,
+              "matched": true,
+              "new_blocker": null,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 29332, \"selector\": \"browser\", \"status\": \"launched\"}",
+              "suggested_repair": null
+            },
+            "blocker": null,
+            "repair": null,
+            "latency_ms": 1840.586
+          },
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 349,
+                "element_types": {
+                  "button": 115,
+                  "image": 16,
+                  "panel": 184,
+                  "tab": 22,
+                  "text_field": 12
+                },
+                "focus_region": "main",
+                "interactive_count": 159,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 349,
+                "element_types": {
+                  "button": 115,
+                  "image": 16,
+                  "panel": 184,
+                  "tab": 22,
+                  "text_field": 12
+                },
+                "focus_region": "main",
+                "interactive_count": 159,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {}
+            },
+            "chosen_mode": {
+              "confidence": 0.904,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "tabs",
+                    "address bar",
+                    "links",
+                    "forms",
+                    "page actions"
+                  ],
+                  "family": "browser",
+                  "preferred_channels": [
+                    "accessibility",
+                    "dom",
+                    "explore",
+                    "vision"
+                  ],
+                  "repair_recipes": [
+                    "refresh DOM/accessibility",
+                    "escape modal",
+                    "bounded link probe"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "tab_focused",
+                    "field_contains",
+                    "state_changed"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.988,
+                  "app_family": "browser",
+                  "app_signature": "browser:ec0e13d8af6a",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.815,
+                  "confidence": 0.904,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.65,
+                  "evidence": {
+                    "app_context": "browser",
+                    "element_count": 349,
+                    "interactive_count": 159,
+                    "layout_mode": "full",
+                    "node_count": 349,
+                    "sample_names": [
+                      "QA OSD",
+                      "Running applications",
+                      "Widgets 28\u00f8C Partly cloudy",
+                      "27\u00f8C",
+                      "Partly cloudy",
+                      "28\u00f8C",
+                      "Partly cloudy",
+                      "Start"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "hybrid",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "hybrid",
+              "rationale": "Profile recommends combining local structure with semantic guidance.",
+              "should_use_frontier": true
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.988,
+              "app_family": "browser",
+              "app_signature": "browser:ec0e13d8af6a",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.815,
+              "confidence": 0.904,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.65,
+              "evidence": {
+                "app_context": "browser",
+                "element_count": 349,
+                "interactive_count": 159,
+                "layout_mode": "full",
+                "node_count": 349,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "hybrid",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tabs",
+                "address bar",
+                "links",
+                "forms",
+                "page actions"
+              ],
+              "family": "browser",
+              "preferred_channels": [
+                "accessibility",
+                "dom",
+                "explore",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh DOM/accessibility",
+                "escape modal",
+                "bounded link probe"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "tab_focused",
+                "field_contains",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "set_text",
+              "selector": "name=Address and search bar",
+              "value": "AgentOS live-fire value",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "The target field contains the live-fire value.",
+            "verification_contract": {
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "metadata": {
+                "action_type": "set_text",
+                "regrounded": true,
+                "selector": "name=Address and search bar"
+              },
+              "path": "",
+              "required": true,
+              "target": "name=Address and search bar",
+              "value": "AgentOS live-fire value"
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": "name=Address and search bar"
+              },
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "matched": false,
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 4 running windows visual studio code - 1 running window show hidden icons  onedrive - personal\r\nup to date  tray input indicator english (united states)\r\nus\r\n\r\nto switch input met",
+              "reason": "typed value was not observed",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"set_text\", \"draw_path\": null, \"focus_error\": \"Exception calling \\\"SetFocus\\\" with \\\"0\\\" argument(s): \\\"Target element cannot receive focus.\\\"\", \"matched_name\": \"Address and search bar\", \"matched_role\": \"ControlType.Edit\", \"selector\": \"name=Address and search bar\", \"status\": \"value-set\"}",
+            "outcome": {
+              "expected": "The target field contains the live-fire value.",
+              "failure_reason": "typed value was not observed",
+              "matched": false,
+              "new_blocker": "typed value was not observed",
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 4 running windows visual studio code - 1 running window show hidden icons  onedrive - personal\r\nup to date  tray input indicator english (united states)\r\nus\r\n\r\nto switch input met",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "blocker": {
+              "new_blocker": "typed value was not observed",
+              "failure_reason": "typed value was not observed",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "repair": null,
+            "latency_ms": 1726.987
+          }
+        ],
+        "final_state": {
+          "failure_reason": "typed value was not observed",
+          "success": false,
+          "task_id": "browser_03_fill_form"
+        }
+      }
+    ],
+    "schema_version": 1
+  }
+}

@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from agentos_orchestrator.cognition.abstract_world_model import (
+    AbstractMCTSAdapter,
     AbstractUIState,
     AbstractWorldModel,
     ActionEmbedding,
@@ -33,6 +34,7 @@ from agentos_orchestrator.cognition.hierarchical_task_decomposer import (
     Option,
     TaskHierarchy,
 )
+from agentos_orchestrator.cognition.mcts_simulator import WorldState
 from agentos_orchestrator.os_control.base import UiAction
 
 
@@ -387,6 +389,52 @@ class AbstractWorldModelTests(unittest.TestCase):
         self.assertEqual(reconstructed.app_context, "browser")
         self.assertEqual(len(reconstructed.elements), 1)
 
+    def test_abstract_mcts_adapter_inferrs_actions_from_state_vector(self) -> None:
+        adapter = AbstractMCTSAdapter(AbstractWorldModel())
+        state = AbstractUIState(
+            app_context="browser",
+            layout_mode="full",
+            elements=[
+                UIElementState("text_field", "header", 0.5, 0.1, True, "search"),
+                UIElementState("button", "main", 0.5, 0.5, True, "go"),
+                UIElementState("link", "header", 0.2, 0.1, True, "docs"),
+            ],
+        )
+        world = WorldState(
+            state_vector=state.to_vector(256).tolist(),
+            depth=0,
+            terminal=False,
+            reward=0.0,
+        )
+        actions = adapter.available_actions(world)
+        selectors = {action.selector for action in actions}
+        self.assertIn("inferred_search_input", selectors)
+        self.assertIn("inferred_primary_button", selectors)
+        self.assertIn("inferred_navigation", selectors)
+
+    def test_abstract_mcts_adapter_prioritizes_modal_actions(self) -> None:
+        adapter = AbstractMCTSAdapter(AbstractWorldModel())
+        state = AbstractUIState(
+            app_context="browser",
+            layout_mode="modal_open",
+            active_modal="Save As",
+            elements=[
+                UIElementState("button", "modal", 0.5, 0.5, True, "save"),
+                UIElementState("text_field", "modal", 0.5, 0.4, True, "filename"),
+            ],
+        )
+        world = WorldState(
+            state_vector=state.to_vector(256).tolist(),
+            depth=0,
+            terminal=False,
+            reward=0.0,
+        )
+        actions = adapter.available_actions(world)
+        selectors = {action.selector for action in actions}
+        self.assertIn("inferred_modal_confirm", selectors)
+        self.assertIn("escape", selectors)
+        self.assertNotIn("inferred_navigation", selectors)
+
 
 # --------------------------------------------------------------------------- #
 # 3. Hierarchical Task Decomposer Tests
@@ -446,6 +494,17 @@ class HierarchicalTaskDecomposerTests(unittest.TestCase):
         hierarchy = decomp.decompose("xyzzy plugh")
         names = [opt.name for opt in hierarchy.execution_sequence]
         self.assertIn("explore_ui", names)
+
+    def test_decompose_unknown_surface_bootstraps_orientation(self) -> None:
+        decomp = HierarchicalTaskDecomposer()
+        hierarchy = decomp.decompose(
+            "Draw a simple logo",
+            AbstractUIState(app_context="unknown", elements=[]),
+        )
+        names = [opt.name for opt in hierarchy.execution_sequence]
+        self.assertIn("orient_surface", names)
+        self.assertIn("discover_affordances", names)
+        self.assertIn("attempt_grounded_objective", names)
 
     def test_hierarchy_execution_sequence(self) -> None:
         decomp = HierarchicalTaskDecomposer()

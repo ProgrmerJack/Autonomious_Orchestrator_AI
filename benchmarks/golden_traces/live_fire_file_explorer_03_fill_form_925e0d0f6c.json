@@ -1,0 +1,405 @@
+{
+  "trace_id": "live_fire_file_explorer_03_fill_form_925e0d0f6c",
+  "name": "Live-fire eval failure: file_explorer_03_fill_form",
+  "scope": "universal OS live-fire eval",
+  "objective": "Prevent regression for file_explorer_03_fill_form.",
+  "failure_modes": [
+    "typed value was not observed"
+  ],
+  "steps": [
+    {
+      "kind": "live_fire.execute",
+      "expect": "Task is run safely."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "Failure is recorded."
+    },
+    {
+      "kind": "debug.replay",
+      "expect": "Replay explains failure."
+    },
+    {
+      "kind": "shadow.train",
+      "expect": "Trajectory trains heads."
+    }
+  ],
+  "expectations": [
+    "The failure remains reproducible from the live-fire trace.",
+    "A future run either verifies the task or records a repair."
+  ],
+  "metadata": {
+    "run_id": "windows_uia_safe_pack_20260430_post_reground",
+    "surface": "file_explorer",
+    "intent": "fill_form",
+    "trajectory_path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_file_explorer_03_fill_form.jsonl"
+  },
+  "replay_debug": {
+    "run_count": 1,
+    "runs": [
+      {
+        "path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_20260430_post_reground_file_explorer_03_fill_form.jsonl",
+        "run_id": "windows_uia_safe_pack_20260430_post_reground_file_explorer_03_fill_form",
+        "objective": "On a file explorer surface, fill form and verify the result.",
+        "step_count": 2,
+        "success": false,
+        "steps": [
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "file_explorer",
+                "element_count": 664,
+                "element_types": {
+                  "button": 209,
+                  "image": 54,
+                  "panel": 350,
+                  "tab": 26,
+                  "text_field": 25
+                },
+                "focus_region": "main",
+                "interactive_count": 282,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "file_explorer",
+                "element_count": 727,
+                "element_types": {
+                  "button": 229,
+                  "image": 67,
+                  "panel": 376,
+                  "tab": 28,
+                  "text_field": 27
+                },
+                "focus_region": "main",
+                "interactive_count": 309,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 727,
+                  "before": 664
+                },
+                "element_types": {
+                  "after": {
+                    "button": 229,
+                    "image": 67,
+                    "panel": 376,
+                    "tab": 28,
+                    "text_field": 27
+                  },
+                  "before": {
+                    "button": 209,
+                    "image": 54,
+                    "panel": 350,
+                    "tab": 26,
+                    "text_field": 25
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.72,
+              "evidence": {
+                "app_context": "file_explorer",
+                "interactive_count": 282
+              },
+              "mode": "ui",
+              "rationale": "The visible UI has enough structure for local action selection.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.982,
+              "app_family": "file_explorer",
+              "app_signature": "file_explorer:269524f36dca",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.723,
+              "confidence": 0.901,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "api",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "file_explorer",
+                "element_count": 664,
+                "interactive_count": 282,
+                "layout_mode": "full",
+                "node_count": 664,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.45,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "ui",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tree",
+                "file list",
+                "breadcrumb",
+                "context menu"
+              ],
+              "family": "file_explorer",
+              "preferred_channels": [
+                "accessibility",
+                "api",
+                "explore",
+                "dom",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh folder",
+                "validate path",
+                "use structured file action"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "file_exists",
+                "window_title_changed",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "launch_app",
+              "selector": "explorer.exe",
+              "value": "explorer.exe",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "file_explorer surface launches.",
+            "verification_contract": {
+              "expected": "file_explorer surface launches.",
+              "kind": "process_launched",
+              "metadata": {
+                "action_type": "launch_app",
+                "selector": "explorer.exe"
+              },
+              "path": "",
+              "required": true,
+              "target": "",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": ""
+              },
+              "expected": "file_explorer surface launches.",
+              "kind": "process_launched",
+              "matched": true,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"explorer.exe\", \"process_id\": 37008, \"selector\": \"explorer.exe\", \"status\": \"launched\"}",
+              "reason": "",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"launch_app\", \"launched\": \"explorer.exe\", \"process_id\": 37008, \"selector\": \"explorer.exe\", \"status\": \"launched\"}",
+            "outcome": {
+              "expected": "file_explorer surface launches.",
+              "failure_reason": null,
+              "matched": true,
+              "new_blocker": null,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"explorer.exe\", \"process_id\": 37008, \"selector\": \"explorer.exe\", \"status\": \"launched\"}",
+              "suggested_repair": null
+            },
+            "blocker": null,
+            "repair": null,
+            "latency_ms": 2045.916
+          },
+          {
+            "option": "fill_form",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "file_explorer",
+                "element_count": 727,
+                "element_types": {
+                  "button": 229,
+                  "image": 67,
+                  "panel": 376,
+                  "tab": 28,
+                  "text_field": 27
+                },
+                "focus_region": "main",
+                "interactive_count": 309,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "file_explorer",
+                "element_count": 727,
+                "element_types": {
+                  "button": 229,
+                  "image": 67,
+                  "panel": 376,
+                  "tab": 28,
+                  "text_field": 27
+                },
+                "focus_region": "main",
+                "interactive_count": 309,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {}
+            },
+            "chosen_mode": {
+              "confidence": 0.72,
+              "evidence": {
+                "app_context": "file_explorer",
+                "interactive_count": 309
+              },
+              "mode": "ui",
+              "rationale": "The visible UI has enough structure for local action selection.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.98,
+              "app_family": "file_explorer",
+              "app_signature": "file_explorer:269524f36dca",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.722,
+              "confidence": 0.9,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "api",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "file_explorer",
+                "element_count": 727,
+                "interactive_count": 309,
+                "layout_mode": "full",
+                "node_count": 727,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 28\u00f8C Partly cloudy",
+                  "27\u00f8C",
+                  "Partly cloudy",
+                  "28\u00f8C",
+                  "Partly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.45,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "ui",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tree",
+                "file list",
+                "breadcrumb",
+                "context menu"
+              ],
+              "family": "file_explorer",
+              "preferred_channels": [
+                "accessibility",
+                "api",
+                "explore",
+                "dom",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh folder",
+                "validate path",
+                "use structured file action"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "file_exists",
+                "window_title_changed",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "set_text",
+              "selector": "name=Home",
+              "value": "AgentOS live-fire value",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "The target field contains the live-fire value.",
+            "verification_contract": {
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "metadata": {
+                "action_type": "set_text",
+                "regrounded": true,
+                "selector": "name=Home"
+              },
+              "path": "",
+              "required": true,
+              "target": "name=Home",
+              "value": "AgentOS live-fire value"
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": "name=Home"
+              },
+              "expected": "The target field contains the live-fire value.",
+              "kind": "field_contains",
+              "matched": false,
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer - 3 running windows pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 7 running windows visual studio code - 1 running window show hidden icons  onedrive - personal\r\nup to date  tray input indicator english (united states)\r\nus\r\n\r",
+              "reason": "typed value was not observed",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"set_text\", \"draw_path\": null, \"focus_error\": null, \"matched_name\": \"Home - File Explorer\", \"matched_role\": \"ControlType.Window\", \"selector\": \"name=Home\", \"status\": \"typed\"}",
+            "outcome": {
+              "expected": "The target field contains the live-fire value.",
+              "failure_reason": "typed value was not observed",
+              "matched": false,
+              "new_blocker": "typed value was not observed",
+              "observed": "qa osd    running applications   widgets 28\u00f8c partly cloudy  27\u00f8c partly cloudy  28\u00f8c partly cloudy start search search search - keukenhof gardens, lisse, netherlands  task view microsoft 365 copilot pinned file explorer - 3 running windows pinned microsoft store pinned microsoft edge pinned telegram desktop pinned outlook pinned yandex - 7 running windows visual studio code - 1 running window show hidden icons  onedrive - personal\r\nup to date  tray input indicator english (united states)\r\nus\r\n\r",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "blocker": {
+              "new_blocker": "typed value was not observed",
+              "failure_reason": "typed value was not observed",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "repair": null,
+            "latency_ms": 3280.926
+          }
+        ],
+        "final_state": {
+          "failure_reason": "typed value was not observed",
+          "success": false,
+          "task_id": "file_explorer_03_fill_form"
+        }
+      }
+    ],
+    "schema_version": 1
+  }
+}

@@ -78,7 +78,11 @@ class SelfDocumentationLoop:
         self.workspace_root = Path(workspace_root)
         self.search_provider = search_provider
         self.fetcher = fetcher or UrlLibFetcher()
-        self.cache_dir = Path(cache_dir) if cache_dir else self.workspace_root / ".agentos" / "docs_cache"
+        self.cache_dir = (
+            Path(cache_dir)
+            if cache_dir
+            else self.workspace_root / ".agentos" / "docs_cache"
+        )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def prepare_context(
@@ -129,20 +133,31 @@ class SelfDocumentationLoop:
         scored = [(url, self._official_score(url, app_hint)) for url in deduped]
         official = [(url, score) for url, score in scored if score > 0.0]
         ranked = official or scored
-        return [url for url, _score in sorted(ranked, key=lambda item: item[1], reverse=True)]
+        return [
+            url
+            for url, _score in sorted(ranked, key=lambda item: item[1], reverse=True)
+        ]
 
     @staticmethod
     def _official_score(url: str, app_hint: str) -> float:
         lower = url.lower()
-        app_tokens = [t for t in re.split(r"[^a-z0-9]+", app_hint.lower()) if len(t) > 2]
+        app_tokens = [
+            t for t in re.split(r"[^a-z0-9]+", app_hint.lower()) if len(t) > 2
+        ]
         score = 0.0
         if any(token in lower for token in app_tokens):
             score += 0.25
-        if any(part in lower for part in ("docs", "documentation", "help", "support", "learn")):
+        if any(
+            part in lower
+            for part in ("docs", "documentation", "help", "support", "learn")
+        ):
             score += 0.35
         if any(part in lower for part in ("official", "developer", "manual", "guide")):
             score += 0.15
-        if any(domain in lower for domain in ("youtube.com", "reddit.com", "x.com", "twitter.com")):
+        if any(
+            domain in lower
+            for domain in ("youtube.com", "reddit.com", "x.com", "twitter.com")
+        ):
             score -= 0.4
         if lower.startswith("https://"):
             score += 0.05
@@ -176,6 +191,8 @@ class SelfDocumentationLoop:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return DocumentationBundle(
             query=payload.get("query", ""),
-            sources=[DocumentationSource(**source) for source in payload.get("sources", [])],
+            sources=[
+                DocumentationSource(**source) for source in payload.get("sources", [])
+            ],
             cache_hit=True,
         )

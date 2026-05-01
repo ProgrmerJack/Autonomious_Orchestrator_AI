@@ -1,0 +1,32 @@
+{
+  "trace_id": "universal_os_stale_screenshot",
+  "name": "Universal OS stale screenshot recovery",
+  "scope": "universal OS agent Set-of-Mark grounding",
+  "objective": "Recover when a frontier decision refers to stale or missing Set-of-Mark IDs.",
+  "failure_modes": [
+    "stale_screenshot"
+  ],
+  "steps": [
+    {
+      "kind": "frontier.normalize",
+      "expect": "Unknown or low-confidence target IDs are rejected or coerced to explore."
+    },
+    {
+      "kind": "repair.plan",
+      "expect": "Selector-not-found blockers produce a re-snapshot exploration action."
+    },
+    {
+      "kind": "active.inference",
+      "expect": "Bounded probes gather fresh local evidence."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "The failed target and fresh observation are preserved for training."
+    }
+  ],
+  "expectations": [
+    "The agent never clicks an unverified stale mark.",
+    "Explore is the safe escape hatch for ambiguous tags.",
+    "The trace contains enough evidence to train the outcome critic."
+  ]
+}

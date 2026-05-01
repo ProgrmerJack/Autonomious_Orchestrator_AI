@@ -12,6 +12,17 @@ import webbrowser
 from dataclasses import asdict
 from pathlib import Path
 
+from .cognition.adaptation_training import (
+    AdaptationLongRunConfig,
+    AdaptationTrainingConfig,
+    UnknownAppAdaptationTrainer,
+)
+from .cognition.live_fire_eval import LiveFireEvalConfig, LiveFireEvalRunner
+from .cognition.live_fire_review import (
+    load_live_fire_reviews,
+    promote_live_fire_failure,
+    write_shadow_training_heads,
+)
 from .core.orchestrator import ResearchOrchestrator
 from .core.policy import PermissionPolicy
 from .core.types import ActionRequest
@@ -223,6 +234,104 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paint_live_fire_parser.add_argument("--timeout", type=float, default=12.0)
     paint_live_fire_parser.add_argument("--approval-token")
+
+    eval_live_fire_parser = subparsers.add_parser(
+        "pc-live-fire-eval",
+        help="Run the universal 100-task live-fire OS eval pack.",
+        parents=[runtime_parent],
+    )
+    eval_live_fire_parser.add_argument(
+        "--backend",
+        default="virtual-desktop-sandbox",
+    )
+    eval_live_fire_parser.add_argument("--max-tasks", type=int)
+    eval_live_fire_parser.add_argument("--surface", action="append")
+    eval_live_fire_parser.add_argument("--intent", action="append")
+    eval_live_fire_parser.add_argument("--run-id", default="")
+    eval_live_fire_parser.add_argument(
+        "--safe-windows-pack",
+        action="store_true",
+    )
+    eval_live_fire_parser.add_argument("--repeat", type=int, default=1)
+    eval_live_fire_parser.add_argument("--promote-after", type=int, default=1)
+    eval_live_fire_parser.add_argument("--heldout-from", default="")
+    eval_live_fire_parser.add_argument(
+        "--no-promote-failures",
+        action="store_true",
+    )
+    eval_live_fire_parser.add_argument("--replay-limit", type=int, default=10)
+    eval_live_fire_parser.add_argument("--training-output", default="")
+    eval_live_fire_parser.add_argument("--approval-token")
+
+    eval_review_parser = subparsers.add_parser(
+        "pc-live-fire-review",
+        help="Review recent live-fire failures and optionally promote one.",
+        parents=[runtime_parent],
+    )
+    eval_review_parser.add_argument("--limit", type=int, default=10)
+    eval_review_parser.add_argument("--promote-run-id", default="")
+    eval_review_parser.add_argument("--promote-task-id", default="")
+
+    shadow_parser = subparsers.add_parser(
+        "pc-live-fire-shadow-train",
+        help="Write advisory shadow-training datasets for low-risk heads.",
+        parents=[runtime_parent],
+    )
+    shadow_parser.add_argument("--trajectory", action="append")
+    shadow_parser.add_argument("--output-dir", default="")
+
+    train_parser = subparsers.add_parser(
+        "pc-train-adaptation",
+        help="Warm-start unknown-app adaptation from external GUI data and local trajectories.",
+        parents=[runtime_parent],
+    )
+    train_parser.add_argument("--screenspot-limit", type=int, default=64)
+    train_parser.add_argument("--click100k-limit", type=int, default=0)
+    train_parser.add_argument("--gui-actor-limit", type=int, default=0)
+    train_parser.add_argument("--screenspot-source", action="append")
+    train_parser.add_argument("--osworld-archive-limit", type=int, default=0)
+    train_parser.add_argument(
+        "--osworld-archive-transition-limit",
+        type=int,
+        default=0,
+    )
+    train_parser.add_argument("--trajectory", action="append")
+    train_parser.add_argument("--output-dir", default="")
+    train_parser.add_argument("--cache-dir", default="")
+    train_parser.add_argument("--cache-budget-gb", type=float, default=0.0)
+    train_parser.add_argument("--stage-archives", action="store_true")
+    train_parser.add_argument("--skip-osworld-manifest", action="store_true")
+
+    longrun_parser = subparsers.add_parser(
+        "pc-train-adaptation-longrun",
+        help="Run shard-based adaptation training across many archive batches with optional local staging.",
+        parents=[runtime_parent],
+    )
+    longrun_parser.add_argument("--shard-count", type=int, default=1)
+    longrun_parser.add_argument("--screenspot-limit-per-shard", type=int, default=0)
+    longrun_parser.add_argument("--click100k-limit-per-shard", type=int, default=0)
+    longrun_parser.add_argument("--gui-actor-limit-per-shard", type=int, default=0)
+    longrun_parser.add_argument("--screenspot-source", action="append")
+    longrun_parser.add_argument("--osworld-archives-per-shard", type=int, default=0)
+    longrun_parser.add_argument(
+        "--osworld-archive-transition-limit-per-shard",
+        type=int,
+        default=0,
+    )
+    longrun_parser.add_argument(
+        "--osworld-archive-candidate-multiplier",
+        type=int,
+        default=0,
+    )
+    longrun_parser.add_argument("--trajectory", action="append")
+    longrun_parser.add_argument("--output-dir", default="")
+    longrun_parser.add_argument("--state-path", default="")
+    longrun_parser.add_argument("--cache-dir", default="")
+    longrun_parser.add_argument("--cache-budget-gb", type=float, default=0.0)
+    longrun_parser.add_argument("--stage-archives", action="store_true")
+    longrun_parser.add_argument("--skip-osworld-manifest", action="store_true")
+    longrun_parser.add_argument("--no-resume", action="store_true")
+    longrun_parser.add_argument("--no-internal-trajectories", action="store_true")
     return parser
 
 
@@ -244,7 +353,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-
     if args.command == "launch":
         return _launch_dashboard(args)
 
@@ -262,9 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 "required_checks_passed": payload["benchmarks"][
                     "required_checks_passed"
                 ],
-                "required_checks_total": payload["benchmarks"][
-                    "required_checks_total"
-                ],
+                "required_checks_total": payload["benchmarks"]["required_checks_total"],
             }
         print(json.dumps(payload, indent=2))
         failed = [
@@ -392,19 +498,19 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(asdict(auth_decision), indent=2))
             return 2
         backend = _pc_backend(args.backend, args.state)
-        trial = NotepadLiveFireTrial(
+        notepad_trial = NotepadLiveFireTrial(
             backend=backend,
             workspace_root=Path.cwd(),
         )
-        result = trial.run(
+        notepad_result = notepad_trial.run(
             NotepadLiveFireConfig(
                 payload=args.payload,
                 file_name=args.file_name,
                 dialog_timeout_seconds=args.timeout,
             )
         )
-        print(json.dumps(asdict(result), indent=2))
-        return 0 if result.success else 1
+        print(json.dumps(asdict(notepad_result), indent=2))
+        return 0 if notepad_result.success else 1
 
     if args.command == "pc-live-fire-paint":
         action = ActionRequest(
@@ -419,18 +525,137 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(asdict(auth_decision), indent=2))
             return 2
         backend = _pc_backend(args.backend, args.state)
-        trial = PaintLiveFireTrial(
+        paint_trial = PaintLiveFireTrial(
             backend=backend,
             workspace_root=Path.cwd(),
         )
-        result = trial.run(
+        paint_result = paint_trial.run(
             PaintLiveFireConfig(
                 file_name=args.file_name,
                 dialog_timeout_seconds=args.timeout,
             )
         )
-        print(json.dumps(asdict(result), indent=2))
-        return 0 if result.success else 1
+        print(json.dumps(asdict(paint_result), indent=2))
+        return 0 if paint_result.success else 1
+
+    if args.command == "pc-live-fire-eval":
+        action = ActionRequest(
+            agent_id="manual-pc-control",
+            action_type="os.act",
+            target=f"{args.backend}://live-fire/eval-pack",
+            payload={
+                "trial": "universal-eval-pack",
+                "max_tasks": args.max_tasks,
+                "surfaces": args.surface or [],
+                "intents": args.intent or [],
+                "safe_windows_pack": args.safe_windows_pack,
+                "repeat": args.repeat,
+            },
+            approval_token=args.approval_token,
+        )
+        auth_decision = orchestrator.authorization.authorize("manual", action)
+        if not auth_decision.allowed:
+            print(json.dumps(asdict(auth_decision), indent=2))
+            return 2
+        backend = _pc_backend(args.backend, args.state)
+        live_fire_config = LiveFireEvalConfig(
+            run_id=args.run_id,
+            max_tasks=args.max_tasks,
+            surfaces=tuple(args.surface or ()),
+            intents=tuple(args.intent or ()),
+            windows_safe_pack=args.safe_windows_pack,
+            repeat=args.repeat,
+            promote_failures=not args.no_promote_failures,
+            promote_after=args.promote_after,
+            replay_limit=args.replay_limit,
+            training_output=args.training_output,
+        )
+        live_fire_config.heldout_from = args.heldout_from
+        eval_result = LiveFireEvalRunner(backend, Path.cwd()).run(live_fire_config)
+        print(json.dumps(eval_result.asdict(), indent=2))
+        return 0 if eval_result.success else 1
+
+    if args.command == "pc-live-fire-review":
+        if args.promote_run_id and args.promote_task_id:
+            payload = promote_live_fire_failure(
+                Path.cwd(),
+                args.promote_run_id,
+                args.promote_task_id,
+            )
+        else:
+            payload = load_live_fire_reviews(Path.cwd(), limit=args.limit)
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if args.command == "pc-live-fire-shadow-train":
+        payload = write_shadow_training_heads(
+            Path.cwd(),
+            trajectory_paths=args.trajectory or None,
+            output_dir=args.output_dir or None,
+        )
+        print(json.dumps(payload, indent=2))
+        return 0 if payload.get("ready_for_shadow_training") else 1
+
+    if args.command == "pc-train-adaptation":
+        trainer = UnknownAppAdaptationTrainer(Path.cwd())
+        adaptation_result = trainer.train(
+            AdaptationTrainingConfig(
+                screenspot_limit=args.screenspot_limit,
+                screenspot_offset=0,
+                click100k_limit=args.click100k_limit,
+                click100k_offset=0,
+                gui_actor_limit=args.gui_actor_limit,
+                gui_actor_offset=0,
+                screenspot_sources=tuple(
+                    args.screenspot_source or ("windows", "web", "macos")
+                ),
+                include_internal_trajectories=True,
+                trajectory_paths=tuple(args.trajectory or ()),
+                download_osworld_manifest=not args.skip_osworld_manifest,
+                osworld_archive_limit=args.osworld_archive_limit,
+                osworld_archive_transition_limit=args.osworld_archive_transition_limit,
+                cache_dir=args.cache_dir,
+                cache_budget_bytes=max(0, int(args.cache_budget_gb * (1 << 30))),
+                stage_remote_archives=args.stage_archives,
+                output_dir=args.output_dir,
+            )
+        )
+        print(json.dumps(adaptation_result.asdict(), indent=2))
+        return 0 if adaptation_result.success else 1
+
+    if args.command == "pc-train-adaptation-longrun":
+        trainer = UnknownAppAdaptationTrainer(Path.cwd())
+        longrun_result = trainer.train_long_run(
+            AdaptationLongRunConfig(
+                shard_count=args.shard_count,
+                screenspot_limit_per_shard=args.screenspot_limit_per_shard,
+                click100k_limit_per_shard=args.click100k_limit_per_shard,
+                gui_actor_limit_per_shard=args.gui_actor_limit_per_shard,
+                screenspot_sources=tuple(
+                    args.screenspot_source or ("windows", "web", "macos")
+                ),
+                include_internal_trajectories_first_shard=(
+                    not args.no_internal_trajectories
+                ),
+                trajectory_paths=tuple(args.trajectory or ()),
+                download_osworld_manifest=not args.skip_osworld_manifest,
+                osworld_archives_per_shard=args.osworld_archives_per_shard,
+                osworld_archive_transition_limit_per_shard=(
+                    args.osworld_archive_transition_limit_per_shard
+                ),
+                osworld_archive_candidate_multiplier=(
+                    args.osworld_archive_candidate_multiplier
+                ),
+                cache_dir=args.cache_dir,
+                cache_budget_bytes=max(0, int(args.cache_budget_gb * (1 << 30))),
+                stage_remote_archives=args.stage_archives,
+                output_dir=args.output_dir,
+                state_path=args.state_path,
+                resume=not args.no_resume,
+            )
+        )
+        print(json.dumps(longrun_result.asdict(), indent=2))
+        return 0 if longrun_result.success else 1
 
     parser.error(f"Unknown command: {args.command}")
     return 2
@@ -442,9 +667,7 @@ def _pc_backend(name: str, state_path: str | Path):
     if name == "touchpoint":
         return TouchpointBackend()
     if name == "directshell":
-        return DirectShellBackend(
-            Path(state_path).with_name("directshell.sqlite3")
-        )
+        return DirectShellBackend(Path(state_path).with_name("directshell.sqlite3"))
     if name == "virtual-desktop-sandbox":
         return VirtualDesktopSandboxBackend(
             Path(state_path).with_name("virtual_desktop_sandbox.json")

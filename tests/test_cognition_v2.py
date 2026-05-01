@@ -14,10 +14,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 from PIL import Image
 
+from agentos_orchestrator.cognition.abstract_world_model import AbstractUIState
 from agentos_orchestrator.cognition.learned_world_model import (
     LearnedGenerativeWorldModel,
     MLPDynamics,
@@ -36,7 +39,10 @@ from agentos_orchestrator.cognition.semantic_memory import (
     SemanticEmbedder,
     SemanticEpisodicMemory,
 )
-from agentos_orchestrator.cognition.universal_agent_v2 import UniversalDesktopAgentV2
+from agentos_orchestrator.cognition.universal_agent_v2 import (
+    UniversalAgentRun,
+    UniversalDesktopAgentV2,
+)
 from agentos_orchestrator.os_control.base import UiAction, UiNode
 
 
@@ -273,6 +279,42 @@ class LocalFastVLATests(unittest.TestCase):
         for _ in range(15):
             vla.provide_feedback(buf.getvalue(), 200, 150, "button")
         self.assertGreaterEqual(len(vla._training_features), 10)
+
+    def test_vla_feedback_bounds_detection_region_for_large_images(self) -> None:
+        vla = LocalFastVLA()
+        img = Image.new("RGB", (4096, 4096), color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        seen_shapes: list[tuple[int, int]] = []
+
+        def fake_contours(arr: np.ndarray) -> list[DetectedElement]:
+            seen_shapes.append((int(arr.shape[0]), int(arr.shape[1])))
+            return [
+                DetectedElement(
+                    x=10,
+                    y=12,
+                    width=40,
+                    height=24,
+                    aspect_ratio=40 / 24,
+                    solidity=0.9,
+                    edge_density=0.1,
+                    color_variance=1.0,
+                    text_like=False,
+                )
+            ]
+
+        with (
+            mock.patch.object(vla, "_detect_by_contours", side_effect=fake_contours),
+            mock.patch.object(vla, "_detect_by_msers", return_value=[]),
+        ):
+            collected = vla.collect_feedback(buf.getvalue(), 3500, 3500, "button")
+
+        self.assertTrue(collected)
+        self.assertTrue(seen_shapes)
+        self.assertLessEqual(
+            max(max(height, width) for height, width in seen_shapes),
+            LocalFastVLA.FEEDBACK_MAX_DETECTION_SIDE,
+        )
 
     def test_vla_score_elements_for_objective(self) -> None:
         vla = LocalFastVLA()
@@ -572,6 +614,37 @@ class UniversalAgentV2Tests(unittest.TestCase):
         run = agent.run("try something")
         self.assertFalse(run.success)
         self.assertTrue(len(run.steps) >= 1)
+
+    def test_agent_grounds_snapshot_primitives_before_mcts(self) -> None:
+        class SnapshotOnlyBackend:
+            def snapshot(self):
+                return [
+                    UiNode(node_id="search", role="Edit", name="Search"),
+                    UiNode(node_id="go", role="Button", name="Go"),
+                ]
+
+            def perform(self, action):
+                return json.dumps({"status": "executed", "action": action.action_type})
+
+        agent = UniversalDesktopAgentV2(
+            SnapshotOnlyBackend(),
+            max_steps=1,
+            use_frontier_api=False,
+            use_local_vla=False,
+        )
+        action = agent._select_action(
+            SimpleNamespace(
+                name="discover_affordances",
+                description="search for API docs",
+            ),
+            [],
+            AbstractUIState(app_context="unknown"),
+            UniversalAgentRun(run_id="r1", objective="search for API docs"),
+            [],
+        )
+        self.assertEqual(action.metadata.get("source"), "active_inference_grounding")
+        self.assertEqual(action.action_type, "type")
+        self.assertEqual(action.selector, "name=Search")
 
 
 # --------------------------------------------------------------------------- #

@@ -23,9 +23,20 @@ import numpy as np
 from agentos_orchestrator.os_control.base import UiAction, UiNode
 from agentos_orchestrator.os_control.workflow.models import DesktopWorkflowPlan
 
-from .abstract_world_model import AbstractUIState, AbstractWorldModel, AbstractMCTSAdapter, ActionEmbedding
+from .abstract_world_model import (
+    AbstractUIState,
+    AbstractWorldModel,
+    AbstractMCTSAdapter,
+    ActionEmbedding,
+)
+from .adaptation_readiness import collect_adaptation_readiness
+from .affordance_policy_memory import PersistentAffordancePolicyMemory
 from .active_inference import ActiveInferenceExplorer
 from .adaptive_perception import AdaptivePerceptionEngine
+from .app_adapters import AdapterRegistry
+from .blocker_repair import BlockerRepairPlanner
+from .capability_profile import CapabilityProfiler
+from .control_surface_discovery import GenericControlSurfaceDiscoverer
 from .differentiable_memory import WorkingMemoryScratchpad
 from .frontier_api import FrontierClient, FrontierPrompt, default_provider_from_env
 from .hierarchical_planner import (
@@ -38,6 +49,7 @@ from .hierarchical_task_decomposer import HierarchicalTaskDecomposer, TaskHierar
 from .learned_world_model import LearnedGenerativeWorldModel
 from .local_vla import LocalFastVLA
 from .mcts_simulator import MCTSSimulator, WorldState
+from .mode_arbitration import ModeArbiter, ModeContext, ModeDecision
 from .pixel_pomdp import PixelFeatureExtractor, PurePixelEnvironment
 from .pomdp_state import POMDPEnvironmentModel
 from .runtime_state import AgentRuntimeState
@@ -45,6 +57,11 @@ from .safety_gates import FormalSafetyVerifier, default_safety_verifier
 from .semantic_memory import SemanticEpisodicMemory, SemanticEmbedder
 from .self_documentation import SelfDocumentationLoop
 from .tool_executor import QuantAnalysisRequest, ToolExecutor
+from .trajectory_recorder import TrajectoryRecorder
+from .verification_contracts import (
+    ensure_verification_contract,
+    verify_action_contract,
+)
 
 
 @dataclass
@@ -72,6 +89,7 @@ class UniversalAgentRun:
     mcts_simulations_run: int = 0
     avg_latency_ms: float = 0.0
     model_used_ratio: float = 0.0
+    trajectory_path: str = ""
 
 
 class UniversalDesktopAgentV2:
@@ -123,7 +141,9 @@ class UniversalDesktopAgentV2:
         )
 
         # --- Fix 2: Local Fast VLA (zero API latency) ---
-        self.local_vla = LocalFastVLA()
+        self.local_vla = LocalFastVLA(
+            model_path=str(self.workspace_root / ".agentos" / "local_vla.pkl")
+        )
 
         # --- Frontier API bridge (semantic reasoning, local physical grounding) ---
         self.frontier_client = (
@@ -133,7 +153,9 @@ class UniversalDesktopAgentV2:
         )
 
         # --- Tool augmentation (terminal/code fast path) ---
-        self.tool_executor = ToolExecutor(workspace_root=self.workspace_root / ".agentos")
+        self.tool_executor = ToolExecutor(
+            workspace_root=self.workspace_root / ".agentos"
+        )
 
         # --- Deterministic safety gate between planner and executor ---
         self.safety_verifier = safety_verifier or default_safety_verifier(
@@ -157,8 +179,18 @@ class UniversalDesktopAgentV2:
         self.semantic_memory = SemanticEpisodicMemory(
             embedder=SemanticEmbedder(n_components=128)
         )
+        self.affordance_policies = PersistentAffordancePolicyMemory(self.workspace_root)
         self.working_memory = WorkingMemoryScratchpad(capacity=32)
         self.runtime_state = AgentRuntimeState()
+        self.repair_planner = BlockerRepairPlanner()
+        self.mode_arbiter = ModeArbiter()
+        self.capability_profiler = CapabilityProfiler()
+        self.control_surface_discoverer = GenericControlSurfaceDiscoverer(
+            self.workspace_root
+        )
+        self.adapter_registry = AdapterRegistry()
+        self.trajectory_recorder = TrajectoryRecorder(self.workspace_root)
+        self.adaptation_readiness = collect_adaptation_readiness(self.workspace_root)
 
         # --- Fix 3b: Hierarchical Task Decomposer (long-horizon planning) ---
         self.task_decomposer = HierarchicalTaskDecomposer(memory=self.semantic_memory)
@@ -227,6 +259,18 @@ class UniversalDesktopAgentV2:
         run_id = f"ua2_{self._run_id_counter}_{int(time.time())}"
         run = UniversalAgentRun(run_id=run_id, objective=objective)
         self.runtime_state.reset(objective)
+        self.adaptation_readiness = collect_adaptation_readiness(self.workspace_root)
+        self.working_memory.write(
+            "Adaptation readiness: "
+            f"{self.adaptation_readiness.status}; "
+            f"heldout={self.adaptation_readiness.heldout_success_rate:.2f}; "
+            f"blockers={self.adaptation_readiness.blockers}",
+            item_type="observation",
+            priority=0.86,
+        )
+        trajectory_path = self.trajectory_recorder.start_run(run_id, objective)
+        if trajectory_path is not None:
+            run.trajectory_path = str(trajectory_path)
 
         # Start async perception for real-time responsiveness
         self.start_perception_loop()
@@ -239,8 +283,7 @@ class UniversalDesktopAgentV2:
                     name=f"macro_{index}",
                     intent=macro_goal.description,
                     success_criteria=[
-                        "The goal-completion checker marks this macro "
-                        "goal complete."
+                        "The goal-completion checker marks this macro goal complete."
                     ],
                 )
             self.working_memory.write(
@@ -342,7 +385,11 @@ class UniversalDesktopAgentV2:
                     "node_count": len(self.backend.snapshot()),
                     "steps_taken": len(run.steps),
                 }
+            if run.trajectory_path:
+                run.final_state["trajectory_path"] = run.trajectory_path
+            run.final_state["adaptation_readiness"] = self.adaptation_readiness.asdict()
             run.success = any(g.completed for g in macro_goals)
+            self.trajectory_recorder.finish_run(run.run_id, run.final_state)
 
             # Record to semantic memory
             self.semantic_memory.record(
@@ -433,6 +480,32 @@ class UniversalDesktopAgentV2:
                     priority=0.7,
                 )
 
+            snapshot_nodes = self._safe_snapshot_nodes()
+            capability_profile = self.capability_profiler.profile(
+                current_state,
+                nodes=snapshot_nodes,
+                screenshot_available=screenshot is not None,
+            )
+            adapter_context = self.adapter_registry.context_for(
+                capability_profile,
+                run.objective,
+            )
+            self.working_memory.write(
+                f"Surface: {capability_profile.app_family} via "
+                f"{adapter_context.preferred_channels[:2]}",
+                item_type="observation",
+                priority=0.72,
+            )
+            policy_channels = self.affordance_policies.preferred_channels(
+                capability_profile.app_signature
+            )
+            if policy_channels:
+                self.working_memory.write(
+                    f"Policy memory channels: {policy_channels[:2]}",
+                    item_type="observation",
+                    priority=0.66,
+                )
+
             # --- Semantic Memory: Check for past failures ---
             similar_failures = self.semantic_memory.get_failure_patterns(
                 run.objective, top_k=3
@@ -444,21 +517,99 @@ class UniversalDesktopAgentV2:
                     priority=0.85,
                 )
 
-            # --- Action Selection: Tool fast path, frontier SoM, perception, MCTS ---
-            action = tool_action or self._select_action(
+            mode_decision = self.mode_arbiter.choose(
+                run.objective,
                 option,
-                perceived_elements,
                 current_state,
-                run,
-                similar_failures,
+                self.runtime_state,
+                ModeContext(
+                    perceived_element_count=len(perceived_elements),
+                    tool_action_available=tool_action is not None,
+                    similar_failures=similar_failures,
+                    capability_profile=capability_profile,
+                    adapter_context=adapter_context.to_prompt_dict(),
+                ),
             )
+            self.working_memory.write(
+                f"Mode: {mode_decision.mode} ({mode_decision.rationale})",
+                item_type="plan",
+                priority=0.7,
+            )
+
+            active_blockers = [
+                blocker
+                for blocker in self.runtime_state.blocker_stack
+                if blocker.active
+            ]
+            repair_plan = self.repair_planner.propose(
+                active_blockers,
+                current_state,
+                run.objective,
+                option_name=getattr(option, "name", ""),
+                recent_reflections=list(self.runtime_state.recent_reflections),
+            )
+            if repair_plan is not None and not repair_plan.can_execute:
+                self.working_memory.write(
+                    f"Repair requires operator input: {repair_plan.rationale}",
+                    item_type="reflection",
+                    priority=0.95,
+                )
+                context.failure_streak += 1
+                hierarchy.mark_current_failure()
+                goal.failed = True
+                break
+
+            # --- Action Selection: Tool fast path, frontier SoM, perception, MCTS ---
+            if repair_plan is not None and repair_plan.action is not None:
+                action = repair_plan.action
+            elif mode_decision.mode == "explore" and tool_action is None:
+                action = self._local_explore_action(
+                    run,
+                    source="mode_arbitration",
+                    rationale=mode_decision.rationale,
+                )
+            else:
+                action = tool_action or self._select_action(
+                    option,
+                    perceived_elements,
+                    current_state,
+                    run,
+                    similar_failures,
+                    capability_profile=capability_profile,
+                    adapter_context=adapter_context,
+                    mode_decision=mode_decision,
+                )
+            self._warm_world_model_with_action(current_state, run, action)
+            action.metadata.setdefault(
+                "mode_decision",
+                mode_decision.to_prompt_dict(),
+            )
+            if repair_plan is not None:
+                action.metadata.setdefault(
+                    "repair_plan",
+                    repair_plan.to_prompt_dict(),
+                )
+            action.metadata.setdefault(
+                "capability_profile",
+                capability_profile.to_prompt_dict(),
+            )
+            action = self.adapter_registry.enrich_action(
+                action,
+                capability_profile,
+                run.objective,
+            )
+            verification_contract = ensure_verification_contract(action)
 
             # --- Deterministic Safety Gate + Execute ---
             expected_observation = _expected_observation_for_action(action)
             safety = self.safety_verifier.verify_action(action, objective=run.objective)
             if not safety.allowed:
                 receipt = json.dumps(
-                    {"status": "blocked", "reason": safety.reason, "solver": safety.solver}
+                    {
+                        "status": "blocked",
+                        "reason": safety.reason,
+                        "solver": safety.solver,
+                    }
                 )
                 context.failure_streak += 1
                 hierarchy.mark_current_failure()
@@ -468,9 +619,12 @@ class UniversalDesktopAgentV2:
                 if action.metadata.get("tool_success") is True:
                     hierarchy.mark_current_success()
             elif action.action_type == "explore":
-                receipt = json.dumps(
-                    action.metadata.get("exploration_result", {})
-                )
+                if "exploration_result" not in action.metadata:
+                    source = str(action.metadata.get("source", "local_explore"))
+                    action.metadata["exploration_result"] = self._run_local_exploration(
+                        run, status=source
+                    )
+                receipt = json.dumps(action.metadata.get("exploration_result", {}))
                 context.failure_streak = 0
             else:
                 try:
@@ -511,10 +665,35 @@ class UniversalDesktopAgentV2:
                 receipt,
                 expected_observation=expected_observation,
             )
-            if (
-                outcome_evaluation.new_blocker
-                or not outcome_evaluation.matched
-            ):
+            verification_result = verify_action_contract(
+                action,
+                current_state,
+                new_state,
+                receipt,
+            )
+            verification_failed = (
+                verification_result.required and not verification_result.matched
+            )
+            if verification_failed:
+                outcome_evaluation.matched = False
+                existing_reason = outcome_evaluation.failure_reason
+                outcome_evaluation.failure_reason = existing_reason or (
+                    verification_result.reason
+                )
+                if not outcome_evaluation.new_blocker:
+                    outcome_evaluation.new_blocker = verification_result.reason
+                    self.runtime_state.add_blocker(
+                        kind="verification",
+                        description=verification_result.reason,
+                        evidence=verification_result.observed,
+                        repair_hint=(
+                            "Re-ground the action using the latest capability profile."
+                        ),
+                    )
+            outcome_failed = (
+                outcome_evaluation.new_blocker or not outcome_evaluation.matched
+            )
+            if outcome_failed:
                 self.working_memory.write(
                     f"Outcome reflection: {outcome_evaluation.observed}",
                     item_type="reflection",
@@ -524,6 +703,24 @@ class UniversalDesktopAgentV2:
                 current_state,
                 action,
                 new_state,
+            )
+            self.trajectory_recorder.record_step(
+                run_id=run.run_id,
+                objective=run.objective,
+                option_name=getattr(option, "name", ""),
+                before=current_state,
+                after=new_state,
+                action=action,
+                expected_observation=expected_observation,
+                receipt=receipt,
+                outcome=outcome_evaluation,
+                mode_decision=mode_decision,
+                repair_plan=repair_plan,
+                capability_profile=capability_profile.to_prompt_dict(),
+                adapter_context=adapter_context.to_prompt_dict(),
+                verification_contract=verification_contract.asdict(),
+                verification_result=verification_result.asdict(),
+                latency_ms=step_elapsed,
             )
             current_state = new_state
 
@@ -539,16 +736,27 @@ class UniversalDesktopAgentV2:
                         "option": option.name,
                         "perceived_elements": len(perceived_elements),
                         "abstract_state_elements": len(current_state.elements),
-                        "outcome_evaluation": (
-                            outcome_evaluation.to_prompt_dict()
+                        "mode_decision": mode_decision.to_prompt_dict(),
+                        "capability_profile": (capability_profile.to_prompt_dict()),
+                        "adapter_context": adapter_context.to_prompt_dict(),
+                        "verification_contract": (verification_contract.asdict()),
+                        "verification_result": verification_result.asdict(),
+                        "repair_plan": (
+                            repair_plan.to_prompt_dict()
+                            if repair_plan is not None
+                            else None
                         ),
+                        "outcome_evaluation": (outcome_evaluation.to_prompt_dict()),
                     },
                     belief_entropy=self.pixel_env.belief.entropy()
                     if self.pixel_env
                     else self.pomdp.belief.entropy(),
                     mcts_reward=None,
                     memory_reads=[f["outcome"] for f in similar_failures],
-                    rationale=f"Option '{option.name}': {action.action_type} on {action.selector}",
+                    rationale=(
+                        f"Option '{option.name}': {action.action_type} "
+                        f"on {action.selector}"
+                    ),
                     latency_ms=step_elapsed,
                 )
             )
@@ -561,6 +769,27 @@ class UniversalDesktopAgentV2:
                 observation=f"Option {option.name}: {receipt}",
                 outcome=receipt,
                 reward=1.0 if "executed" in receipt.lower() else -0.5,
+            )
+            policy_success = (
+                bool(action.metadata.get("tool_success"))
+                if action.action_type == "tool"
+                else not outcome_failed
+            )
+            self.affordance_policies.record(
+                capability_profile.app_signature,
+                run.objective,
+                action,
+                success=policy_success,
+                control_channel=str(
+                    action.metadata.get("control_channel")
+                    or adapter_context.preferred_channels[0]
+                ),
+                observed=outcome_evaluation.observed,
+                evidence={
+                    "family": capability_profile.app_family,
+                    "option": option.name,
+                    "source": action.metadata.get("source", ""),
+                },
             )
 
             # Check option completion
@@ -666,12 +895,17 @@ class UniversalDesktopAgentV2:
         )
 
         docs_context = ""
-        if self.self_documentation is not None and current_state.app_context == "unknown":
+        if (
+            self.self_documentation is not None
+            and current_state.app_context == "unknown"
+        ):
             bundle = self.self_documentation.prepare_context(
                 run.objective,
                 app_hint="unknown application",
             )
-            docs_context = bundle.context or f"Generated documentation query: {bundle.query}"
+            docs_context = (
+                bundle.context or f"Generated documentation query: {bundle.query}"
+            )
 
         prompt = FrontierPrompt(
             objective=run.objective,
@@ -750,23 +984,14 @@ class UniversalDesktopAgentV2:
         decision: Any,
     ) -> UiAction:
         """Execute bounded local exploration after frontier uncertainty."""
-        probes: list[Any] = []
-        if self.pixel_env:
-            probes = self._pixel_explore(run.objective, run)
-        elif hasattr(self.backend, "snapshot"):
-            probes = self.explorer.explore(
-                self.backend.snapshot(),
-                run.objective,
-                perform_fn=self._safe_perform,
-                snapshot_fn=self.backend.snapshot,
-            )
-        run.exploration_probes_used += len(probes)
-        payload = {
-            "status": "frontier_requested_explore",
-            "frontier_confidence": decision.confidence,
-            "frontier_rationale": decision.rationale,
-            "probes": [_exploration_result_payload(probe) for probe in probes],
-        }
+        payload = self._run_local_exploration(
+            run,
+            status="frontier_requested_explore",
+            extra_payload={
+                "frontier_confidence": decision.confidence,
+                "frontier_rationale": decision.rationale,
+            },
+        )
         return UiAction(
             action_type="explore",
             selector="frontier_escape_hatch",
@@ -791,6 +1016,53 @@ class UniversalDesktopAgentV2:
             },
         )
 
+    def _local_explore_action(
+        self,
+        run: UniversalAgentRun,
+        source: str,
+        rationale: str = "",
+    ) -> UiAction:
+        payload = self._run_local_exploration(
+            run,
+            status=source,
+            extra_payload={"rationale": rationale},
+        )
+        return UiAction(
+            action_type="explore",
+            selector=source,
+            metadata={
+                "source": source,
+                "expected_observation": (
+                    "Bounded exploration produces grounded evidence."
+                ),
+                "exploration_result": payload,
+            },
+        )
+
+    def _run_local_exploration(
+        self,
+        run: UniversalAgentRun,
+        status: str,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        probes: list[Any] = []
+        if self.pixel_env:
+            probes = self._pixel_explore(run.objective, run)
+        elif hasattr(self.backend, "snapshot"):
+            probes = self.explorer.explore(
+                self.backend.snapshot(),
+                run.objective,
+                perform_fn=self._safe_perform,
+                snapshot_fn=self.backend.snapshot,
+            )
+        run.exploration_probes_used += len(probes)
+        payload = {
+            "status": status,
+            "probes": [_exploration_result_payload(probe) for probe in probes],
+        }
+        payload.update(extra_payload or {})
+        return payload
+
     def _select_action(
         self,
         option: Any,
@@ -798,12 +1070,56 @@ class UniversalDesktopAgentV2:
         current_state: AbstractUIState,
         run: UniversalAgentRun,
         similar_failures: list[dict[str, Any]],
+        capability_profile: Any | None = None,
+        adapter_context: Any | None = None,
+        mode_decision: ModeDecision | None = None,
     ) -> UiAction:
         """Select best action using frontier SoM, perception, MCTS, and fallbacks."""
-        # 1. Try frontier semantic reasoning grounded by local Set-of-Mark IDs
-        frontier_action = self._select_frontier_som_action(current_state, run)
-        if frontier_action is not None:
-            return frontier_action
+        snapshot_nodes = self._safe_snapshot_nodes()
+        capability_profile = capability_profile or self.capability_profiler.profile(
+            current_state,
+            nodes=snapshot_nodes,
+            screenshot_available=self.get_latest_screenshot() is not None,
+        )
+        policy_action = self.affordance_policies.recommend_action(
+            capability_profile.app_signature,
+            run.objective,
+            nodes=snapshot_nodes,
+        )
+        if (
+            policy_action is not None
+            and float(policy_action.metadata.get("policy_score", 0.0)) >= 0.72
+        ):
+            self._warm_world_model_with_action(current_state, run, policy_action)
+            return policy_action
+
+        control_surface_action = self._select_control_surface_action(
+            capability_profile,
+            snapshot_nodes,
+            current_state,
+            run,
+            adapter_context=adapter_context,
+        )
+        if control_surface_action is not None:
+            self._warm_world_model_with_action(
+                current_state, run, control_surface_action
+            )
+            return control_surface_action
+
+        if policy_action is not None:
+            self._warm_world_model_with_action(current_state, run, policy_action)
+            return policy_action
+
+        use_frontier = (
+            mode_decision is None
+            or mode_decision.should_use_frontier
+            or mode_decision.mode in {"ui", "hybrid", "research"}
+        )
+        if use_frontier:
+            frontier_action = self._select_frontier_som_action(current_state, run)
+            if frontier_action is not None:
+                self._warm_world_model_with_action(current_state, run, frontier_action)
+                return frontier_action
 
         # 2. Try perception-guided action (highest semantic match)
         if perceived_elements:
@@ -811,13 +1127,15 @@ class UniversalDesktopAgentV2:
             if best_elem.semantic_score > 0.3:
                 cx = best_elem.x + best_elem.width // 2
                 cy = best_elem.y + best_elem.height // 2
-                return UiAction(
+                action = UiAction(
                     action_type=best_elem.element_type
                     if best_elem.element_type in {"button", "text_field", "checkbox"}
                     else "click",
                     selector=f"perceived_{best_elem.element_type}_{best_elem.x}_{best_elem.y}",
                     metadata={"x": cx, "y": cy, "source": "adaptive_perception"},
                 )
+                self._warm_world_model_with_action(current_state, run, action)
+                return action
 
                 # 3. Try local VLA fallback
         screenshot = self.get_latest_screenshot()
@@ -826,11 +1144,30 @@ class UniversalDesktopAgentV2:
             if vla_action:
                 x = getattr(vla_action, "x", 0)
                 y = getattr(vla_action, "y", 0)
-                return UiAction(
+                action = UiAction(
                     action_type=vla_action.action_type,
                     selector=f"vla_{x}_{y}",
                     metadata={"x": x, "y": y, "source": "local_vla"},
                 )
+                self._warm_world_model_with_action(current_state, run, action)
+                return action
+
+        grounded_action = self.explorer.suggest_action(
+            self._safe_snapshot_nodes(),
+            f"{getattr(option, 'description', '')} {run.objective}".strip(),
+            success_patterns=self.semantic_memory.get_success_patterns(
+                run.objective,
+                top_k=3,
+            ),
+        )
+        if grounded_action is not None:
+            grounded_action.metadata.setdefault("source", "active_inference_grounding")
+            grounded_action.metadata.setdefault(
+                "expected_observation",
+                "The grounded control should expose the next affordance or advance the option.",
+            )
+            self._warm_world_model_with_action(current_state, run, grounded_action)
+            return grounded_action
 
         # 4. MCTS deliberation on abstract state
         root_state = WorldState(
@@ -857,6 +1194,206 @@ class UniversalDesktopAgentV2:
             metadata={"x": 960, "y": 540, "source": "fallback"},
         )
 
+    def _warm_world_model_with_action(
+        self,
+        current_state: AbstractUIState,
+        run: UniversalAgentRun,
+        action: UiAction,
+    ) -> None:
+        if action.metadata.get("world_model_warmed") is True:
+            return
+        try:
+            root_state = WorldState(
+                state_vector=current_state.to_vector(256).tolist(),
+                depth=run.adaptive_steps_used,
+                terminal=False,
+                reward=0.0,
+            )
+            self.world_model.predict(root_state, action)
+            action.metadata["world_model_warmed"] = True
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _select_control_surface_action(
+        self,
+        capability_profile: Any,
+        snapshot_nodes: list[UiNode],
+        current_state: AbstractUIState,
+        run: UniversalAgentRun,
+        adapter_context: Any | None = None,
+    ) -> UiAction | None:
+        preferred_channels = []
+        if adapter_context is not None:
+            preferred_channels.extend(
+                getattr(adapter_context, "preferred_channels", [])
+            )
+        preferred_channels.extend(
+            self.affordance_policies.preferred_channels(
+                capability_profile.app_signature
+            )
+        )
+
+        documentation_context = ""
+        objective_lower = run.objective.lower()
+        should_fetch_docs = self.self_documentation is not None and (
+            capability_profile.app_family in {"unknown", "electron_app", "chat_app"}
+            or "api" in capability_profile.control_channels
+            or any(
+                keyword in objective_lower
+                for keyword in {
+                    "api",
+                    "json",
+                    "endpoint",
+                    "payload",
+                    "graphql",
+                    "webhook",
+                }
+            )
+        )
+        should_probe_loopback = self.allow_network_tools and (
+            capability_profile.app_family
+            in {"unknown", "browser", "terminal", "electron_app", "chat_app"}
+            or "api" in capability_profile.control_channels
+            or any(
+                keyword in objective_lower
+                for keyword in {
+                    "api",
+                    "json",
+                    "endpoint",
+                    "payload",
+                    "graphql",
+                    "webhook",
+                    "localhost",
+                    "port",
+                    "service",
+                    "server",
+                }
+            )
+        )
+        if should_fetch_docs:
+            bundle = self.self_documentation.prepare_context(
+                run.objective,
+                app_hint=self._app_hint(capability_profile, snapshot_nodes),
+                max_sources=2,
+            )
+            documentation_context = bundle.context or bundle.query
+
+        candidates = self.control_surface_discoverer.discover(
+            capability_profile,
+            snapshot_nodes,
+            run.objective,
+            documentation_context=documentation_context,
+            preferred_channels=list(dict.fromkeys(preferred_channels)),
+            active_fingerprinting=should_probe_loopback,
+        )
+        if not candidates:
+            return None
+        best = candidates[0]
+        if best.workflow and self.allow_network_tools:
+            workflow_payload = {
+                "steps": best.workflow,
+                "headers": {},
+                "auth_env_keys": best.metadata.get("auth_env_keys", []),
+            }
+            result = self.tool_executor.run(
+                QuantAnalysisRequest(
+                    objective=(
+                        f"Execute synthesized API workflow for {run.objective}: {best.endpoint or best.metadata.get('documentation_url', '')}"
+                    ),
+                    code=self.tool_executor.build_api_workflow_code(workflow_payload),
+                    allow_network=True,
+                    timeout_seconds=20,
+                    expose_env_keys=list(best.metadata.get("auth_env_keys", [])),
+                )
+            )
+            return UiAction(
+                action_type="tool",
+                selector=f"synthesized_api_workflow:{best.endpoint or best.metadata.get('documentation_url', 'docs')}",
+                metadata={
+                    "source": "control_surface_discovery",
+                    "control_channel": best.channel,
+                    "control_surface_kind": best.kind,
+                    "control_surface_confidence": best.confidence,
+                    "control_surface_rationale": best.rationale,
+                    "workflow_step_count": len(best.workflow),
+                    "workflow": best.workflow,
+                    "tool_success": result.success,
+                    "tool_result": {
+                        "success": result.success,
+                        "stdout": result.stdout[-4000:],
+                        "stderr": result.stderr[-1000:],
+                        "error": result.error,
+                        "parsed_results": result.parsed_results,
+                        "artefacts": [str(path) for path in result.artefacts],
+                        "elapsed_ms": result.elapsed_ms,
+                    },
+                    "allow_network": True,
+                    "expected_observation": (
+                        "The documented API workflow returns structured HTTP results for each step."
+                    ),
+                },
+            )
+        if best.endpoint and self.allow_network_tools:
+            result = self.tool_executor.run(
+                QuantAnalysisRequest(
+                    objective=(
+                        f"Probe discovered control surface for {run.objective}: {best.endpoint}"
+                    ),
+                    code=self.tool_executor.build_http_probe_code([best.endpoint]),
+                    allow_network=True,
+                    timeout_seconds=15,
+                )
+            )
+            return UiAction(
+                action_type="tool",
+                selector=f"control_surface_api_probe:{best.endpoint}",
+                metadata={
+                    "source": "control_surface_discovery",
+                    "control_channel": best.channel,
+                    "control_surface_kind": best.kind,
+                    "control_surface_confidence": best.confidence,
+                    "control_surface_rationale": best.rationale,
+                    "tool_success": result.success,
+                    "tool_result": {
+                        "success": result.success,
+                        "stdout": result.stdout[-4000:],
+                        "stderr": result.stderr[-1000:],
+                        "error": result.error,
+                        "parsed_results": result.parsed_results,
+                        "artefacts": [str(path) for path in result.artefacts],
+                        "elapsed_ms": result.elapsed_ms,
+                    },
+                    "allow_network": True,
+                    "expected_observation": (
+                        "The API probe yields a structured response or an informative HTTP status."
+                    ),
+                },
+            )
+        if not best.selector:
+            return None
+        return UiAction(
+            action_type=best.action_type or "click",
+            selector=best.selector,
+            value=best.value,
+            metadata={
+                "source": "control_surface_discovery",
+                "control_channel": best.channel,
+                "control_surface_kind": best.kind,
+                "control_surface_confidence": best.confidence,
+                "control_surface_rationale": best.rationale,
+                "expected_observation": (
+                    "The higher-level control surface becomes active or reveals structured controls."
+                ),
+            },
+        )
+
+    @staticmethod
+    def _app_hint(capability_profile: Any, nodes: list[UiNode]) -> str:
+        names = [node.name.strip() for node in nodes if node.name][:3]
+        if names:
+            return " ".join(names)
+        return str(getattr(capability_profile, "app_family", "unknown application"))
+
     def _build_abstract_state(self) -> AbstractUIState:
         """Build compact abstract state from current perception."""
         screenshot = self.get_latest_screenshot()
@@ -874,23 +1411,30 @@ class UniversalDesktopAgentV2:
         # Fallback from accessibility tree
         if hasattr(self.backend, "snapshot"):
             nodes = self.backend.snapshot()
+            elements = [
+                type(
+                    "FakeElem",
+                    (),
+                    {
+                        "x": 0,
+                        "y": 0,
+                        "width": 100,
+                        "height": 30,
+                        "element_type": _element_type_from_node(n),
+                        "text": getattr(n, "name", "") or "",
+                    },
+                )()
+                for n in nodes
+            ]
+            state = AbstractUIState.from_perceived_elements(elements, "unknown")
+            profile = self.capability_profiler.profile(
+                state,
+                nodes=nodes,
+                screenshot_available=False,
+            )
             return AbstractUIState.from_perceived_elements(
-                [
-                    type(
-                        "FakeElem",
-                        (),
-                        {
-                            "x": 0,
-                            "y": 0,
-                            "width": 100,
-                            "height": 30,
-                            "element_type": "unknown",
-                            "text": getattr(n, "name", "") or "",
-                        },
-                    )()
-                    for n in nodes
-                ],
-                "other",
+                elements,
+                profile.app_family,
             )
         return AbstractUIState(app_context="unknown")
 
@@ -968,6 +1512,14 @@ class UniversalDesktopAgentV2:
             )
         return self.backend.perform(action)
 
+    def _safe_snapshot_nodes(self) -> list[UiNode]:
+        if not hasattr(self.backend, "snapshot"):
+            return []
+        try:
+            return list(self.backend.snapshot())
+        except Exception:
+            return []
+
     def get_cognitive_summary(self, run: UniversalAgentRun) -> dict[str, Any]:
         return {
             "run_id": run.run_id,
@@ -979,6 +1531,7 @@ class UniversalDesktopAgentV2:
             "adaptive_actions": run.adaptive_steps_used,
             "avg_latency_ms": run.avg_latency_ms,
             "model_used_ratio": run.model_used_ratio,
+            "trajectory_path": run.trajectory_path,
             "final_belief_entropy": run.final_state.get("belief_entropy", 1.0),
             "working_memory_summary": self.working_memory.summarize(),
             "semantic_memory_events": len(self.semantic_memory._events),
@@ -996,6 +1549,9 @@ def _phase_for_action(action: UiAction) -> str:
 
 
 def _expected_observation_for_action(action: UiAction) -> str:
+    contract = action.metadata.get("verification_contract")
+    if isinstance(contract, dict) and contract.get("expected"):
+        return str(contract["expected"])
     expected = action.metadata.get("expected_observation")
     if expected:
         return str(expected)
@@ -1007,6 +1563,21 @@ def _expected_observation_for_action(action: UiAction) -> str:
     if action.action_type == "explore":
         return "Exploration produces evidence for the next plan step."
     return f"The UI changes in response to {action.action_type} on {action.selector}."
+
+
+def _element_type_from_node(node: UiNode) -> str:
+    role = node.role.lower()
+    if "button" in role:
+        return "button"
+    if "edit" in role:
+        return "text_field"
+    if "table" in role or "grid" in role:
+        return "text_field"
+    if "canvas" in role:
+        return "image"
+    if "tab" in role:
+        return "tab"
+    return "panel"
 
 
 def _exploration_result_payload(result: Any) -> dict[str, Any]:

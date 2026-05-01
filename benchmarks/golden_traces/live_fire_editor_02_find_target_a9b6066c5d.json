@@ -1,0 +1,401 @@
+{
+  "trace_id": "live_fire_editor_02_find_target_a9b6066c5d",
+  "name": "Live-fire eval failure: editor_02_find_target",
+  "scope": "universal OS live-fire eval",
+  "objective": "Prevent regression for editor_02_find_target.",
+  "failure_modes": [
+    "no state change was detected"
+  ],
+  "steps": [
+    {
+      "kind": "live_fire.execute",
+      "expect": "Task is run safely."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "Failure is recorded."
+    },
+    {
+      "kind": "debug.replay",
+      "expect": "Replay explains failure."
+    },
+    {
+      "kind": "shadow.train",
+      "expect": "Trajectory trains heads."
+    }
+  ],
+  "expectations": [
+    "The failure remains reproducible from the live-fire trace.",
+    "A future run either verifies the task or records a repair."
+  ],
+  "metadata": {
+    "run_id": "windows_uia_regrounded_find_target_20260430_r2",
+    "surface": "editor",
+    "intent": "find_target",
+    "trajectory_path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_regrounded_find_target_20260430_r2_editor_02_find_target.jsonl"
+  },
+  "replay_debug": {
+    "run_count": 1,
+    "runs": [
+      {
+        "path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_regrounded_find_target_20260430_r2_editor_02_find_target.jsonl",
+        "run_id": "windows_uia_regrounded_find_target_20260430_r2_editor_02_find_target",
+        "objective": "On a editor surface, find target and verify the result.",
+        "step_count": 2,
+        "success": false,
+        "steps": [
+          {
+            "option": "find_target",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "text_editor",
+                "element_count": 269,
+                "element_types": {
+                  "button": 101,
+                  "image": 6,
+                  "panel": 126,
+                  "tab": 32,
+                  "text_field": 4
+                },
+                "focus_region": "main",
+                "interactive_count": 143,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "text_editor",
+                "element_count": 306,
+                "element_types": {
+                  "button": 115,
+                  "image": 6,
+                  "panel": 146,
+                  "tab": 34,
+                  "text_field": 5
+                },
+                "focus_region": "main",
+                "interactive_count": 160,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 306,
+                  "before": 269
+                },
+                "element_types": {
+                  "after": {
+                    "button": 115,
+                    "image": 6,
+                    "panel": 146,
+                    "tab": 34,
+                    "text_field": 5
+                  },
+                  "before": {
+                    "button": 101,
+                    "image": 6,
+                    "panel": 126,
+                    "tab": 32,
+                    "text_field": 4
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.72,
+              "evidence": {
+                "app_context": "text_editor",
+                "interactive_count": 143
+              },
+              "mode": "ui",
+              "rationale": "The visible UI has enough structure for local action selection.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.992,
+              "app_family": "editor",
+              "app_signature": "editor:770affc0de74",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.817,
+              "confidence": 0.906,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "text_editor",
+                "element_count": 269,
+                "interactive_count": 143,
+                "layout_mode": "full",
+                "node_count": 269,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 29\u00f8C Partly sunny",
+                  "29\u00f8C",
+                  "Partly sunny",
+                  "29\u00f8C",
+                  "Partly sunny",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.45,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "ui",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "text area",
+                "tabs",
+                "command palette",
+                "status bar"
+              ],
+              "family": "editor",
+              "preferred_channels": [
+                "accessibility",
+                "explore",
+                "dom",
+                "vision"
+              ],
+              "repair_recipes": [
+                "focus editor",
+                "use clipboard for large text",
+                "verify save path"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "field_contains",
+                "file_exists",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "launch_app",
+              "selector": "notepad.exe",
+              "value": "notepad.exe",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "editor surface launches.",
+            "verification_contract": {
+              "expected": "editor surface launches.",
+              "kind": "process_launched",
+              "metadata": {
+                "action_type": "launch_app",
+                "selector": "notepad.exe"
+              },
+              "path": "",
+              "required": true,
+              "target": "",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": ""
+              },
+              "expected": "editor surface launches.",
+              "kind": "process_launched",
+              "matched": true,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"notepad.exe\", \"process_id\": 39472, \"selector\": \"notepad.exe\", \"status\": \"launched\"}",
+              "reason": "",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"launch_app\", \"launched\": \"notepad.exe\", \"process_id\": 39472, \"selector\": \"notepad.exe\", \"status\": \"launched\"}",
+            "outcome": {
+              "expected": "editor surface launches.",
+              "failure_reason": null,
+              "matched": true,
+              "new_blocker": null,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"notepad.exe\", \"process_id\": 39472, \"selector\": \"notepad.exe\", \"status\": \"launched\"}",
+              "suggested_repair": null
+            },
+            "blocker": null,
+            "repair": null,
+            "latency_ms": 3086.433
+          },
+          {
+            "option": "find_target",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "text_editor",
+                "element_count": 306,
+                "element_types": {
+                  "button": 115,
+                  "image": 6,
+                  "panel": 146,
+                  "tab": 34,
+                  "text_field": 5
+                },
+                "focus_region": "main",
+                "interactive_count": 160,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "text_editor",
+                "element_count": 306,
+                "element_types": {
+                  "button": 115,
+                  "image": 6,
+                  "panel": 146,
+                  "tab": 34,
+                  "text_field": 5
+                },
+                "focus_region": "main",
+                "interactive_count": 160,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {}
+            },
+            "chosen_mode": {
+              "confidence": 0.72,
+              "evidence": {
+                "app_context": "text_editor",
+                "interactive_count": 160
+              },
+              "mode": "ui",
+              "rationale": "The visible UI has enough structure for local action selection.",
+              "should_use_frontier": false
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.991,
+              "app_family": "editor",
+              "app_signature": "editor:770affc0de74",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.816,
+              "confidence": 0.906,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.75,
+              "evidence": {
+                "app_context": "text_editor",
+                "element_count": 306,
+                "interactive_count": 160,
+                "layout_mode": "full",
+                "node_count": 306,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 29\u00f8C Partly sunny",
+                  "29\u00f8C",
+                  "Partly sunny",
+                  "29\u00f8C",
+                  "Partly sunny",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.45,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "ui",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "text area",
+                "tabs",
+                "command palette",
+                "status bar"
+              ],
+              "family": "editor",
+              "preferred_channels": [
+                "accessibility",
+                "explore",
+                "dom",
+                "vision"
+              ],
+              "repair_recipes": [
+                "focus editor",
+                "use clipboard for large text",
+                "verify save path"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "field_contains",
+                "file_exists",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "focus",
+              "selector": "name=Text editor",
+              "value": null,
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "find_target verifies with state_changed.",
+            "verification_contract": {
+              "expected": "find_target verifies with state_changed.",
+              "kind": "state_changed",
+              "metadata": {
+                "action_type": "click",
+                "regrounded": true,
+                "selector": "document-canvas"
+              },
+              "path": "",
+              "required": true,
+              "target": "name=Text editor",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": "name=Text editor"
+              },
+              "expected": "find_target verifies with state_changed.",
+              "kind": "state_changed",
+              "matched": false,
+              "observed": "{\"action_type\": \"focus\", \"draw_path\": null, \"focus_error\": null, \"matched_name\": \"Text editor\", \"matched_role\": \"ControlType.Document\", \"selector\": \"name=Text editor\", \"status\": \"focused\"}",
+              "reason": "no state change was detected",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"focus\", \"draw_path\": null, \"focus_error\": null, \"matched_name\": \"Text editor\", \"matched_role\": \"ControlType.Document\", \"selector\": \"name=Text editor\", \"status\": \"focused\"}",
+            "outcome": {
+              "expected": "find_target verifies with state_changed.",
+              "failure_reason": "no state change was detected",
+              "matched": false,
+              "new_blocker": "no state change was detected",
+              "observed": "{\"action_type\": \"focus\", \"draw_path\": null, \"focus_error\": null, \"matched_name\": \"Text editor\", \"matched_role\": \"ControlType.Document\", \"selector\": \"name=Text editor\", \"status\": \"focused\"}",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "blocker": {
+              "new_blocker": "no state change was detected",
+              "failure_reason": "no state change was detected",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "repair": null,
+            "latency_ms": 3826.034
+          }
+        ],
+        "final_state": {
+          "failure_reason": "no state change was detected",
+          "success": false,
+          "task_id": "editor_02_find_target"
+        }
+      }
+    ],
+    "schema_version": 1
+  }
+}

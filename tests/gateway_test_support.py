@@ -49,6 +49,7 @@ def base_network_hosts() -> list[str]:
         "api.semanticscholar.org",
         "api.crossref.org",
         "api.github.com",
+        "html.duckduckgo.com",
         "generativelanguage.googleapis.com",
     ]
 

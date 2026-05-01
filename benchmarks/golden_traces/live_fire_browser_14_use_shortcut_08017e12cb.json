@@ -1,0 +1,541 @@
+{
+  "trace_id": "live_fire_browser_14_use_shortcut_08017e12cb",
+  "name": "Live-fire eval failure: browser_14_use_shortcut",
+  "scope": "universal OS live-fire eval",
+  "objective": "Prevent regression for browser_14_use_shortcut.",
+  "failure_modes": [
+    "receipt did not report success"
+  ],
+  "steps": [
+    {
+      "kind": "live_fire.execute",
+      "expect": "Task is run safely."
+    },
+    {
+      "kind": "trajectory.record",
+      "expect": "Failure is recorded."
+    },
+    {
+      "kind": "debug.replay",
+      "expect": "Replay explains failure."
+    },
+    {
+      "kind": "shadow.train",
+      "expect": "Trajectory trains heads."
+    }
+  ],
+  "expectations": [
+    "The failure remains reproducible from the live-fire trace.",
+    "A future run either verifies the task or records a repair."
+  ],
+  "metadata": {
+    "run_id": "windows_uia_safe_pack_repeat_2",
+    "surface": "browser",
+    "intent": "use_shortcut",
+    "trajectory_path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_repeat_2_browser_14_use_shortcut.jsonl"
+  },
+  "replay_debug": {
+    "run_count": 1,
+    "runs": [
+      {
+        "path": "C:\\Users\\Jack0\\Autonomious_Orchestrator_AI\\.agentos\\trajectories\\windows_uia_safe_pack_repeat_2_browser_14_use_shortcut.jsonl",
+        "run_id": "windows_uia_safe_pack_repeat_2_browser_14_use_shortcut",
+        "objective": "On a browser surface, use shortcut and verify the result.",
+        "step_count": 2,
+        "success": false,
+        "steps": [
+          {
+            "option": "use_shortcut",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 421,
+                "element_types": {
+                  "button": 136,
+                  "image": 21,
+                  "panel": 226,
+                  "tab": 20,
+                  "text_field": 18
+                },
+                "focus_region": "main",
+                "interactive_count": 187,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 338,
+                "element_types": {
+                  "button": 97,
+                  "image": 21,
+                  "panel": 202,
+                  "text_field": 18
+                },
+                "focus_region": "main",
+                "interactive_count": 128,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 338,
+                  "before": 421
+                },
+                "element_types": {
+                  "after": {
+                    "button": 97,
+                    "image": 21,
+                    "panel": 202,
+                    "text_field": 18
+                  },
+                  "before": {
+                    "button": 136,
+                    "image": 21,
+                    "panel": 226,
+                    "tab": 20,
+                    "text_field": 18
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.904,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "tabs",
+                    "address bar",
+                    "links",
+                    "forms",
+                    "page actions"
+                  ],
+                  "family": "browser",
+                  "preferred_channels": [
+                    "accessibility",
+                    "dom",
+                    "explore",
+                    "vision"
+                  ],
+                  "repair_recipes": [
+                    "refresh DOM/accessibility",
+                    "escape modal",
+                    "bounded link probe"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "tab_focused",
+                    "field_contains",
+                    "state_changed"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.988,
+                  "app_family": "browser",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.815,
+                  "confidence": 0.904,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.65,
+                  "evidence": {
+                    "app_context": "browser",
+                    "element_count": 421,
+                    "interactive_count": 187,
+                    "layout_mode": "full",
+                    "node_count": 421,
+                    "sample_names": [
+                      "QA OSD",
+                      "Running applications",
+                      "Widgets 24\u00f8C Mostly cloudy",
+                      "24\u00f8C",
+                      "Mostly cloudy",
+                      "24\u00f8C",
+                      "Mostly cloudy",
+                      "Start"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "hybrid",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "hybrid",
+              "rationale": "Profile recommends combining local structure with semantic guidance.",
+              "should_use_frontier": true
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.988,
+              "app_family": "browser",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.815,
+              "confidence": 0.904,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.65,
+              "evidence": {
+                "app_context": "browser",
+                "element_count": 421,
+                "interactive_count": 187,
+                "layout_mode": "full",
+                "node_count": 421,
+                "sample_names": [
+                  "QA OSD",
+                  "Running applications",
+                  "Widgets 24\u00f8C Mostly cloudy",
+                  "24\u00f8C",
+                  "Mostly cloudy",
+                  "24\u00f8C",
+                  "Mostly cloudy",
+                  "Start"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "hybrid",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tabs",
+                "address bar",
+                "links",
+                "forms",
+                "page actions"
+              ],
+              "family": "browser",
+              "preferred_channels": [
+                "accessibility",
+                "dom",
+                "explore",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh DOM/accessibility",
+                "escape modal",
+                "bounded link probe"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "tab_focused",
+                "field_contains",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "launch_app",
+              "selector": "browser",
+              "value": "browser",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "browser surface launches.",
+            "verification_contract": {
+              "expected": "browser surface launches.",
+              "kind": "process_launched",
+              "metadata": {},
+              "path": "",
+              "required": true,
+              "target": "",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": ""
+              },
+              "expected": "browser surface launches.",
+              "kind": "process_launched",
+              "matched": true,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 23524, \"selector\": \"browser\", \"status\": \"launched\"}",
+              "reason": "",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 23524, \"selector\": \"browser\", \"status\": \"launched\"}",
+            "outcome": {
+              "expected": "browser surface launches.",
+              "failure_reason": null,
+              "matched": true,
+              "new_blocker": null,
+              "observed": "{\"action_type\": \"launch_app\", \"launched\": \"browser\", \"process_id\": 23524, \"selector\": \"browser\", \"status\": \"launched\"}",
+              "suggested_repair": null
+            },
+            "blocker": null,
+            "repair": null,
+            "latency_ms": 2262.116
+          },
+          {
+            "option": "use_shortcut",
+            "state": {
+              "before": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 395,
+                "element_types": {
+                  "button": 116,
+                  "image": 25,
+                  "panel": 233,
+                  "text_field": 21
+                },
+                "focus_region": "main",
+                "interactive_count": 152,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "after": {
+                "active_modal": "",
+                "app_context": "browser",
+                "element_count": 392,
+                "element_types": {
+                  "button": 97,
+                  "image": 21,
+                  "panel": 256,
+                  "text_field": 18
+                },
+                "focus_region": "main",
+                "interactive_count": 128,
+                "layout_mode": "full",
+                "task_progress": {}
+              },
+              "diff": {
+                "element_count": {
+                  "after": 392,
+                  "before": 395
+                },
+                "element_types": {
+                  "after": {
+                    "button": 97,
+                    "image": 21,
+                    "panel": 256,
+                    "text_field": 18
+                  },
+                  "before": {
+                    "button": 116,
+                    "image": 25,
+                    "panel": 233,
+                    "text_field": 21
+                  }
+                }
+              }
+            },
+            "chosen_mode": {
+              "confidence": 0.902,
+              "evidence": {
+                "adapter_context": {
+                  "affordance_hints": [
+                    "tabs",
+                    "address bar",
+                    "links",
+                    "forms",
+                    "page actions"
+                  ],
+                  "family": "browser",
+                  "preferred_channels": [
+                    "accessibility",
+                    "dom",
+                    "explore",
+                    "vision"
+                  ],
+                  "repair_recipes": [
+                    "refresh DOM/accessibility",
+                    "escape modal",
+                    "bounded link probe"
+                  ],
+                  "risk_notes": [
+                    "canvas_or_image_heavy"
+                  ],
+                  "verification_templates": [
+                    "tab_focused",
+                    "field_contains",
+                    "state_changed"
+                  ]
+                },
+                "capability_profile": {
+                  "accessibility_quality": 0.985,
+                  "app_family": "browser",
+                  "canvas_likelihood": 0.75,
+                  "clipboard_reliability": 0.814,
+                  "confidence": 0.902,
+                  "control_channels": [
+                    "accessibility",
+                    "dom",
+                    "vision",
+                    "explore"
+                  ],
+                  "dom_presence": 0.65,
+                  "evidence": {
+                    "app_context": "browser",
+                    "element_count": 395,
+                    "interactive_count": 152,
+                    "layout_mode": "full",
+                    "node_count": 395,
+                    "sample_names": [
+                      "QA OSD",
+                      "1: ???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????, group Window 1:  tabs - Yandex\u00ffBrowser",
+                      "???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????, group Window 1:  tabs - Yandex\u00ffBrowser",
+                      "???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????",
+                      "Press Esc to exit full screen mode",
+                      "6:  - Yandex\u00ffBrowser",
+                      " - Yandex\u00ffBrowser",
+                      "Yandex"
+                    ]
+                  },
+                  "file_dialog_likelihood": 0.0,
+                  "latency_sensitivity": 0.7,
+                  "modal_pressure": 0.0,
+                  "ocr_quality": 0.0,
+                  "recommended_mode": "hybrid",
+                  "risks": [
+                    "canvas_or_image_heavy"
+                  ]
+                }
+              },
+              "mode": "hybrid",
+              "rationale": "Profile recommends combining local structure with semantic guidance.",
+              "should_use_frontier": true
+            },
+            "capability_profile": {
+              "accessibility_quality": 0.985,
+              "app_family": "browser",
+              "canvas_likelihood": 0.75,
+              "clipboard_reliability": 0.814,
+              "confidence": 0.902,
+              "control_channels": [
+                "accessibility",
+                "dom",
+                "vision",
+                "explore"
+              ],
+              "dom_presence": 0.65,
+              "evidence": {
+                "app_context": "browser",
+                "element_count": 395,
+                "interactive_count": 152,
+                "layout_mode": "full",
+                "node_count": 395,
+                "sample_names": [
+                  "QA OSD",
+                  "1: ???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????, group Window 1:  tabs - Yandex\u00ffBrowser",
+                  "???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????, group Window 1:  tabs - Yandex\u00ffBrowser",
+                  "???????-????: ????? ????????? (2018) ???????? ?????? ????????? ? ??????? ???????? 1080 HD ?? ??????? ????? - ?????????",
+                  "Press Esc to exit full screen mode",
+                  "6:  - Yandex\u00ffBrowser",
+                  " - Yandex\u00ffBrowser",
+                  "Yandex"
+                ]
+              },
+              "file_dialog_likelihood": 0.0,
+              "latency_sensitivity": 0.7,
+              "modal_pressure": 0.0,
+              "ocr_quality": 0.0,
+              "recommended_mode": "hybrid",
+              "risks": [
+                "canvas_or_image_heavy"
+              ]
+            },
+            "adapter_context": {
+              "affordance_hints": [
+                "tabs",
+                "address bar",
+                "links",
+                "forms",
+                "page actions"
+              ],
+              "family": "browser",
+              "preferred_channels": [
+                "accessibility",
+                "dom",
+                "explore",
+                "vision"
+              ],
+              "repair_recipes": [
+                "refresh DOM/accessibility",
+                "escape modal",
+                "bounded link probe"
+              ],
+              "risk_notes": [
+                "canvas_or_image_heavy"
+              ],
+              "verification_templates": [
+                "tab_focused",
+                "field_contains",
+                "state_changed"
+              ]
+            },
+            "action": {
+              "action_type": "hotkey",
+              "selector": "app-window",
+              "value": "%{TAB}",
+              "control_channel": "accessibility"
+            },
+            "expected_observation": "use_shortcut backend receipt reports progress.",
+            "verification_contract": {
+              "expected": "use_shortcut backend receipt reports progress.",
+              "kind": "receipt_success",
+              "metadata": {},
+              "path": "",
+              "required": true,
+              "target": "app-window",
+              "value": ""
+            },
+            "verification_result": {
+              "evidence": {
+                "path": "",
+                "target": "app-window"
+              },
+              "expected": "use_shortcut backend receipt reports progress.",
+              "kind": "receipt_success",
+              "matched": false,
+              "observed": "{\"action_type\": \"hotkey\", \"selector\": \"app-window\", \"status\": \"hotkey-sent\", \"value\": \"%{TAB}\"}",
+              "reason": "receipt did not report success",
+              "required": true
+            },
+            "receipt": "{\"action_type\": \"hotkey\", \"selector\": \"app-window\", \"status\": \"hotkey-sent\", \"value\": \"%{TAB}\"}",
+            "outcome": {
+              "expected": "use_shortcut backend receipt reports progress.",
+              "failure_reason": "receipt did not report success",
+              "matched": false,
+              "new_blocker": "receipt did not report success",
+              "observed": "{\"action_type\": \"hotkey\", \"selector\": \"app-window\", \"status\": \"hotkey-sent\", \"value\": \"%{TAB}\"}",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "blocker": {
+              "new_blocker": "receipt did not report success",
+              "failure_reason": "receipt did not report success",
+              "suggested_repair": "Re-ground and retry with a fresh snapshot."
+            },
+            "repair": null,
+            "latency_ms": 2125.697
+          }
+        ],
+        "final_state": {
+          "failure_reason": "receipt did not report success",
+          "success": false,
+          "task_id": "browser_14_use_shortcut"
+        }
+      }
+    ],
+    "schema_version": 1
+  }
+}

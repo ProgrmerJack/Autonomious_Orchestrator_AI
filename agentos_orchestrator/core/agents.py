@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import re
+import urllib.parse
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -152,6 +153,11 @@ class SupervisorAgent:
                             "literature-agent",
                             "network.fetch",
                             "https://api.crossref.org/works",
+                        ),
+                        declared_action(
+                            "literature-agent",
+                            "network.fetch",
+                            "https://html.duckduckgo.com/html",
                         ),
                         declared_action(
                             "literature-agent",
@@ -359,7 +365,10 @@ class WorkerAgent:
             "",
         ).strip()
         min_runtime_seconds = self._multi_hour_min_runtime_seconds()
-        max_retrieval_passes = 4 if min_runtime_seconds == 0 else 48
+        max_retrieval_passes = self._multi_hour_max_retrieval_passes(
+            min_runtime_seconds
+        )
+        min_depth_passes = self._multi_hour_min_depth_passes()
         targets = {
             "min_source_count": 8,
             "min_provider_count": 2,
@@ -369,6 +378,8 @@ class WorkerAgent:
             "min_novelty_rate": 0.1,
             "max_retrieval_passes": max_retrieval_passes,
             "min_runtime_seconds": min_runtime_seconds,
+            "min_depth_passes": min_depth_passes,
+            "max_low_novelty_streak": 3,
         }
         hypotheses = [
             "Structured, multi-pass retrieval increases evidence breadth.",
@@ -409,6 +420,21 @@ class WorkerAgent:
         except ValueError:
             return 0
         return max(value, 0)
+
+    @staticmethod
+    def _multi_hour_max_retrieval_passes(min_runtime_seconds: int) -> int:
+        if min_runtime_seconds > 0:
+            return 96
+        return 48
+
+    @staticmethod
+    def _multi_hour_min_depth_passes() -> int:
+        raw = os.environ.get("AGENTOS_MULTI_HOUR_MIN_DEPTH_PASSES", "12")
+        try:
+            value = int(raw)
+        except ValueError:
+            return 12
+        return max(value, 1)
 
     def _run_research_with_context(
         self,
@@ -638,25 +664,24 @@ class WorkerAgent:
 
     @staticmethod
     def _planning_urls_from_objective(objective: str) -> list[str]:
-        lower = objective.lower()
         urls: list[str] = []
-        for entity in ("openclaw", "opencode", "openhands", "agentos"):
-            if entity not in lower:
-                continue
-            query = f"{entity} architecture benchmark safety"
-            encoded = query.replace(" ", "+")
-            urls.append(f"https://github.com/search?type=repositories&q={encoded}")
         urls.extend(
-            [
-                "https://github.com/All-Hands-AI/OpenHands",
-                "https://openreview.net/group?id=OpenHands",
-            ]
+            match.rstrip(").,;]}>\"'")
+            for match in re.findall(r"https?://[^\s<>()]+", objective)
         )
+        cleaned = re.sub(r"https?://[^\s<>()]+", " ", objective)
+        cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            query = cleaned[:140]
+            encoded = urllib.parse.quote_plus(query)
+            urls.append(f"https://html.duckduckgo.com/html/?q={encoded}")
+            urls.append(f"https://github.com/search?type=repositories&q={encoded}")
         deduped: list[str] = []
         for item in urls:
             if item not in deduped:
                 deduped.append(item)
-        return deduped[:6]
+        return deduped[:8]
 
     @staticmethod
     def _latest_planning_context(

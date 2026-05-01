@@ -68,6 +68,40 @@ class GatewayDesktopWorkflowTests(unittest.TestCase):
                     if isinstance(item["receipt"], dict)
                 )
             )
+            self.assertTrue(
+                any(
+                    item.get("action_type") == "universal_agent_run"
+                    for item in response.payload["receipts"]
+                )
+            )
+
+    def test_run_command_auto_routes_actionable_objective_to_desktop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            router = GatewayCommandRouter(self._desktop_orchestrator(root))
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                response = router.handle(
+                    ChannelMessage(
+                        "telegram",
+                        "42",
+                        "/run open foobar app and summarize current task progress",
+                    )
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(response.status, "completed")
+            self.assertIn("plan", response.payload)
+            self.assertEqual(response.payload["plan"]["app_target"], "foobar.exe")
+            self.assertTrue(
+                any(
+                    item.get("action_type") == "universal_agent_run"
+                    for item in response.payload["receipts"]
+                )
+            )
 
     def test_gateway_router_requests_clarification_for_vague_desktop_task(
         self,

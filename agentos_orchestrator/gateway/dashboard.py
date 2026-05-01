@@ -22,6 +22,21 @@ from agentos_orchestrator.core.types import (
     new_id,
     utc_now,
 )
+from agentos_orchestrator.cognition.benchmark_scenarios import (
+    load_golden_traces,
+    replay_golden_traces,
+)
+from agentos_orchestrator.cognition.live_fire_eval import (
+    LiveFireEvalConfig,
+    LiveFireEvalRunner,
+)
+from agentos_orchestrator.cognition.live_fire_review import (
+    load_live_fire_reviews,
+    promote_live_fire_failure,
+    write_shadow_training_heads,
+)
+from agentos_orchestrator.cognition.os_eval_packs import eval_pack_payload
+from agentos_orchestrator.cognition.replay_debug import load_replay_debug
 from agentos_orchestrator.gateway.channels import (
     ChannelMessage,
     DiscordWebhookAdapter,
@@ -350,6 +365,75 @@ def create_dashboard_app(
                 str(payload.get("trace_id") or ""),
             )
 
+        @app.get("/benchmarks/eval-pack")
+        async def universal_eval_pack() -> dict:
+            return eval_pack_payload()
+
+        @app.post("/benchmarks/live-fire-eval")
+        async def live_fire_eval(payload: dict) -> dict:
+            backend_name = str(payload.get("backend") or "virtual-desktop-sandbox")
+            approval_token = payload.get("approval_token")
+            if backend_name != "virtual-desktop-sandbox":
+                action = ActionRequest(
+                    agent_id="dashboard-pc-control",
+                    action_type="os.act",
+                    target=f"{backend_name}://live-fire/eval-pack",
+                    approval_token=(str(approval_token) if approval_token else None),
+                )
+                decision = orchestrator.authorization.authorize(
+                    "dashboard",
+                    action,
+                )
+                if not decision.allowed:
+                    return {
+                        "status": _blocked_status(decision.requires_approval),
+                        "decision": asdict(decision),
+                    }
+            backend = _pc_backend(backend_name, orchestrator.state_path)
+            runner = LiveFireEvalRunner(
+                backend,
+                _workspace_root(orchestrator.state_path),
+            )
+            return runner.run(_live_fire_config(payload)).asdict()
+
+        @app.get("/benchmarks/live-fire-review")
+        async def live_fire_review(limit: int = 10) -> dict:
+            root = _workspace_root(orchestrator.state_path)
+            return load_live_fire_reviews(root, limit=max(1, min(limit, 100)))
+
+        @app.post("/benchmarks/live-fire-review/promote")
+        async def live_fire_review_promote(payload: dict) -> dict:
+            run_id = str(payload.get("run_id") or "").strip()
+            task_id = str(payload.get("task_id") or "").strip()
+            if not run_id or not task_id:
+                raise fastapi.HTTPException(
+                    status_code=400,
+                    detail="run_id and task_id are required",
+                )
+            return promote_live_fire_failure(
+                _workspace_root(orchestrator.state_path),
+                run_id,
+                task_id,
+            )
+
+        @app.post("/benchmarks/live-fire-shadow-training")
+        async def live_fire_shadow_training(payload: dict) -> dict:
+            paths = _string_list(payload.get("trajectory_paths"))
+            output_dir = str(payload.get("output_dir") or "").strip()
+            return write_shadow_training_heads(
+                _workspace_root(orchestrator.state_path),
+                trajectory_paths=paths or None,
+                output_dir=output_dir or None,
+            )
+
+        @app.post("/debug/replay")
+        async def replay_debug(payload: dict) -> dict:
+            return load_replay_debug(
+                Path.cwd(),
+                run_id=str(payload.get("run_id") or ""),
+                limit=int(payload.get("limit") or 1),
+            )
+
         @app.get("/commands")
         async def list_commands() -> list[dict]:
             return [command.asdict() for command in command_registry.list_commands()]
@@ -450,10 +534,11 @@ def create_dashboard_app(
             if not decision.allowed:
                 return {"status": "blocked", "decision": asdict(decision)}
             nodes = _pc_backend(backend, orchestrator.state_path).snapshot()
+            node_limit = max(1, min(limit, 500))
             return {
                 "status": "ok",
                 "backend": backend,
-                "nodes": [asdict(node) for node in nodes[: max(1, min(limit, 500))]],
+                "nodes": [asdict(node) for node in nodes[:node_limit]],
             }
 
         @app.post("/pc/debug-selector")
@@ -730,44 +815,52 @@ def _record_channel_delivery(
 
 
 def _golden_traces_payload(workspace_root: Path) -> dict[str, Any]:
-    trace_dir = workspace_root / "benchmarks" / "golden_traces"
-    traces: list[dict[str, Any]] = []
-    trace_paths = sorted(trace_dir.glob("*.json")) if trace_dir.exists() else []
-    for path in trace_paths:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {"trace_id": path.stem, "status": "invalid"}
-        payload.setdefault("trace_id", path.stem)
-        payload.setdefault("path", str(path.relative_to(workspace_root)))
-        traces.append(payload)
+    traces = load_golden_traces(workspace_root)
     return {"trace_count": len(traces), "traces": traces}
 
 
 def _replay_benchmarks(workspace_root: Path, trace_id: str) -> dict[str, Any]:
-    payload = _golden_traces_payload(workspace_root)
-    traces = payload["traces"]
-    selected = [
-        trace for trace in traces if not trace_id or trace.get("trace_id") == trace_id
-    ]
-    results = []
-    for trace in selected:
-        expectations = trace.get("expectations")
-        if not isinstance(expectations, list):
-            expectations = []
-        results.append(
-            {
-                "trace_id": trace.get("trace_id"),
-                "passed": True,
-                "expectations_checked": len(expectations),
-                "detail": "golden trace schema replayed",
-            }
-        )
-    return {
-        "passed": all(item["passed"] for item in results),
-        "trace_count": len(results),
-        "results": results,
-    }
+    return replay_golden_traces(workspace_root, trace_id)
+
+
+def _live_fire_config(payload: dict[str, Any]) -> LiveFireEvalConfig:
+    config = LiveFireEvalConfig(
+        run_id=str(payload.get("run_id") or ""),
+        max_tasks=_optional_int(payload.get("max_tasks")),
+        surfaces=tuple(_string_list(payload.get("surfaces"))),
+        intents=tuple(_string_list(payload.get("intents"))),
+        windows_safe_pack=bool(payload.get("windows_safe_pack", False)),
+        repeat=max(1, int(payload.get("repeat") or 1)),
+        promote_failures=bool(payload.get("promote_failures", True)),
+        promote_after=int(payload.get("promote_after") or 1),
+        replay_limit=int(payload.get("replay_limit") or 10),
+        training_output=str(payload.get("training_output") or ""),
+    )
+    config.heldout_from = str(payload.get("heldout_from") or "")
+    return config
+
+
+def _workspace_root(state_path: str | Path) -> Path:
+    parent = Path(state_path).resolve(strict=False).parent
+    if parent.name == ".agentos":
+        return parent.parent
+    return Path.cwd()
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(str(value))
+
+
+def _string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    return []
 
 
 def _normalize_depth(value: object) -> str:

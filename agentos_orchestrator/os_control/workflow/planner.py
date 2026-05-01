@@ -240,7 +240,7 @@ class DesktopWorkflowPlanner:
         draw_steps = [
             DesktopWorkflowStep(
                 action_type="draw_path",
-                selector="drawing-canvas",
+                selector="name=Drawing Canvas",
                 value=path,
                 description="Draw a starter stroke sequence.",
             )
@@ -249,7 +249,7 @@ class DesktopWorkflowPlanner:
         return [
             DesktopWorkflowStep(
                 action_type="type",
-                selector="drawing-canvas",
+                selector="name=Drawing Canvas",
                 value=(f"Concept: {title}\nReference sketch saved to {artifact_path}"),
                 description=("Reference the generated concept in the drawing app."),
             ),

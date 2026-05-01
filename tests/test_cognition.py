@@ -223,6 +223,29 @@ class ActiveInferenceTests(unittest.TestCase):
         # Should still run but safety score is lower
         self.assertTrue(len(results) <= 1)
 
+    def test_suggest_action_types_into_search_like_field(self) -> None:
+        explorer = ActiveInferenceExplorer(max_probes=2, random_seed=42)
+        nodes = [
+            UiNode(node_id="search", role="Edit", name="Search"),
+            UiNode(node_id="go", role="Button", name="Go"),
+        ]
+        action = explorer.suggest_action(nodes, "search for API documentation")
+        self.assertIsNotNone(action)
+        self.assertEqual(action.action_type, "type")
+        self.assertEqual(action.selector, "name=Search")
+        self.assertTrue(bool(action.value))
+
+    def test_suggest_action_focuses_canvas_for_drawing_objective(self) -> None:
+        explorer = ActiveInferenceExplorer(max_probes=2, random_seed=42)
+        nodes = [
+            UiNode(node_id="canvas", role="Canvas", name="Drawing Surface"),
+            UiNode(node_id="save", role="Button", name="Save"),
+        ]
+        action = explorer.suggest_action(nodes, "draw a small house")
+        self.assertIsNotNone(action)
+        self.assertEqual(action.action_type, "focus")
+        self.assertEqual(action.selector, "name=Drawing Surface")
+
 
 # --------------------------------------------------------------------------- #
 # POMDP State Tests

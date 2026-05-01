@@ -275,10 +275,7 @@ class NotepadLiveFireTrial:
     ) -> str:
         attempts = max(
             1,
-            int(
-                config.file_timeout_seconds
-                / max(config.poll_interval_seconds, 0.001)
-            )
+            int(config.file_timeout_seconds / max(config.poll_interval_seconds, 0.001))
             + 1,
         )
         for attempt in range(attempts):
@@ -286,9 +283,7 @@ class NotepadLiveFireTrial:
                 return _sha256_bytes(target_path.read_bytes())
             if attempt < attempts - 1:
                 self.poller.sleep_fn(config.poll_interval_seconds)
-        raise FileNotFoundError(
-            f"Notepad output file was not created: {target_path}"
-        )
+        raise FileNotFoundError(f"Notepad output file was not created: {target_path}")
 
 
 def enable_windows_dpi_awareness() -> str:
@@ -312,9 +307,7 @@ def _notepad_window_observation(nodes: list[UiNode]) -> PollObservation:
     return PollObservation(
         matched=bool(matches),
         reason=(
-            "notepad window observed"
-            if matches
-            else "notepad window not observed"
+            "notepad window observed" if matches else "notepad window not observed"
         ),
         node_count=len(nodes),
         matched_nodes=[_node_label(node) for node in matches[:5]],
@@ -361,8 +354,7 @@ def _is_save_as_dialog(node: UiNode) -> bool:
 
 def _is_save_button(node: UiNode) -> bool:
     return "save" in _node_text(node) and (
-        _has_role(node, "button")
-        or _metadata_value(node, "class_name") == "button"
+        _has_role(node, "button") or _metadata_value(node, "class_name") == "button"
     )
 
 
@@ -424,9 +416,7 @@ def _elapsed_ms(start: float) -> float:
 
 
 def _default_notepad_config() -> NotepadLiveFireConfig:
-    return NotepadLiveFireConfig(
-        file_name=f"notepad_smoke_{int(time.time())}.txt"
-    )
+    return NotepadLiveFireConfig(file_name=f"notepad_smoke_{int(time.time())}.txt")
 
 
 def _initial_result(

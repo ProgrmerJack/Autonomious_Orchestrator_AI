@@ -1,0 +1,32 @@
+{
+  "trace_id": "universal_os_focus_theft",
+  "name": "Universal OS focus theft recovery",
+  "scope": "universal OS agent temporal grounding",
+  "objective": "Notice focus moved away from the intended app and re-ground before typing.",
+  "failure_modes": [
+    "focus_theft"
+  ],
+  "steps": [
+    {
+      "kind": "runtime.observe",
+      "expect": "TemporalFrame records focus_region changes between observations."
+    },
+    {
+      "kind": "mode.arbitrate",
+      "expect": "Uncertain focus routes to hybrid or explore mode instead of direct typing."
+    },
+    {
+      "kind": "frontier.prompt",
+      "expect": "State context includes recent focus history and active blockers."
+    },
+    {
+      "kind": "action.select",
+      "expect": "The selected action is grounded in current marks or bounded exploration."
+    }
+  ],
+  "expectations": [
+    "The agent does not type into stale focus.",
+    "Mode arbitration accounts for current UI uncertainty.",
+    "The next action has a locally verifiable expected observation."
+  ]
+}

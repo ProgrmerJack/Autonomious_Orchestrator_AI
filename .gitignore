@@ -22,3 +22,4 @@ apps/dashboard/node_modules/
 apps/dashboard/dist/
 
 Plan.md
+.env

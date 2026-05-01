@@ -4,6 +4,12 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agentos_orchestrator.app_family_registry import sandbox_surface_for_app
+from agentos_orchestrator.sandbox.agent_body_client import (
+    AgentBodyClient,
+    AgentBodyError,
+)
+
 from .base import UiAction, UiNode
 
 
@@ -15,7 +21,10 @@ class VirtualDesktopSandboxBackend:
     def __init__(self, state_path: str | Path) -> None:
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.state_path.exists():
+        self._agent_body = AgentBodyClient(self.state_path)
+        if self._agent_body.available():
+            self._migrate_state_for_agent_body()
+        elif not self.state_path.exists():
             self._save_state(self._default_state())
 
     @staticmethod
@@ -72,7 +81,44 @@ class VirtualDesktopSandboxBackend:
     def available(self) -> bool:
         return True
 
+    def capabilities(self) -> dict:
+        if self._agent_body.available():
+            try:
+                return self._agent_body.capabilities()
+            except AgentBodyError:
+                pass
+        return {
+            "type": "sandbox.capabilities",
+            "status": "ok",
+            "sandbox": True,
+            "rights": "full-virtual-rights",
+            "capabilities": [
+                "snapshot",
+                "act",
+                "exec",
+                "reset",
+                "adaptive-app-surfaces",
+                "virtual-file-mutation",
+                "stateful-control-receipts",
+            ],
+        }
+
+    def reset(self) -> dict:
+        if self._agent_body.available():
+            try:
+                return self._agent_body.reset()
+            except AgentBodyError:
+                pass
+        self._save_state(self._default_state())
+        return {"type": "sandbox.reset", "status": "reset", "sandbox": True}
+
     def snapshot(self) -> list[UiNode]:
+        if self._agent_body.available():
+            try:
+                payload = self._agent_body.request({"kind": "snapshot"})
+                return self._snapshot_from_agent_body(payload)
+            except AgentBodyError:
+                pass
         state = self._load_state()
         nodes: list[UiNode] = []
         for node in state.get("nodes", []):
@@ -99,6 +145,23 @@ class VirtualDesktopSandboxBackend:
         return nodes
 
     def perform(self, action: UiAction) -> str:
+        if self._agent_body.available():
+            try:
+                payload = self._agent_body.request(
+                    {
+                        "kind": "act",
+                        "action_type": action.action_type,
+                        "selector": action.selector,
+                        "value": action.value,
+                        "metadata": dict(action.metadata or {}),
+                    }
+                )
+                return json.dumps(
+                    self._agent_body_receipt(payload, action),
+                    sort_keys=True,
+                )
+            except AgentBodyError:
+                pass
         state = self._load_state()
         nodes = list(state.get("nodes") or [])
         receipt = {
@@ -136,6 +199,87 @@ class VirtualDesktopSandboxBackend:
         state["last_action"] = receipt
         self._save_state(state)
         return json.dumps(receipt, sort_keys=True)
+
+    def _migrate_state_for_agent_body(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        nodes = list(payload.get("nodes") or [])
+        if payload.get("terminal_log") is not None and all(
+            isinstance(node, dict) and "text" in node and "value" in node
+            for node in nodes
+        ):
+            return
+        migrated_nodes: list[dict] = []
+        for node in nodes:
+            metadata = dict(node.get("metadata") or {})
+            migrated_nodes.append(
+                {
+                    "node_id": str(node.get("node_id") or "unknown"),
+                    "role": str(node.get("role") or "Unknown"),
+                    "name": str(node.get("name") or "Unnamed"),
+                    "focused": bool(node.get("focused", False)),
+                    "enabled": bool(node.get("enabled", True)),
+                    "text": str(metadata.get("text") or ""),
+                    "value": str(metadata.get("value") or ""),
+                    "metadata": metadata,
+                }
+            )
+        migrated = {
+            "focused": str(payload.get("focused") or "window-browser"),
+            "last_action": payload.get("last_action"),
+            "virtual_files": list(payload.get("virtual_files") or []),
+            "terminal_log": list(payload.get("terminal_log") or []),
+            "nodes": migrated_nodes,
+        }
+        self.state_path.write_text(
+            json.dumps(migrated, indent=2),
+            encoding="utf-8",
+        )
+
+    def _snapshot_from_agent_body(self, payload: dict) -> list[UiNode]:
+        nodes: list[UiNode] = []
+        for node in list(payload.get("nodes") or []):
+            metadata = dict(node.get("metadata") or {})
+            bounds_raw = node.get("bounds") or metadata.get("bounds")
+            bounds = None
+            if isinstance(bounds_raw, list) and len(bounds_raw) == 4:
+                bounds = (
+                    int(bounds_raw[0]),
+                    int(bounds_raw[1]),
+                    int(bounds_raw[2]),
+                    int(bounds_raw[3]),
+                )
+            nodes.append(
+                UiNode(
+                    node_id=str(node.get("node_id") or "unknown"),
+                    role=str(node.get("role") or "Unknown"),
+                    name=str(node.get("name") or "Unnamed"),
+                    bounds=bounds,
+                    enabled=bool(node.get("enabled", True)),
+                    focused=bool(node.get("focused", False)),
+                    metadata=metadata,
+                )
+            )
+        return nodes
+
+    def _agent_body_receipt(self, payload: dict, action: UiAction) -> dict:
+        receipt = dict(payload)
+        status = str(receipt.get("status") or "")
+        if action.action_type in {"click", "invoke"} and status == "focused":
+            receipt["focus_status"] = status
+            receipt["status"] = "executed"
+        receipt.setdefault("sandbox", True)
+        receipt["backend"] = self.name
+        receipt.setdefault("action", action.action_type)
+        receipt.setdefault("action_type", action.action_type)
+        receipt.setdefault("selector", action.selector)
+        receipt.setdefault("value", action.value)
+        receipt.setdefault("timestamp", datetime.now(UTC).isoformat())
+        return receipt
 
     @staticmethod
     def _requires_node(action_type: str) -> bool:
@@ -425,6 +569,8 @@ class VirtualDesktopSandboxBackend:
     def _node_matches_selector(node: dict, selector_lower: str) -> bool:
         node_id = str(node.get("node_id") or "").lower()
         name = str(node.get("name") or "").lower()
+        if selector_lower in {"drawing-canvas", "design-canvas"}:
+            return node_id in {"drawing-canvas", "design-canvas"} or "canvas" in name
         return selector_lower in node_id or selector_lower in name
 
     def _update_browser_url(self, nodes: list[dict], url: str) -> None:
@@ -475,18 +621,13 @@ class VirtualDesktopSandboxBackend:
 
     @staticmethod
     def _predefined_surface(lower: str) -> tuple[str, str, str] | None:
+        registry_surface = sandbox_surface_for_app(lower)
+        if registry_surface is not None:
+            return registry_surface
         if "powerpnt" in lower:
             return "presentation-canvas", "Document", "Presentation Canvas"
-        if "winword" in lower or "notepad" in lower:
-            return "document-canvas", "Document", "Document Canvas"
         if lower == "code" or "vscode" in lower:
             return "editor-canvas", "Document", "Editor Canvas"
-        if "excel" in lower:
-            return "spreadsheet-grid", "Table", "Spreadsheet Grid"
-        if "explorer" in lower:
-            return "explorer-file-list", "List", "Explorer File List"
-        if "paint" in lower:
-            return "drawing-canvas", "Canvas", "Drawing Canvas"
         return None
 
     @staticmethod

@@ -43,6 +43,81 @@ class AgentOSClient:
             {"trace_id": trace_id},
         )
 
+    def eval_pack(self) -> dict[str, Any]:
+        return self._request("GET", "/benchmarks/eval-pack")
+
+    def replay_debug(
+        self,
+        run_id: str = "",
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/debug/replay",
+            {"run_id": run_id, "limit": limit},
+        )
+
+    def live_fire_eval(
+        self,
+        backend: str = "virtual-desktop-sandbox",
+        max_tasks: int | None = None,
+        surfaces: list[str] | None = None,
+        intents: list[str] | None = None,
+        run_id: str = "",
+        windows_safe_pack: bool = False,
+        repeat: int = 1,
+        promote_failures: bool = True,
+        promote_after: int = 1,
+        replay_limit: int = 10,
+        training_output: str = "",
+        approval_token: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "backend": backend,
+            "max_tasks": max_tasks,
+            "surfaces": surfaces or [],
+            "intents": intents or [],
+            "run_id": run_id,
+            "windows_safe_pack": windows_safe_pack,
+            "repeat": repeat,
+            "promote_failures": promote_failures,
+            "promote_after": promote_after,
+            "replay_limit": replay_limit,
+            "training_output": training_output,
+        }
+        if approval_token:
+            payload["approval_token"] = approval_token
+        return self._request("POST", "/benchmarks/live-fire-eval", payload)
+
+    def live_fire_review(self, limit: int = 10) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"limit": limit})
+        return self._request("GET", f"/benchmarks/live-fire-review?{query}")
+
+    def promote_live_fire_failure(
+        self,
+        run_id: str,
+        task_id: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/benchmarks/live-fire-review/promote",
+            {"run_id": run_id, "task_id": task_id},
+        )
+
+    def live_fire_shadow_training(
+        self,
+        trajectory_paths: list[str] | None = None,
+        output_dir: str = "",
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/benchmarks/live-fire-shadow-training",
+            {
+                "trajectory_paths": trajectory_paths or [],
+                "output_dir": output_dir,
+            },
+        )
+
     def daemon_status(self) -> dict[str, Any]:
         return self._request("GET", "/daemon/status")
 

@@ -1,0 +1,32 @@
+{
+  "trace_id": "universal_os_surprise_modal",
+  "name": "Universal OS surprise modal repair",
+  "scope": "universal OS agent blocker recovery",
+  "objective": "Continue the parent task when an unrelated modal appears unexpectedly.",
+  "failure_modes": [
+    "surprise_modal"
+  ],
+  "steps": [
+    {
+      "kind": "runtime.observe",
+      "expect": "Temporal state records the modal and computes a UI diff."
+    },
+    {
+      "kind": "blocker.detect",
+      "expect": "A modal blocker is pushed with evidence and a repair hint."
+    },
+    {
+      "kind": "repair.plan",
+      "expect": "The repair planner proposes a bounded Escape hotkey for unrelated modals."
+    },
+    {
+      "kind": "outcome.evaluate",
+      "expect": "Successful repair retires the active modal blocker."
+    }
+  ],
+  "expectations": [
+    "The frontier model is not allowed to dismiss modal evidence without local verification.",
+    "The repair action is non-destructive and policy-checkable.",
+    "The parent goal remains resumable after the modal closes."
+  ]
+}

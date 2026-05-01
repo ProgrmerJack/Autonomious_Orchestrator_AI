@@ -66,6 +66,8 @@ class GatewayCommandRouter:
                 "error",
                 "A research objective is required.",
             )
+        if self._should_route_to_desktop(objective):
+            return self._desktop_task(objective)
         if self._needs_clarification(objective):
             return ChannelResponse(
                 "clarification_required",
@@ -133,6 +135,7 @@ class GatewayCommandRouter:
                     "virtual_desktop_sandbox.json"
                 )
             )
+        self.workflow_service.ensure_universal_mode(backend, max_steps=8)
         result = self.workflow_service.execute(objective, backend)
         if result.get("status") == "clarification_required":
             questions = result["plan"].get("clarification_questions") or []
@@ -149,6 +152,86 @@ class GatewayCommandRouter:
             result["plan"]["summary"],
             result,
         )
+
+    @staticmethod
+    def _should_route_to_desktop(objective: str) -> bool:
+        lower = re.sub(r"\s+", " ", objective).strip().lower()
+        if not lower:
+            return False
+        action_markers = (
+            "open ",
+            "launch ",
+            "start ",
+            "search for",
+            "look up",
+            "browse ",
+            "navigate ",
+            "go to",
+            "click ",
+            "type ",
+            "fill ",
+            "write ",
+            "draft ",
+            "edit ",
+            "save ",
+            "create ",
+            "rename ",
+            "move ",
+            "copy ",
+            "download ",
+            "upload ",
+            "submit ",
+            "inspect ",
+        )
+        surface_markers = (
+            "browser",
+            "desktop",
+            "window",
+            "website",
+            "web page",
+            "url",
+            "app",
+            "application",
+            "file explorer",
+            "explorer",
+            "folder",
+            "file",
+            "document",
+            "report",
+            "spreadsheet",
+            "sheet",
+            "slides",
+            "presentation",
+            "script",
+            "notepad",
+            "word",
+            "excel",
+            "powerpoint",
+            "paint",
+            "vscode",
+            "code editor",
+            "chrome",
+            "edge",
+        )
+        research_only_markers = (
+            "paper",
+            "papers",
+            "literature",
+            "citation",
+            "citations",
+            "theorem",
+            "proof",
+            "survey",
+            "sources",
+        )
+        has_action = any(marker in lower for marker in action_markers)
+        has_surface = any(marker in lower for marker in surface_markers)
+        has_path_or_url = (
+            re.search(r"https?://|[a-z]:[/\\]|\.[a-z0-9]{1,6}\b", lower) is not None
+        )
+        if any(marker in lower for marker in research_only_markers) and not has_surface:
+            return False
+        return has_action and (has_surface or has_path_or_url)
 
     @staticmethod
     def _needs_clarification(objective: str) -> bool:

@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 # Data structures shared by all adapters                                      #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @dataclass
 class VLMElement:
     """A UI element as perceived by the VLM."""
@@ -80,9 +81,14 @@ class VLMElement:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "x": self.x, "y": self.y, "w": self.width, "h": self.height,
-            "label": self.label, "type": self.element_type,
-            "confidence": self.confidence, "affordance": self.affordance,
+            "x": self.x,
+            "y": self.y,
+            "w": self.width,
+            "h": self.height,
+            "label": self.label,
+            "type": self.element_type,
+            "confidence": self.confidence,
+            "affordance": self.affordance,
         }
 
 
@@ -93,9 +99,11 @@ class SceneUnderstanding:
     # Top-level natural-language description
     description: str = ""
     # Inferred application type
-    app_type: str = "unknown"   # browser | code_editor | terminal | media | office | unknown
+    app_type: str = (
+        "unknown"  # browser | code_editor | terminal | media | office | unknown
+    )
     # Detected UI theme
-    theme: str = "unknown"      # light | dark | high_contrast | unknown
+    theme: str = "unknown"  # light | dark | high_contrast | unknown
     # Semantic elements
     elements: list[VLMElement] = field(default_factory=list)
     # Confidence in description [0, 1]
@@ -115,14 +123,17 @@ class SceneUnderstanding:
     @property
     def interactive_elements(self) -> list[VLMElement]:
         return [
-            e for e in self.elements
-            if e.element_type in {"button", "text_field", "checkbox", "dropdown", "slider"}
+            e
+            for e in self.elements
+            if e.element_type
+            in {"button", "text_field", "checkbox", "dropdown", "slider"}
         ]
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Abstract protocol                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class VLMAdapter(abc.ABC):
     """Protocol all VLM backends must implement.
@@ -175,6 +186,7 @@ class VLMAdapter(abc.ABC):
 # ─────────────────────────────────────────────────────────────────────────── #
 # Default: classical CV adapter (wraps existing local_vla + perception)      #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class ClassicalVLMAdapter(VLMAdapter):
     """Thin wrapper around LocalFastVLA + AdaptivePerceptionEngine.
@@ -231,6 +243,7 @@ class ClassicalVLMAdapter(VLMAdapter):
 
         # Infer theme from mean brightness
         import numpy as np
+
         arr = np.array(screenshot.convert("L"), dtype=np.float32)
         theme = "dark" if arr.mean() < 100 else "light"
 
@@ -284,6 +297,7 @@ class ClassicalVLMAdapter(VLMAdapter):
 # ─────────────────────────────────────────────────────────────────────────── #
 # Stub: Qwen-VL local adapter (real model, activate when hardware is ready)  #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class QwenVLAdapter(VLMAdapter):
     """7B/2B Qwen-VL running locally via HuggingFace Transformers.
@@ -342,6 +356,7 @@ class QwenVLAdapter(VLMAdapter):
         t0 = time.perf_counter()
 
         import tempfile, os
+
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             screenshot.save(tmp.name)
             tmp_path = tmp.name
@@ -356,9 +371,7 @@ class QwenVLAdapter(VLMAdapter):
             query = self._tokenizer.from_list_format(
                 [{"image": tmp_path}, {"text": prompt}]
             )
-            response, _ = self._model.chat(
-                self._tokenizer, query=query, history=None
-            )
+            response, _ = self._model.chat(self._tokenizer, query=query, history=None)
         finally:
             os.unlink(tmp_path)
 
@@ -388,17 +401,19 @@ class QwenVLAdapter(VLMAdapter):
             screenshot = screenshot.crop(region)
 
         import tempfile, os
+
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             screenshot.save(tmp.name)
             tmp_path = tmp.name
 
         try:
             query = self._tokenizer.from_list_format(
-                [{"image": tmp_path}, {"text": "Extract all text from this image verbatim."}]
+                [
+                    {"image": tmp_path},
+                    {"text": "Extract all text from this image verbatim."},
+                ]
             )
-            response, _ = self._model.chat(
-                self._tokenizer, query=query, history=None
-            )
+            response, _ = self._model.chat(self._tokenizer, query=query, history=None)
         finally:
             os.unlink(tmp_path)
 
