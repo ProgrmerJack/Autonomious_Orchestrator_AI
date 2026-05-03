@@ -505,7 +505,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(overridden["min_provider_count"], 1)
         self.assertEqual(overridden["min_scholarly_sources"], 0)
         self.assertEqual(overridden["min_novelty_rate"], 0.0)
-        self.assertEqual(overridden["max_retrieval_passes"], 28)
+        self.assertEqual(overridden["max_retrieval_passes"], 120)
 
     def test_search_result_pages_are_not_seeded_as_sources(self) -> None:
         urls = DeepResearchEngine._source_seed_urls(

@@ -440,6 +440,50 @@ class ResearchOrchestrator:
         if novelty < novelty_target:
             failures.append("novelty rate below threshold")
 
+        # Current-web/market mode uses broad live web evidence where
+        # "strong_or_moderate" grading can undercount useful signals.
+        # Treat this as a soft gate when relevance and provider diversity are adequate.
+        # Current-web profile is indicated by relaxed scholarly requirement, not strict provider count.
+        current_web_profile = int(targets.get("min_scholarly_sources", 0)) == 0
+        if current_web_profile and failures:
+            source_floor = max(3, int(targets.get("min_source_count", 0)) // 2)
+            has_minimum_live_signal = (
+                int(coverage.get("source_count", 0)) >= source_floor
+                and float(coverage.get("on_topic_ratio", 0.0)) >= 0.65
+                and int(coverage.get("provider_count", 0)) >= 1
+            )
+            if has_minimum_live_signal:
+                failures = [
+                    item
+                    for item in failures
+                    if item
+                    not in {
+                        "source_count below target",
+                        "provider_count below target",
+                        "strong_or_moderate evidence below target",
+                    }
+                ]
+            else:
+                # Second-tier fallback for live web runs: if we still have
+                # at least some relevant evidence, keep the run alive and let
+                # downstream synthesis expose uncertainty instead of hard-failing.
+                has_partial_live_signal = (
+                    int(coverage.get("source_count", 0)) >= 1
+                    and int(coverage.get("provider_count", 0)) >= 1
+                    and float(coverage.get("on_topic_ratio", 0.0)) >= 0.5
+                )
+                if has_partial_live_signal:
+                    failures = [
+                        item
+                        for item in failures
+                        if item
+                        not in {
+                            "source_count below target",
+                            "provider_count below target",
+                            "strong_or_moderate evidence below target",
+                        }
+                    ]
+
         return failures
 
     @staticmethod

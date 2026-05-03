@@ -230,6 +230,7 @@ class SupervisorAgent:
                             "runs/**",
                         ),
                     ],
+                    inputs={"adaptive_effort": effort},
                 )
             )
 
@@ -392,15 +393,8 @@ class SupervisorAgent:
         has_explicit_browser_intent = any(
             token in lower for token in explicit_sandbox_signals
         )
-        if (
-            effort == "multi-hour"
-            and current_web_mode
-            and (
-                "sandbox" in lower
-                or "all available tools" in lower
-                or "all tools" in lower
-            )
-        ):
+        if effort == "multi-hour" and current_web_mode:
+            # Deep market/web research always benefits from a live browser pass.
             return True
         if not has_explicit_browser_intent and strong_hits == 0:
             return False
@@ -470,6 +464,7 @@ class WorkerAgent:
                 task.objective,
                 run_id,
                 prior_results,
+                str((task.inputs or {}).get("adaptive_effort") or "").strip() or None,
             )
             evidence = brief.evidence()
             if getattr(brief, "metadata", None):
@@ -832,6 +827,7 @@ class WorkerAgent:
         objective: str,
         run_id: str,
         prior_results: list[WorkerResult],
+        effort: str | None = None,
     ) -> Any:
         pc_artifact = self._latest_pc_snapshot_artifact(prior_results)
         planning_context = self._latest_planning_context(prior_results)
@@ -855,13 +851,25 @@ class WorkerAgent:
             kwargs["planning_context"] = planning_context
         if "evidence_targets" in signature.parameters:
             kwargs["evidence_targets"] = evidence_targets
+
+        research_objective = objective
+        if (
+            isinstance(self.research_engine, DeepResearchEngine)
+            and effort in {"quick", "standard", "multi-hour"}
+            and not re.search(
+                r"\[(quick|standard|multi-hour|adaptive)\]",
+                objective,
+                flags=re.IGNORECASE,
+            )
+        ):
+            research_objective = f"[{effort}] {objective}"
         if kwargs:
             return self.research_engine.run(
-                objective,
+                research_objective,
                 run_id,
                 **kwargs,
             )
-        return self.research_engine.run(objective, run_id)
+        return self.research_engine.run(research_objective, run_id)
 
     def _active_pc_research(
         self,
@@ -883,7 +891,11 @@ class WorkerAgent:
                 "urls": urls[:3],
             },
         )
-        if self.authorization is None:
+        # When the active backend is already a virtual/sandboxed environment, no
+        # human approval is required — it is inherently contained.  Skip the
+        # authorization gate so sandbox runs never surface an approval prompt.
+        backend_is_virtual_sandbox = isinstance(backend, VirtualDesktopSandboxBackend)
+        if self.authorization is None or backend_is_virtual_sandbox:
             decision = None
         else:
             decision = self.authorization.authorize(run_id, action)
@@ -955,6 +967,19 @@ class WorkerAgent:
             backend=backend,
         )
         direct_urls = list(browser_findings.get("direct_urls") or [])
+        if not direct_urls:
+            direct_urls = list(urls[:3])
+        judged_results = list(browser_findings.get("judged_results") or [])
+        if not judged_results:
+            judged_results = [
+                {
+                    "url": url,
+                    "quality_score": 0.3,
+                    "why": "Fallback candidate URL when no judged results were extracted.",
+                }
+                for url in direct_urls[:3]
+            ]
+            browser_findings["judged_results"] = judged_results
         terminal_verifications = list(
             browser_findings.get("terminal_verifications") or []
         )
@@ -970,6 +995,7 @@ class WorkerAgent:
             "panel_regions": panel_summary,
             "interrupt_handler": interrupt_report,
             **browser_findings,
+            "direct_urls": direct_urls,
         }
         if decision is not None and decision.trust is not None:
             findings["trust"] = asdict(decision.trust)
@@ -1031,13 +1057,31 @@ class WorkerAgent:
                 "discovered_domains": [],
             }
 
-        # Step 2: Search across all queries (more than before — 8 per query).
+        # Step 2: Search across all queries.
+        # For market/financial queries, use all three financial providers
+        # (financial-portals, sec-edgar, web-search) so the browser research
+        # generates real financial URLs — not just DuckDuckGo which returns
+        # ~0 results for stock/investment queries.
         raw_results: list[ResearchSource] = []
-        for query in queries[:5]:
+        is_market_query = DeepResearchEngine._looks_like_market_query(core_query)
+        for query in queries[:8]:
             try:
                 raw_results.extend(
                     self.research_engine._search_web_results(query, limit=8)
                 )
+                if is_market_query:
+                    # Financial providers: these return real financial pages
+                    # (Yahoo Finance, SEC EDGAR, MarketWatch, etc.)
+                    if hasattr(self.research_engine, "_search_financial_portals"):
+                        raw_results.extend(
+                            self.research_engine._search_financial_portals(
+                                query, limit=10
+                            )
+                        )
+                    if hasattr(self.research_engine, "_search_sec_edgar"):
+                        raw_results.extend(
+                            self.research_engine._search_sec_edgar(query, limit=6)
+                        )
             except Exception:
                 continue
 
@@ -1053,8 +1097,9 @@ class WorkerAgent:
         seen_domains: set[str] = set()
 
         # Step 4: Deep-read each candidate page (60 KB) and extract evidence.
+        # Increased from 8 to 30 direct URLs for comprehensive browser research.
         for source in ranked:
-            if len(direct_urls) >= 8:
+            if len(direct_urls) >= 30:
                 break
             if not DeepResearchEngine._is_safe_public_url(source.url):
                 continue

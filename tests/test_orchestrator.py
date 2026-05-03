@@ -176,6 +176,56 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(targets.get("min_novelty_rate"), 0.0)
         self.assertEqual(targets.get("min_scholarly_sources"), 0)
 
+    def test_current_web_gate_softens_source_and_strong_thresholds(self) -> None:
+        failures = ResearchOrchestrator._coverage_failures(
+            {
+                "source_count": 8,
+                "provider_count": 1,
+                "scholarly_source_count": 0,
+                "strong_or_moderate": 0,
+                "max_contradiction_risk": 0.2,
+                "novelty_rate": 0.0,
+                "on_topic_ratio": 0.9,
+            },
+            {
+                "min_source_count": 12,
+                "min_provider_count": 1,
+                "min_scholarly_sources": 0,
+                "min_strong_or_moderate": 4,
+                "max_contradiction_risk": 0.8,
+                "min_novelty_rate": 0.0,
+            },
+        )
+
+        self.assertNotIn("source_count below target", failures)
+        self.assertNotIn("strong_or_moderate evidence below target", failures)
+
+    def test_current_web_gate_softens_provider_and_source_on_partial_signal(
+        self,
+    ) -> None:
+        failures = ResearchOrchestrator._coverage_failures(
+            {
+                "source_count": 2,
+                "provider_count": 1,
+                "scholarly_source_count": 0,
+                "strong_or_moderate": 0,
+                "max_contradiction_risk": 0.1,
+                "novelty_rate": 0.0,
+                "on_topic_ratio": 0.7,
+            },
+            {
+                "min_source_count": 12,
+                "min_provider_count": 2,
+                "min_scholarly_sources": 0,
+                "min_strong_or_moderate": 4,
+                "max_contradiction_risk": 0.8,
+                "min_novelty_rate": 0.0,
+            },
+        )
+
+        self.assertNotIn("source_count below target", failures)
+        self.assertNotIn("provider_count below target", failures)
+
     def test_planning_urls_support_explicit_and_generic_targets(self) -> None:
         urls = WorkerAgent._planning_urls_from_objective(
             "Review https://docs.example.org/agentos and compare benchmark safety behavior for agentos orchestration"
