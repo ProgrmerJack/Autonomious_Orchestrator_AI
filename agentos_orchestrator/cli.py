@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import json
 import os
@@ -43,6 +44,25 @@ from .os_control import (
     WindowsUiaBackend,
 )
 from .product import DaemonManager, collect_product_status
+
+
+def _configure_dashboard_event_loop_policy() -> None:
+    """Use a stable asyncio policy for dashboard serving on Windows.
+
+    The Proactor loop on recent Python/Windows combinations can emit
+    WinError 64 accept-loop failures under client disconnect churn.
+    Switching to the selector policy improves socket accept resilience
+    for local dashboard workloads.
+    """
+    if os.name != "nt":
+        return
+    selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if selector_policy is None:
+        return
+    current_policy = asyncio.get_event_loop_policy()
+    if isinstance(current_policy, selector_policy):
+        return
+    asyncio.set_event_loop_policy(selector_policy())
 
 
 def add_runtime_options(
@@ -435,6 +455,8 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "Install uvicorn and fastapi to run the dashboard API"
             ) from exc
+
+        _configure_dashboard_event_loop_policy()
 
         event_hub = DashboardEventHub()
         event_hub.attach(orchestrator.event_bus)

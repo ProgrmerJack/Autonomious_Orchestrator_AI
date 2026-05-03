@@ -130,7 +130,7 @@ class AgentOSClient:
     def start_run(
         self,
         objective: str,
-        depth: str = "standard",
+        depth: str = "adaptive",
         background: bool = True,
     ) -> dict[str, Any]:
         return self._request(

@@ -71,67 +71,112 @@ class MacroPlanner:
         lower = objective.lower()
         goals: list[MacroGoal] = []
 
-        # Detect app-launch goals
-        if any(kw in lower for kw in {"open", "launch", "start"}):
-            goals.append(
-                self._make_goal(
-                    f"Launch the target application for: {objective}",
-                    ["Target app is open and visible"],
-                )
-            )
+        # Each goal type is detected by presence of relevant intent signals.
+        # Multiple goal types can fire for compound objectives.
 
-        # Detect content-creation goals
-        if any(kw in lower for kw in {"write", "create", "draw", "make", "edit"}):
+        # App-launch / navigation intent
+        launch_signals = {"open", "launch", "start", "navigate", "go to", "switch to"}
+        if any(sig in lower for sig in launch_signals):
+            target_hint = self._extract_target_hint(objective, launch_signals)
             goals.append(
                 self._make_goal(
-                    f"Create or modify content for: {objective}",
+                    f"Launch or navigate to the target{target_hint} for: {objective}",
                     [
-                        "Content has been entered into the workspace",
-                        "Changes are saved or staged",
+                        "Target application or page is open and visible",
+                        "UI reflects the expected state after navigation",
                     ],
                 )
             )
 
-        # Detect research/knowledge goals
-        if any(
-            kw in lower
-            for kw in {"find", "search", "analyze", "compare", "research", "look up"}
-        ):
+        # Content creation / editing intent
+        creation_signals = {
+            "write",
+            "create",
+            "draw",
+            "make",
+            "edit",
+            "type",
+            "enter",
+            "fill",
+            "draft",
+        }
+        if any(sig in lower for sig in creation_signals):
             goals.append(
                 self._make_goal(
-                    f"Gather information for: {objective}",
+                    f"Create or modify the required content for: {objective}",
                     [
-                        "Relevant information has been retrieved",
-                        "Information is accessible in the workspace",
+                        "Required content has been entered into the correct field or workspace",
+                        "Changes are saved or staged for confirmation",
                     ],
                 )
             )
 
-        # Detect file-operation goals
-        if any(
-            kw in lower
-            for kw in {"save", "export", "download", "move", "copy", "delete"}
-        ):
+        # Research / information gathering intent
+        research_signals = {
+            "find",
+            "search",
+            "analyze",
+            "compare",
+            "research",
+            "look up",
+            "investigate",
+        }
+        if any(sig in lower for sig in research_signals):
             goals.append(
                 self._make_goal(
-                    f"Perform file operation for: {objective}",
+                    f"Gather information needed for: {objective}",
+                    [
+                        "Relevant information has been retrieved and is accessible",
+                        "Evidence is sufficient to proceed with the objective",
+                    ],
+                )
+            )
+
+        # File operation intent
+        file_signals = {
+            "save",
+            "export",
+            "download",
+            "move",
+            "copy",
+            "delete",
+            "rename",
+            "upload",
+        }
+        if any(sig in lower for sig in file_signals):
+            goals.append(
+                self._make_goal(
+                    f"Perform the required file operation for: {objective}",
                     [
                         "File operation completed successfully",
-                        "File exists at expected path or is removed",
+                        "File exists at the expected path or has been removed",
                     ],
                 )
             )
 
-        # Fallback: if no patterns matched, create a single exploratory goal
+        # Fallback: no recognised signal → single exploratory goal
         if not goals:
             goals.append(
                 self._make_goal(
                     f"Explore and accomplish: {objective}",
-                    ["Objective appears satisfied based on UI state"],
+                    [
+                        "Objective appears satisfied based on observable UI state",
+                    ],
                 )
             )
 
         return goals
+
+    @staticmethod
+    def _extract_target_hint(objective: str, signals: set[str]) -> str:
+        """Extract a short hint about what is being targeted (app, URL, etc.)."""
+        words = objective.lower().split()
+        for i, word in enumerate(words):
+            if word in signals and i + 1 < len(words):
+                candidate = words[i + 1].strip(".,;:")
+                if len(candidate) > 2:
+                    return f" ({candidate})"
+        return ""
 
     def replan_on_failure(
         self,
@@ -187,28 +232,32 @@ class MacroPlanner:
         """Break a stuck goal into smaller pieces."""
         sub_goals: list[MacroGoal] = []
         desc = goal.description.lower()
-        if "launch" in desc or "open" in desc:
+        # Determine decomposition strategy from the goal's description.
+        if any(sig in desc for sig in ("launch", "navigate", "open", "go to")):
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub1",
-                    description="Identify the correct application executable",
-                    success_criteria=["Executable path or name is known"],
+                    description="Identify the correct target executable or URL",
+                    success_criteria=["Target path, name, or URL is known"],
                     max_micro_attempts=3,
                 )
             )
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub2",
-                    description="Launch the application via shell or UI",
-                    success_criteria=["Application window is visible"],
+                    description="Open the target via shell command, icon, or address bar",
+                    success_criteria=["Target is visible and responsive"],
                     max_micro_attempts=5,
                 )
             )
-        elif "create" in desc or "write" in desc:
+        elif any(
+            sig in desc
+            for sig in ("create", "write", "edit", "enter", "modify", "content")
+        ):
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub1",
-                    description="Focus the correct input/workspace area",
+                    description="Locate and focus the correct input area",
                     success_criteria=["Cursor is in an editable region"],
                     max_micro_attempts=5,
                 )
@@ -216,28 +265,37 @@ class MacroPlanner:
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub2",
-                    description="Enter the required content",
-                    success_criteria=["Content matches the intent"],
+                    description="Enter or modify the required content",
+                    success_criteria=["Content reflects the objective intent"],
                     max_micro_attempts=8,
                 )
             )
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub3",
-                    description="Save or confirm the changes",
-                    success_criteria=["File is saved or changes are committed"],
+                    description="Save, submit, or confirm the changes",
+                    success_criteria=["Changes are persisted or submitted"],
                     max_micro_attempts=5,
                 )
             )
         else:
+            # Generic decomposition: explore then act
             sub_goals.append(
                 MacroGoal(
                     goal_id=f"{goal.goal_id}_sub1",
-                    description="Explore the UI to locate relevant controls",
+                    description="Explore the UI to locate controls relevant to the goal",
                     success_criteria=[
                         "At least one relevant control has been identified"
                     ],
                     max_micro_attempts=6,
+                )
+            )
+            sub_goals.append(
+                MacroGoal(
+                    goal_id=f"{goal.goal_id}_sub2",
+                    description="Interact with identified controls to progress toward the goal",
+                    success_criteria=["Observable state change confirms progress"],
+                    max_micro_attempts=8,
                 )
             )
         return sub_goals

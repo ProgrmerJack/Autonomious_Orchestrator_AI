@@ -108,7 +108,7 @@ class DashboardEventHub:
 
 
 class DashboardRunManager:
-    """Small background runner so multi-hour UI requests do not block HTTP."""
+    """Small background runner so long UI requests do not block HTTP."""
 
     def __init__(
         self,
@@ -126,16 +126,26 @@ class DashboardRunManager:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._futures: dict[str, Future] = {}
 
-    def start(self, objective: str) -> dict[str, Any]:
+    def start(self, objective: str, depth: object = "adaptive") -> dict[str, Any]:
+        normalized_depth = _normalize_depth(depth)
+        explicit_depth = _extract_depth_from_objective(objective)
+        # If caller did not provide an explicit depth (or left adaptive), keep
+        # the objective's declared depth tag so deep runs are not downgraded.
+        if explicit_depth and normalized_depth == "adaptive":
+            normalized_depth = explicit_depth
+        run_objective = _objective_with_depth(objective, normalized_depth)
         job_id = new_id("job")
+        run_id = new_id("run")
         now = utc_now()
         job = {
             "job_id": job_id,
             "objective": objective,
+            "depth": normalized_depth,
+            "run_objective": run_objective,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
-            "run_id": None,
+            "run_id": run_id,
             "error": None,
             "report": None,
         }
@@ -144,7 +154,8 @@ class DashboardRunManager:
             self._futures[job_id] = self._executor.submit(
                 self._run_job,
                 job_id,
-                objective,
+                run_id,
+                run_objective,
             )
         self.event_hub.publish({"job": {"job_id": job_id, "status": "queued"}})
         return dict(job)
@@ -158,11 +169,11 @@ class DashboardRunManager:
             job = self._jobs.get(job_id)
             return dict(job) if job is not None else None
 
-    def _run_job(self, job_id: str, objective: str) -> None:
+    def _run_job(self, job_id: str, run_id: str, run_objective: str) -> None:
         self._update(job_id, status="running")
         self.event_hub.publish({"job": {"job_id": job_id, "status": "running"}})
         try:
-            report = self.orchestrator.run(objective)
+            report = self.orchestrator.run(run_objective, run_id=run_id)
         except (
             KeyError,
             OSError,
@@ -441,17 +452,15 @@ def create_dashboard_app(
         @app.post("/commands")
         async def save_command(payload: dict) -> dict:
             command_id = str(payload.get("command_id") or "").strip().removeprefix("/")
-            template = str(payload.get("template") or "").strip()
-            if not command_id or not template:
+            if not command_id:
                 raise fastapi.HTTPException(
                     status_code=400,
-                    detail="command_id and template are required",
+                    detail="command_id is required",
                 )
             command = WorkflowCommand(
                 command_id=command_id,
                 label=str(payload.get("label") or command_id),
                 description=str(payload.get("description") or ""),
-                template=template,
                 enabled=bool(payload.get("enabled", True)),
             )
             return command_registry.save(command).asdict()
@@ -464,13 +473,10 @@ def create_dashboard_app(
                     status_code=400,
                     detail="objective is required",
                 )
-            depth = _normalize_depth(payload.get("depth"))
-            run_objective = (
-                f"[{depth}] {objective}" if depth != "standard" else objective
-            )
-            if bool(payload.get("background")):
-                return run_manager.start(run_objective)
-            return asdict(orchestrator.run(run_objective))
+            # Always run via background executor — never block the event loop.
+            # The legacy synchronous path (no "background" key) was the root
+            # cause of server deadlocks on long-running research jobs.
+            return run_manager.start(objective, payload.get("depth"))
 
         @app.get("/jobs")
         async def list_jobs() -> list[dict]:
@@ -515,6 +521,27 @@ def create_dashboard_app(
                 raise fastapi.HTTPException(
                     status_code=404,
                     detail=str(exc),
+                ) from exc
+
+        @app.get("/runs/{run_id}/progress")
+        async def get_run_progress(run_id: str) -> dict:
+            """Return live progress for a running research job.
+
+            Returns the most recently written progress.json if available,
+            or a 404 if the research phase has not yet started.
+            """
+            progress_path = Path.cwd() / "runs" / run_id / "research" / "progress.json"
+            if not progress_path.exists():
+                raise fastapi.HTTPException(
+                    status_code=404,
+                    detail="Progress not yet available — research phase has not started.",
+                )
+            try:
+                return json.loads(progress_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise fastapi.HTTPException(
+                    status_code=500,
+                    detail=f"Could not read progress file: {exc}",
                 ) from exc
 
         @app.get("/pc/snapshot")
@@ -863,11 +890,37 @@ def _string_list(value: object) -> list[str]:
     return []
 
 
-def _normalize_depth(value: object) -> str:
-    depth = str(value or "standard")
-    if depth in {"quick", "standard", "multi-hour"}:
-        return depth
-    return "standard"
+def _normalize_depth(depth: object) -> str:
+    allowed = {"quick", "standard", "multi-hour", "adaptive"}
+    value = str(depth or "adaptive").strip().lower()
+    return value if value in allowed else "adaptive"
+
+
+def _objective_with_depth(objective: str, depth: str) -> str:
+    if not objective:
+        return objective
+    cleaned = re.sub(
+        r"\[(quick|standard|multi-hour|adaptive)\]\s*",
+        "",
+        objective,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not cleaned:
+        return objective.strip()
+    return f"[{depth}] {cleaned}"
+
+
+def _extract_depth_from_objective(objective: str) -> str | None:
+    if not objective:
+        return None
+    match = re.match(
+        r"\s*\[(quick|standard|multi-hour|adaptive)\]\s*",
+        objective,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return _normalize_depth(match.group(1))
 
 
 def _research_payload(run_id: str, workspace_root: Path) -> dict[str, Any]:

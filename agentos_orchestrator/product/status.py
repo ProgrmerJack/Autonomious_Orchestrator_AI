@@ -133,7 +133,7 @@ def setup_checks(
             (dashboard_dir / "package.json").exists(),
             str(dashboard_dir),
             repair_hint=(
-                "Restore apps/dashboard/package.json from the project template."
+                "Restore apps/dashboard/package.json from the project scaffold."
             ),
         ),
         _check(

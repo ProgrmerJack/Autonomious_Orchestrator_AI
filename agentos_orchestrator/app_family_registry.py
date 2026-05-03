@@ -17,7 +17,7 @@ class AppFamilySpec:
     surface_name: str
     preferred_channels: tuple[str, ...]
     affordance_hints: tuple[str, ...]
-    verification_templates: tuple[str, ...]
+    verification_contracts: tuple[str, ...]
     repair_recipes: tuple[str, ...]
     eval_surface: bool = True
     live_fire: bool = False
@@ -45,7 +45,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Address and search bar",
         preferred_channels=("accessibility", "dom", "ocr", "explore"),
         affordance_hints=("tabs", "address bar", "links", "forms", "page actions"),
-        verification_templates=("tab_focused", "field_contains", "state_changed"),
+        verification_contracts=("tab_focused", "field_contains", "state_changed"),
         repair_recipes=(
             "refresh DOM/accessibility",
             "escape modal",
@@ -70,7 +70,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Explorer File List",
         preferred_channels=("accessibility", "api", "explore"),
         affordance_hints=("tree", "file list", "breadcrumb", "context menu"),
-        verification_templates=("file_exists", "window_title_changed", "state_changed"),
+        verification_contracts=("file_exists", "window_title_changed", "state_changed"),
         repair_recipes=(
             "refresh folder",
             "validate path",
@@ -92,7 +92,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Document Canvas",
         preferred_channels=("accessibility", "api", "ocr", "explore"),
         affordance_hints=("filename field", "save/open button", "folder picker"),
-        verification_templates=("field_contains", "file_exists", "modal_closed"),
+        verification_contracts=("field_contains", "file_exists", "modal_closed"),
         repair_recipes=(
             "select filename",
             "validate allowed root",
@@ -115,7 +115,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Application Workspace",
         preferred_channels=("api", "accessibility", "ocr"),
         affordance_hints=("prompt", "stdout", "current directory", "exit code"),
-        verification_templates=(
+        verification_contracts=(
             "receipt_success",
             "process_launched",
             "clipboard_contains",
@@ -145,7 +145,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Document Canvas",
         preferred_channels=("accessibility", "api", "clipboard", "explore"),
         affordance_hints=("text area", "tabs", "command palette", "status bar"),
-        verification_templates=("field_contains", "file_exists", "state_changed"),
+        verification_contracts=("field_contains", "file_exists", "state_changed"),
         repair_recipes=(
             "focus editor",
             "use clipboard for large text",
@@ -168,7 +168,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Spreadsheet Grid",
         preferred_channels=("accessibility", "ocr", "explore"),
         affordance_hints=("ribbon", "cells", "form fields", "save/export controls"),
-        verification_templates=("field_contains", "export_hash_changed", "file_exists"),
+        verification_contracts=("field_contains", "export_hash_changed", "file_exists"),
         repair_recipes=(
             "select active cell",
             "verify export artifact",
@@ -189,7 +189,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="PDF Search Box",
         preferred_channels=("accessibility", "ocr", "explore"),
         affordance_hints=("page text", "search box", "zoom", "download button"),
-        verification_templates=("field_contains", "file_exists", "state_changed"),
+        verification_contracts=("field_contains", "file_exists", "state_changed"),
         repair_recipes=(
             "use search",
             "verify page text",
@@ -209,7 +209,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Chat Composer",
         preferred_channels=("accessibility", "ocr", "clipboard", "explore"),
         affordance_hints=("message composer", "send button", "thread list"),
-        verification_templates=("field_contains", "receipt_success", "state_changed"),
+        verification_contracts=("field_contains", "receipt_success", "state_changed"),
         repair_recipes=("focus composer", "paste large text", "verify message echo"),
         clipboard_base=0.7,
         latency_base=0.7,
@@ -227,7 +227,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Electron Command Palette",
         preferred_channels=("accessibility", "dom", "ocr", "explore"),
         affordance_hints=("webview", "command palette", "sidebars", "modal overlays"),
-        verification_templates=("state_changed", "field_contains", "modal_closed"),
+        verification_contracts=("state_changed", "field_contains", "modal_closed"),
         repair_recipes=(
             "refresh accessibility",
             "try DOM bridge",
@@ -249,7 +249,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Drawing Canvas",
         preferred_channels=("accessibility", "vision", "ocr", "explore"),
         affordance_hints=("canvas", "layers", "tool palette", "export controls"),
-        verification_templates=(
+        verification_contracts=(
             "state_changed",
             "export_hash_changed",
             "receipt_success",
@@ -276,7 +276,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Trading Order Ticket",
         preferred_channels=("accessibility", "api", "ocr", "explore"),
         affordance_hints=("watchlist", "chart", "order ticket", "position grid"),
-        verification_templates=("field_contains", "receipt_success", "state_changed"),
+        verification_contracts=("field_contains", "receipt_success", "state_changed"),
         repair_recipes=(
             "avoid submit/send actions",
             "verify order ticket fields",
@@ -305,7 +305,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
             "details pane",
             "workflow buttons",
         ),
-        verification_templates=("field_contains", "state_changed", "receipt_success"),
+        verification_contracts=("field_contains", "state_changed", "receipt_success"),
         repair_recipes=(
             "filter before editing",
             "verify selected record",
@@ -327,7 +327,7 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         surface_name="Application Workspace",
         preferred_channels=("accessibility", "ocr", "vision", "explore"),
         affordance_hints=("visible controls", "focused region", "modal state"),
-        verification_templates=("state_changed", "modal_closed", "receipt_success"),
+        verification_contracts=("state_changed", "modal_closed", "receipt_success"),
         repair_recipes=(
             "bounded exploration",
             "ask frontier with marks",
@@ -393,7 +393,7 @@ def adapter_specs() -> list[tuple[str, list[str], list[str], list[str], list[str
             spec.family,
             list(spec.preferred_channels),
             list(spec.affordance_hints),
-            list(spec.verification_templates),
+            list(spec.verification_contracts),
             list(spec.repair_recipes),
         )
         for spec in APP_FAMILY_SPECS

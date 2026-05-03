@@ -175,11 +175,10 @@ class ToolExecutor:
         tickers: list[str] | None = None,
         period: str = "1y",
     ) -> str:
-        """Generate boilerplate quant analysis code for common objectives.
+        """Generate objective-shaped quant analysis code.
 
-        The agent can call this instead of writing code from scratch.
-        It is always faster to use a known-good template than to hallucinate
-        arbitrary pandas.
+        The agent can call this to build a bounded, inspectable analysis script
+        from the objective, tickers, and requested period.
 
         Returns Python source that prints a RESULT: summary= line.
         """
@@ -512,21 +511,21 @@ class ToolExecutor:
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# Pre-built Analysis Templates                                                 #
+# Adaptive Analysis Snippets                                                   #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-_TEMPLATE_REGISTRY: dict[str, str] = {}
+_ANALYSIS_SNIPPET_REGISTRY: dict[str, str] = {}
 
 
-def register_template(name: str, code: str) -> None:
-    _TEMPLATE_REGISTRY[name] = code
+def register_analysis_snippet(name: str, code: str) -> None:
+    _ANALYSIS_SNIPPET_REGISTRY[name] = code
 
 
-def get_template(name: str) -> str | None:
-    return _TEMPLATE_REGISTRY.get(name)
+def get_analysis_snippet(name: str) -> str | None:
+    return _ANALYSIS_SNIPPET_REGISTRY.get(name)
 
 
-register_template(
+register_analysis_snippet(
     "portfolio_stats",
     textwrap.dedent("""
         import json, numpy as np, pandas as pd
@@ -556,7 +555,7 @@ register_template(
     """).strip(),
 )
 
-register_template(
+register_analysis_snippet(
     "rolling_volatility",
     textwrap.dedent("""
         import json, numpy as np, pandas as pd
@@ -578,7 +577,7 @@ register_template(
     """).strip(),
 )
 
-register_template(
+register_analysis_snippet(
     "market_regime_hmm",
     textwrap.dedent("""
         import json, numpy as np, pandas as pd

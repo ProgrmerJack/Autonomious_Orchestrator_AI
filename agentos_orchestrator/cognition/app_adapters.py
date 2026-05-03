@@ -20,7 +20,7 @@ class AdapterContext:
     family: str
     preferred_channels: list[str]
     affordance_hints: list[str]
-    verification_templates: list[str]
+    verification_contracts: list[str]
     repair_recipes: list[str]
     risk_notes: list[str] = field(default_factory=list)
 
@@ -29,7 +29,7 @@ class AdapterContext:
             "family": self.family,
             "preferred_channels": list(self.preferred_channels),
             "affordance_hints": list(self.affordance_hints),
-            "verification_templates": list(self.verification_templates),
+            "verification_contracts": list(self.verification_contracts),
             "repair_recipes": list(self.repair_recipes),
             "risk_notes": list(self.risk_notes),
         }
@@ -40,7 +40,7 @@ class AppFamilyAdapter:
     family: str
     preferred_channels: list[str]
     affordance_hints: list[str]
-    verification_templates: list[str]
+    verification_contracts: list[str]
     repair_recipes: list[str]
 
     def matches(self, profile: CapabilityProfile) -> bool:
@@ -59,7 +59,7 @@ class AppFamilyAdapter:
                 profile.control_channels,
             ),
             affordance_hints=list(self.affordance_hints),
-            verification_templates=list(self.verification_templates),
+            verification_contracts=list(self.verification_contracts),
             repair_recipes=list(self.repair_recipes),
             risk_notes=list(profile.risks),
         )
@@ -156,7 +156,7 @@ class AdapterRegistry:
                 "family": adapter.family,
                 "preferred_channels": list(adapter.preferred_channels),
                 "affordance_hints": list(adapter.affordance_hints),
-                "verification_templates": list(adapter.verification_templates),
+                "verification_contracts": list(adapter.verification_contracts),
                 "repair_recipes": list(adapter.repair_recipes),
             }
             for adapter in self.adapters
@@ -174,14 +174,14 @@ def _adapter(
     family: str,
     channels: list[str],
     hints: list[str],
-    templates: list[str],
+    contracts: list[str],
     repairs: list[str],
 ) -> AppFamilyAdapter:
     return AppFamilyAdapter(
         family=family,
         preferred_channels=channels,
         affordance_hints=hints,
-        verification_templates=templates,
+        verification_contracts=contracts,
         repair_recipes=repairs,
     )
 

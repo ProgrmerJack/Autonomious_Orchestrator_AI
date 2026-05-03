@@ -1621,7 +1621,7 @@ class GenericControlSurfaceDiscoverer:
             if primary.get("json_example") not in (None, {}, []):
                 payload = self._materialize_example(primary["json_example"], objective)
             if payload in (None, {}, []):
-                payload = self._payload_template(excerpt, objective)
+                payload = self._objective_payload(excerpt, objective)
             workflow.append(
                 {
                     "name": "execute_objective",
@@ -1764,7 +1764,7 @@ class GenericControlSurfaceDiscoverer:
             return "DELETE"
         return "GET"
 
-    def _payload_template(self, excerpt: str, objective: str) -> dict[str, Any]:
+    def _objective_payload(self, excerpt: str, objective: str) -> dict[str, Any]:
         example = self._json_example(excerpt)
         if example:
             return self._materialize_example(example, objective)

@@ -378,14 +378,14 @@ class AbstractWorldModelTests(unittest.TestCase):
 
     def test_vector_to_state_preserves_structure(self) -> None:
         model = AbstractWorldModel()
-        template = AbstractUIState(
+        reference = AbstractUIState(
             app_context="browser",
             layout_mode="full",
             elements=[UIElementState("button", "main", 0.5, 0.5, True)],
             task_progress={"step1": 0.5, "step2": 0.3},
         )
-        vec = template.to_vector(256)
-        reconstructed = model._vector_to_state(vec, template)
+        vec = reference.to_vector(256)
+        reconstructed = model._vector_to_state(vec, reference)
         self.assertEqual(reconstructed.app_context, "browser")
         self.assertEqual(len(reconstructed.elements), 1)
 

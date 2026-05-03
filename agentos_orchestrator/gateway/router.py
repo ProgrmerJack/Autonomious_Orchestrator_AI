@@ -28,6 +28,87 @@ class ChannelResponse:
 class GatewayCommandRouter:
     """OpenClaw-style channel command router for local AgentOS runs."""
 
+    # Action verbs that suggest a desktop/browser task is needed.
+    # Configurable: override on a subclass or instance to extend the set.
+    DESKTOP_ACTION_MARKERS: tuple[str, ...] = (
+        "open ",
+        "launch ",
+        "start ",
+        "search for",
+        "look up",
+        "browse ",
+        "navigate ",
+        "go to",
+        "click ",
+        "type ",
+        "fill ",
+        "write ",
+        "draft ",
+        "edit ",
+        "save ",
+        "create ",
+        "rename ",
+        "move ",
+        "copy ",
+        "download ",
+        "upload ",
+        "submit ",
+        "inspect ",
+    )
+    # Surface nouns/contexts that confirm a desktop intent.
+    DESKTOP_SURFACE_MARKERS: tuple[str, ...] = (
+        "browser",
+        "desktop",
+        "window",
+        "website",
+        "web page",
+        "url",
+        "app",
+        "application",
+        "file explorer",
+        "explorer",
+        "folder",
+        "file",
+        "document",
+        "report",
+        "spreadsheet",
+        "sheet",
+        "slides",
+        "presentation",
+        "script",
+        "notepad",
+        "word",
+        "excel",
+        "powerpoint",
+        "paint",
+        "vscode",
+        "code editor",
+        "chrome",
+        "edge",
+    )
+    # Markers that indicate a pure research intent (not desktop).
+    RESEARCH_ONLY_MARKERS: tuple[str, ...] = (
+        "paper",
+        "papers",
+        "literature",
+        "citation",
+        "citations",
+        "theorem",
+        "proof",
+        "survey",
+        "sources",
+    )
+    # Markers that indicate a vague/ambiguous objective needing clarification.
+    VAGUE_MARKERS: tuple[str, ...] = (
+        "do it",
+        "something",
+        "anything",
+        "whatever",
+        "handle this",
+        "make it better",
+        "fix this",
+    )
+
     def __init__(
         self,
         orchestrator: ResearchOrchestrator,
@@ -55,7 +136,7 @@ class GatewayCommandRouter:
             return self._desktop_task(argument)
         workflow = self.command_registry.get(command)
         if workflow is not None:
-            return self._run(workflow.render(argument))
+            return self._run(workflow.objective_for(argument))
         if text:
             return self._run(text)
         return ChannelResponse("ignored", "No command text was provided.")
@@ -158,78 +239,21 @@ class GatewayCommandRouter:
         lower = re.sub(r"\s+", " ", objective).strip().lower()
         if not lower:
             return False
-        action_markers = (
-            "open ",
-            "launch ",
-            "start ",
-            "search for",
-            "look up",
-            "browse ",
-            "navigate ",
-            "go to",
-            "click ",
-            "type ",
-            "fill ",
-            "write ",
-            "draft ",
-            "edit ",
-            "save ",
-            "create ",
-            "rename ",
-            "move ",
-            "copy ",
-            "download ",
-            "upload ",
-            "submit ",
-            "inspect ",
+        has_action = any(
+            marker in lower for marker in GatewayCommandRouter.DESKTOP_ACTION_MARKERS
         )
-        surface_markers = (
-            "browser",
-            "desktop",
-            "window",
-            "website",
-            "web page",
-            "url",
-            "app",
-            "application",
-            "file explorer",
-            "explorer",
-            "folder",
-            "file",
-            "document",
-            "report",
-            "spreadsheet",
-            "sheet",
-            "slides",
-            "presentation",
-            "script",
-            "notepad",
-            "word",
-            "excel",
-            "powerpoint",
-            "paint",
-            "vscode",
-            "code editor",
-            "chrome",
-            "edge",
+        has_surface = any(
+            marker in lower for marker in GatewayCommandRouter.DESKTOP_SURFACE_MARKERS
         )
-        research_only_markers = (
-            "paper",
-            "papers",
-            "literature",
-            "citation",
-            "citations",
-            "theorem",
-            "proof",
-            "survey",
-            "sources",
-        )
-        has_action = any(marker in lower for marker in action_markers)
-        has_surface = any(marker in lower for marker in surface_markers)
         has_path_or_url = (
             re.search(r"https?://|[a-z]:[/\\]|\.[a-z0-9]{1,6}\b", lower) is not None
         )
-        if any(marker in lower for marker in research_only_markers) and not has_surface:
+        if (
+            any(
+                marker in lower for marker in GatewayCommandRouter.RESEARCH_ONLY_MARKERS
+            )
+            and not has_surface
+        ):
             return False
         return has_action and (has_surface or has_path_or_url)
 
@@ -238,13 +262,4 @@ class GatewayCommandRouter:
         cleaned = re.sub(r"\s+", " ", objective).strip().lower()
         if not cleaned:
             return True
-        vague_markers = (
-            "do it",
-            "something",
-            "anything",
-            "whatever",
-            "handle this",
-            "make it better",
-            "fix this",
-        )
-        return any(marker in cleaned for marker in vague_markers)
+        return any(marker in cleaned for marker in GatewayCommandRouter.VAGUE_MARKERS)

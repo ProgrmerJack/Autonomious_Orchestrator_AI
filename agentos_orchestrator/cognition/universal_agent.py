@@ -8,7 +8,7 @@ This agent combines:
 - Hierarchical Macro/Micro planning (goal decomposition)
 - Differentiable memory (Working + Episodic)
 
-It can handle arbitrary desktop tasks without task-specific templates.
+It can handle arbitrary desktop tasks without task-specific scripts.
 """
 
 from __future__ import annotations

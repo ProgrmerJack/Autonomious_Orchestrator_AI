@@ -441,6 +441,9 @@ class AdaptationTrainingTests(unittest.TestCase):
             self.assertEqual(result.requested["osworld_archives"], 4)
             self.assertFalse(result.underfill["underfilled"])
             self.assertEqual(result.scale_report["minimum_target"], 100_000)
+            self.assertEqual(result.scale_report["production_target"], 10_000_000)
+            self.assertFalse(result.scale_report["meets_production_scale"])
+            self.assertEqual(result.scale_report["scale_stage"], "bootstrap")
             self.assertTrue(state_path.exists())
 
             resumed = trainer.train_long_run(

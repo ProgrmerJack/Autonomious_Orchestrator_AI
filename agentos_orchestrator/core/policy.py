@@ -129,6 +129,10 @@ class PermissionPolicy:
         return [self.assert_allowed(request) for request in requests]
 
     def _requires_approval(self, request: ActionRequest) -> bool:
+        # Sandbox-isolated targets never require approval — the sandbox is an
+        # isolated environment with no host-OS impact.
+        if str(request.target or "").lower().startswith("sandbox://"):
+            return False
         return self._matches_any(
             request.action_type,
             self.require_approval.get("actions", []),

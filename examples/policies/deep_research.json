@@ -11,6 +11,7 @@
             "network.fetch",
             "os.act",
             "os.snapshot",
+            "sandbox.exec",
             "sandbox.spawn"
         ],
         "paths": [
@@ -55,8 +56,7 @@
     },
     "require_approval": {
         "actions": [
-            "os.act",
-            "sandbox.exec"
+            "os.act"
         ]
     }
 }

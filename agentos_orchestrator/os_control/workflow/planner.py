@@ -61,6 +61,52 @@ class DesktopWorkflowPlanner:
         "spreadsheet": "excel.exe",
     }
 
+    CLARITY_VAGUE_MARKERS = (
+        "do it",
+        "something",
+        "anything",
+        "whatever",
+        "handle this",
+        "make it better",
+        "fix this",
+    )
+    ACTION_SIGNALS = (
+        "open",
+        "launch",
+        "search",
+        "find",
+        "write",
+        "create",
+        "edit",
+        "save",
+        "move",
+        "copy",
+        "delete",
+        "rename",
+        "download",
+        "upload",
+        "run",
+        "execute",
+    )
+    TARGET_SIGNALS = (
+        "file",
+        "folder",
+        "document",
+        "report",
+        "script",
+        "browser",
+        "website",
+        "url",
+        "app",
+        "excel",
+        "word",
+        "powerpoint",
+        "vscode",
+        "notepad",
+        "paint",
+        "explorer",
+    )
+
     def __init__(self) -> None:
         self.browser_adapter = BrowserWorkflowAdapter()
         self.file_manager_adapter = FileManagerWorkflowAdapter()
@@ -314,9 +360,12 @@ class DesktopWorkflowPlanner:
             return "app-task"
         if DesktopWorkflowPlanner._is_spreadsheet_cell_intent(lower):
             return "spreadsheet"
+        mode_scores: dict[str, int] = {}
         for mode, terms in DesktopWorkflowPlanner.MODE_KEYWORDS.items():
-            if any(term in lower for term in terms):
-                return mode
+            mode_scores[mode] = sum(1 for term in terms if term in lower)
+        best_mode = max(mode_scores, key=mode_scores.get) if mode_scores else "app-task"
+        if mode_scores.get(best_mode, 0) > 0:
+            return best_mode
         return "app-task"
 
     @staticmethod
@@ -422,10 +471,39 @@ class DesktopWorkflowPlanner:
 
     @staticmethod
     def _explicit_app_target(lower: str) -> str | None:
+        explicit_app_keys = {
+            "file explorer",
+            "explorer",
+            "powerpoint",
+            "slides",
+            "word",
+            "excel",
+            "paint",
+            "notepad",
+            "vscode",
+            "visual studio code",
+            "code editor",
+            "browser",
+            "edge",
+            "chrome",
+        }
+        explicit_scored: list[tuple[int, int, str]] = []
+        fallback_scored: list[tuple[int, int, str]] = []
         for key, value in DesktopWorkflowPlanner.APP_TARGET_KEYWORDS:
-            if key in lower:
-                return value
-        return None
+            if key not in lower:
+                continue
+            item = (lower.count(key), len(key), value)
+            if key in explicit_app_keys:
+                explicit_scored.append(item)
+            else:
+                fallback_scored.append(item)
+        if explicit_scored:
+            explicit_scored.sort(reverse=True)
+            return explicit_scored[0][2]
+        if not fallback_scored:
+            return None
+        fallback_scored.sort(reverse=True)
+        return fallback_scored[0][2]
 
     @staticmethod
     def _sub_tasks(objective: str) -> list[str]:
@@ -447,16 +525,27 @@ class DesktopWorkflowPlanner:
             return True
         if len(cleaned.split()) < 4:
             return True
-        vague_markers = (
-            "do it",
-            "something",
-            "anything",
-            "whatever",
-            "handle this",
-            "make it better",
-            "fix this",
+        if any(
+            marker in lower for marker in DesktopWorkflowPlanner.CLARITY_VAGUE_MARKERS
+        ):
+            return True
+
+        action_hits = sum(
+            1 for token in DesktopWorkflowPlanner.ACTION_SIGNALS if token in lower
         )
-        return any(marker in lower for marker in vague_markers)
+        target_hits = sum(
+            1 for token in DesktopWorkflowPlanner.TARGET_SIGNALS if token in lower
+        )
+        unique_terms = {
+            token
+            for token in re.findall(r"[a-z0-9_\-]+", lower)
+            if len(token) > 2
+            and token not in {"the", "and", "for", "with", "then", "from", "into"}
+        }
+        clarity_score = (
+            action_hits * 0.45 + target_hits * 0.4 + min(len(unique_terms), 12) * 0.03
+        )
+        return clarity_score < 0.55
 
     @staticmethod
     def _clarification_questions(

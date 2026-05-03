@@ -118,7 +118,10 @@ class GatewayRouterResearchTests(unittest.TestCase):
 
             self.assertEqual(response.status, "completed")
             report = response.payload["report"]
-            self.assertIn("[multi-hour]", report["objective"])
+            self.assertIn(
+                "retrieval-augmented literature synthesis", report["objective"]
+            )
+            self.assertNotIn("[multi-hour]", report["objective"])
 
 
 if __name__ == "__main__":

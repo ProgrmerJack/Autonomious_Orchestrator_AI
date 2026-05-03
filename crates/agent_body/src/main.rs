@@ -13,7 +13,7 @@ fn main() -> io::Result<()> {
     }
     if args.iter().any(|arg| arg == "--describe") {
         println!(
-            "{{\"capabilities\":[\"event-bridge\",\"stdin-actions\",\"snapshot\",\"act\",\"exec\",\"capabilities\",\"sandbox-state\",\"adaptive-app-surfaces\",\"full-rights-virtual-sandbox\"]}}"
+            "{{\"capabilities\":[\"event-bridge\",\"stdin-actions\",\"snapshot\",\"act\",\"exec\",\"capabilities\",\"sandbox-state\",\"adaptive-app-surfaces\",\"multi-panel-app-surfaces\",\"virtual-filesystem\",\"virtual-processes\",\"clipboard\",\"modal-mutation\",\"history-preserving-reset\",\"window-panel-mutation\",\"full-rights-virtual-sandbox\"]}}"
         );
         return Ok(());
     }
@@ -96,7 +96,19 @@ struct NodeRecord {
 struct SandboxState {
     focused: String,
     last_action: Option<Value>,
+    #[serde(default)]
+    agent_history: Vec<Value>,
+    #[serde(default)]
+    clipboard: String,
+    #[serde(default)]
+    virtual_processes: Vec<Value>,
+    #[serde(default)]
+    modals: Vec<Value>,
+    #[serde(default)]
+    virtual_file_contents: Map<String, Value>,
+    #[serde(default)]
     virtual_files: Vec<String>,
+    #[serde(default)]
     terminal_log: Vec<String>,
     nodes: Vec<NodeRecord>,
 }
@@ -155,6 +167,11 @@ fn default_state() -> SandboxState {
     SandboxState {
         focused: "window-browser".to_string(),
         last_action: None,
+        agent_history: Vec::new(),
+        clipboard: String::new(),
+        virtual_processes: Vec::new(),
+        modals: Vec::new(),
+        virtual_file_contents: default_virtual_file_contents(),
         virtual_files: vec![
             "artifacts/workflows/report.md".to_string(),
             "artifacts/workflows/slides.pptx".to_string(),
@@ -163,12 +180,44 @@ fn default_state() -> SandboxState {
         terminal_log: Vec::new(),
         nodes: vec![
             node_record("window-browser", "Window", "Sandbox Browser"),
+            panel_node(
+                "browser-tab-strip",
+                "TabList",
+                "Browser Tabs",
+                "browser",
+                "tab_strip",
+                vec![120, 92, 900, 26],
+            ),
+            panel_node(
+                "browser-toolbar",
+                "ToolBar",
+                "Browser Toolbar",
+                "browser",
+                "toolbar",
+                vec![120, 118, 1200, 40],
+            ),
             edit_node(
                 "browser-address-bar",
                 "Address and search bar",
                 "about:blank",
             ),
+            panel_node(
+                "browser-side-panel",
+                "Pane",
+                "Browser Side Panel",
+                "browser",
+                "side_panel",
+                vec![1030, 170, 290, 760],
+            ),
             document_node("browser-main-doc", "Blank Page"),
+            panel_node(
+                "browser-status-bar",
+                "StatusBar",
+                "Browser Status Bar",
+                "browser",
+                "status",
+                vec![120, 932, 1200, 24],
+            ),
             document_node("terminal-input", "Sandbox Terminal"),
         ],
     }
@@ -182,11 +231,19 @@ fn handle_command(state: &mut SandboxState, command: CommandEnvelope) -> Value {
             "focused": state.focused,
             "virtual_files": state.virtual_files,
             "terminal_log": state.terminal_log,
+            "clipboard": state.clipboard,
+            "virtual_processes": state.virtual_processes,
+            "modals": state.modals,
+            "virtual_file_contents": state.virtual_file_contents,
+            "agent_history_count": state.agent_history.len(),
+            "recent_agent_history": recent_history(&state.agent_history),
             "nodes": state.nodes,
         }),
         CommandEnvelope::Capabilities => capabilities_payload(),
         CommandEnvelope::Reset => {
+            let history = state.agent_history.clone();
             *state = default_state();
+            state.agent_history = history;
             json!({
                 "type": "sandbox.reset",
                 "status": "reset",
@@ -209,6 +266,104 @@ fn execute_command(state: &mut SandboxState, argv: Vec<String>) -> Value {
     ensure_terminal_node(state);
     state.focused = "terminal-input".to_string();
     state.terminal_log.push(joined.clone());
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = 0;
+
+    if argv.is_empty() {
+        // Do nothing
+    } else {
+        let cmd = argv[0].as_str();
+        match cmd {
+            "ls" | "dir" => {
+                stdout = state.virtual_files.join("\n");
+                if stdout.is_empty() {
+                    stdout = ".".to_string();
+                }
+            }
+            "cat" | "type" => {
+                if argv.len() > 1 {
+                    let path = &argv[1];
+                    if let Some(content) = state.virtual_file_contents.get(path).and_then(|v| v.as_str()) {
+                        stdout = content.to_string();
+                    } else {
+                        stderr = format!("{cmd}: {path}: No such file or directory");
+                        exit_code = 1;
+                    }
+                } else {
+                    stderr = format!("{cmd}: missing operand");
+                    exit_code = 1;
+                }
+            }
+            "echo" => {
+                stdout = argv[1..].join(" ");
+            }
+            "pwd" => {
+                stdout = "/sandbox/workspace".to_string();
+            }
+            "python" | "python3" => {
+                if argv.len() > 1 {
+                    let path = &argv[1];
+                    if state.virtual_file_contents.contains_key(path) {
+                        stdout = format!("Simulated execution of {path} completed successfully.");
+                    } else if path == "-c" {
+                        stdout = "Simulated execution completed.".to_string();
+                    } else {
+                        stderr = format!("{cmd}: can't open file '{path}': [Errno 2] No such file or directory");
+                        exit_code = 2;
+                    }
+                } else {
+                    stdout = "Python 3.10.12 (sandbox virtual python)\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.".to_string();
+                }
+            }
+            "git" => {
+                if argv.len() > 1 {
+                    match argv[1].as_str() {
+                        "status" => stdout = "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean".to_string(),
+                        "log" => stdout = "commit a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0\nAuthor: Sandbox User <sandbox@example.com>\nDate:   Today\n\n    Initial virtual commit".to_string(),
+                        "clone" => stdout = "Cloning into virtual repository... done.".to_string(),
+                        _ => stdout = format!("Simulated git {} executed successfully.", argv[1]),
+                    }
+                } else {
+                    stdout = "usage: git [--version] [--help] [-C <path>] [-c <name>=<value>]\n           [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]\n           [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--bare]\n           [--git-dir=<path>] [--work-tree=<path>] [--namespace=<name>]\n           [--super-prefix=<path>] [--config-env=<name>=<envvar>]\n           <command> [<args>]".to_string();
+                }
+            }
+            "npm" | "yarn" | "pnpm" => {
+                stdout = format!("Simulated {} completed in 1.42s.", cmd);
+            }
+            "curl" | "wget" => {
+                stdout = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><head><title>Virtual Page</title></head><body><h1>Simulated Fetch</h1></body></html>".to_string();
+            }
+            "mkdir" | "touch" | "rm" | "cp" | "mv" => {
+                stdout = "".to_string(); // silent on success usually
+            }
+            _ => {
+                stderr = format!("bash: {cmd}: command not found");
+                exit_code = 127;
+            }
+        }
+    }
+
+    let process = json!({
+        "pid": state.virtual_processes.len() + 1,
+        "command": joined.clone(),
+        "status": "exited",
+        "exit_code": exit_code,
+        "sandbox": true,
+    });
+    state.virtual_processes.push(process.clone());
+    
+    let combined_output = if !stderr.is_empty() {
+        if !stdout.is_empty() {
+            format!("{}\n{}", stdout, stderr)
+        } else {
+            stderr.clone()
+        }
+    } else {
+        stdout.clone()
+    };
+
     if let Some(node) = find_node_mut(state, "terminal-input") {
         node.focused = true;
         node.text = joined.clone();
@@ -221,10 +376,13 @@ fn execute_command(state: &mut SandboxState, argv: Vec<String>) -> Value {
         "rights": "full-virtual-rights",
         "argv": argv,
         "selector": "terminal-input",
-        "exit_code": 0,
-        "stdout": format!("Executed inside sandbox: {joined}"),
+        "exit_code": exit_code,
+        "process": process,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output": combined_output,
     });
-    state.last_action = Some(receipt.clone());
+    remember_receipt(state, &receipt);
     receipt
 }
 
@@ -249,7 +407,14 @@ fn apply_action(
             "launched": app_name,
             "surface": surface,
         });
-        state.last_action = Some(receipt.clone());
+        remember_receipt(state, &receipt);
+        return receipt;
+    }
+
+    if let Some(receipt) =
+        apply_virtual_system_action(state, action_type, selector, value, &metadata)
+    {
+        remember_receipt(state, &receipt);
         return receipt;
     }
 
@@ -263,7 +428,7 @@ fn apply_action(
             "action_type": action_type,
             "selector": selector,
         });
-        state.last_action = Some(receipt.clone());
+        remember_receipt(state, &receipt);
         return receipt;
     }
 
@@ -296,6 +461,15 @@ fn apply_action(
                 let file_op = mutate_virtual_files(state, action_type, &metadata);
                 extra.insert("file_op".to_string(), file_op);
             }
+            "move_window" | "resize_window" | "open_panel" | "close_panel" | "select_tab" => {
+                let panel_receipt =
+                    mutate_window_panel(state, index, action_type, value, &metadata);
+                if let Some(panel_map) = panel_receipt.as_object() {
+                    for (key, value) in panel_map {
+                        extra.insert(key.clone(), value.clone());
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -306,6 +480,10 @@ fn apply_action(
             "cell_edit" => "value-set",
             "draw_path" => "drawn",
             "copy_file" | "move_file" | "rename_file" => "file-op-executed",
+            "move_window" | "resize_window" => "window-updated",
+            "open_panel" => "panel-opened",
+            "close_panel" => "panel-closed",
+            "select_tab" => "tab-selected",
             _ => "executed",
         };
         let mut receipt = json!({
@@ -325,7 +503,7 @@ fn apply_action(
                 receipt_map.insert(key, value);
             }
         }
-        state.last_action = Some(receipt.clone());
+        remember_receipt(state, &receipt);
         return receipt;
     }
 
@@ -338,7 +516,7 @@ fn apply_action(
         "selector": selector,
         "value": value,
     });
-    state.last_action = Some(receipt.clone());
+    remember_receipt(state, &receipt);
     receipt
 }
 
@@ -356,6 +534,11 @@ fn requires_node(action_type: &str) -> bool {
             | "copy_file"
             | "move_file"
             | "rename_file"
+            | "move_window"
+            | "resize_window"
+            | "open_panel"
+            | "close_panel"
+            | "select_tab"
     )
 }
 
@@ -400,6 +583,255 @@ fn set_node_text(state: &mut SandboxState, index: usize, value: &str) {
         node.text = value.to_string();
         node.value = value.to_string();
     }
+}
+
+fn apply_virtual_system_action(
+    state: &mut SandboxState,
+    action_type: &str,
+    selector: &str,
+    value: Option<&str>,
+    metadata: &Map<String, Value>,
+) -> Option<Value> {
+    if matches!(
+        action_type,
+        "create_file"
+            | "write_file"
+            | "read_file"
+            | "delete_file"
+            | "copy_file"
+            | "move_file"
+            | "rename_file"
+            | "download_file"
+            | "upload_file"
+    ) {
+        return Some(virtual_file_action(
+            state,
+            action_type,
+            selector,
+            value,
+            metadata,
+        ));
+    }
+    if matches!(
+        action_type,
+        "set_clipboard" | "get_clipboard" | "clipboard_copy"
+    ) {
+        return Some(clipboard_action(state, action_type, selector, value));
+    }
+    if action_type == "execute_command" {
+        return Some(execute_command(
+            state,
+            vec![value.unwrap_or(selector).to_string()],
+        ));
+    }
+    if matches!(action_type, "open_modal" | "close_modal") {
+        return Some(modal_action(state, action_type, selector, value));
+    }
+    None
+}
+
+fn virtual_file_action(
+    state: &mut SandboxState,
+    action_type: &str,
+    selector: &str,
+    value: Option<&str>,
+    metadata: &Map<String, Value>,
+) -> Value {
+    let source = metadata_text(metadata, "path")
+        .or_else(|| metadata_text(metadata, "source"))
+        .or(value.map(str::to_string))
+        .or_else(|| (!selector.is_empty()).then(|| selector.to_string()))
+        .unwrap_or_else(|| "artifacts/workflows/item.txt".to_string());
+    let destination = metadata_text(metadata, "destination")
+        .unwrap_or_else(|| "artifacts/workflows/copied-item.txt".to_string());
+    let new_name = metadata_text(metadata, "new_name")
+        .or_else(|| metadata_text(metadata, "name"))
+        .unwrap_or_else(|| source.clone());
+    let content = metadata_text(metadata, "content")
+        .or_else(|| metadata_text(metadata, "text"))
+        .or_else(|| value.filter(|item| *item != source).map(str::to_string))
+        .unwrap_or_default();
+
+    let mut operation = action_type.replace("_file", "");
+    let mut read_content = Value::Null;
+    match action_type {
+        "create_file" | "write_file" | "upload_file" => {
+            if !state.virtual_files.contains(&source) {
+                state.virtual_files.push(source.clone());
+            }
+            state
+                .virtual_file_contents
+                .insert(source.clone(), Value::String(content.clone()));
+        }
+        "read_file" => {
+            operation = "read".to_string();
+            read_content = state
+                .virtual_file_contents
+                .get(&source)
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
+        }
+        "delete_file" => {
+            operation = "delete".to_string();
+            state.virtual_files.retain(|item| item != &source);
+            state.virtual_file_contents.remove(&source);
+        }
+        "download_file" => {
+            let download_path = if destination == source {
+                format!("downloads/{source}")
+            } else {
+                destination.clone()
+            };
+            if !state.virtual_files.contains(&download_path) {
+                state.virtual_files.push(download_path.clone());
+            }
+            let stored = state
+                .virtual_file_contents
+                .get(&source)
+                .cloned()
+                .unwrap_or_else(|| Value::String(content.clone()));
+            state.virtual_file_contents.insert(download_path, stored);
+        }
+        "copy_file" | "move_file" | "rename_file" => {
+            let file_op = mutate_virtual_files(state, action_type, metadata);
+            let stored = state
+                .virtual_file_contents
+                .get(&source)
+                .cloned()
+                .unwrap_or_else(|| Value::String(content.clone()));
+            if action_type == "copy_file" {
+                state
+                    .virtual_file_contents
+                    .insert(destination.clone(), stored);
+            } else if action_type == "move_file" {
+                state.virtual_file_contents.remove(&source);
+                state
+                    .virtual_file_contents
+                    .insert(destination.clone(), stored);
+            } else {
+                state.virtual_file_contents.remove(&source);
+                state.virtual_file_contents.insert(new_name.clone(), stored);
+            }
+            return json!({
+                "type": "sandbox.act",
+                "status": "file-op-executed",
+                "sandbox": true,
+                "rights": "full-virtual-rights",
+                "action_type": action_type,
+                "selector": selector,
+                "value": value,
+                "file_op": file_op,
+            });
+        }
+        _ => {}
+    }
+
+    json!({
+        "type": "sandbox.act",
+        "status": "file-op-executed",
+        "sandbox": true,
+        "rights": "full-virtual-rights",
+        "action_type": action_type,
+        "selector": selector,
+        "value": value,
+        "file_op": {
+            "operation": operation.clone(),
+            "source": source,
+            "destination": if operation == "rename" || operation == "read" { Value::Null } else { Value::String(destination) },
+            "new_name": if operation == "rename" { Value::String(new_name) } else { Value::Null },
+            "content": read_content,
+            "resulting_file_count": state.virtual_files.len(),
+        }
+    })
+}
+
+fn clipboard_action(
+    state: &mut SandboxState,
+    action_type: &str,
+    selector: &str,
+    value: Option<&str>,
+) -> Value {
+    if matches!(action_type, "set_clipboard" | "clipboard_copy") {
+        state.clipboard = value.unwrap_or(selector).to_string();
+    }
+    json!({
+        "type": "sandbox.act",
+        "status": "clipboard-updated",
+        "sandbox": true,
+        "rights": "full-virtual-rights",
+        "action_type": action_type,
+        "selector": selector,
+        "value": value,
+        "clipboard": state.clipboard,
+    })
+}
+
+fn modal_action(
+    state: &mut SandboxState,
+    action_type: &str,
+    selector: &str,
+    value: Option<&str>,
+) -> Value {
+    if action_type == "close_modal" {
+        let closed = state.modals.pop().unwrap_or(Value::Null);
+        for node in &mut state.nodes {
+            if node.role.eq_ignore_ascii_case("Dialog") {
+                node.enabled = false;
+            }
+        }
+        return json!({
+            "type": "sandbox.act",
+            "status": "modal-closed",
+            "sandbox": true,
+            "rights": "full-virtual-rights",
+            "action_type": action_type,
+            "selector": selector,
+            "modal": closed,
+        });
+    }
+    let modal_id = format!("modal-{}", state.modals.len() + 1);
+    let modal_name = value.unwrap_or(selector).to_string();
+    let modal = json!({"modal_id": modal_id, "name": modal_name});
+    state.modals.push(modal.clone());
+    let mut node =
+        node_record_with_bounds(&modal_id, "Dialog", &modal_name, vec![360, 220, 560, 320]);
+    node.metadata
+        .insert("panel_type".to_string(), Value::String("modal".to_string()));
+    state.nodes.push(node);
+    json!({
+        "type": "sandbox.act",
+        "status": "modal-opened",
+        "sandbox": true,
+        "rights": "full-virtual-rights",
+        "action_type": action_type,
+        "selector": selector,
+        "value": value,
+        "modal": modal,
+    })
+}
+
+fn metadata_text(metadata: &Map<String, Value>, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn default_virtual_file_contents() -> Map<String, Value> {
+    let mut contents = Map::new();
+    contents.insert(
+        "artifacts/workflows/report.md".to_string(),
+        Value::String(String::new()),
+    );
+    contents.insert(
+        "artifacts/workflows/slides.pptx".to_string(),
+        Value::String(String::new()),
+    );
+    contents.insert(
+        "artifacts/workflows/notes.txt".to_string(),
+        Value::String(String::new()),
+    );
+    contents
 }
 
 fn mutate_virtual_files(
@@ -450,6 +882,103 @@ fn mutate_virtual_files(
         "new_name": if action_type == "rename_file" { Value::String(new_name) } else { Value::Null },
         "resulting_file_count": state.virtual_files.len(),
     })
+}
+
+fn mutate_window_panel(
+    state: &mut SandboxState,
+    index: usize,
+    action_type: &str,
+    value: Option<&str>,
+    metadata: &Map<String, Value>,
+) -> Value {
+    match action_type {
+        "move_window" | "resize_window" => {
+            if let Some(bounds) = metadata.get("bounds").and_then(Value::as_array) {
+                if bounds.len() == 4 {
+                    if let Some(node) = state.nodes.get_mut(index) {
+                        node.bounds = bounds
+                            .iter()
+                            .filter_map(Value::as_i64)
+                            .map(|item| item as i32)
+                            .collect();
+                        if node.bounds.len() != 4 {
+                            node.bounds = default_bounds();
+                        }
+                    }
+                }
+            }
+            json!({"status": "window-updated", "bounds": state.nodes[index].bounds.clone()})
+        }
+        "select_tab" => {
+            let tab = metadata
+                .get("tab")
+                .and_then(Value::as_str)
+                .or(value)
+                .unwrap_or("Tab 1")
+                .to_string();
+            if let Some(node) = state.nodes.get_mut(index) {
+                node.metadata
+                    .insert("selected_tab".to_string(), Value::String(tab.clone()));
+            }
+            json!({"status": "tab-selected", "tab": tab})
+        }
+        "close_panel" => {
+            if let Some(node) = state.nodes.get_mut(index) {
+                node.enabled = false;
+                node.metadata
+                    .insert("visible".to_string(), Value::Bool(false));
+            }
+            json!({"status": "panel-closed"})
+        }
+        "open_panel" => {
+            let panel_name = metadata
+                .get("panel_name")
+                .and_then(Value::as_str)
+                .or(value)
+                .unwrap_or("Agent Panel")
+                .to_string();
+            let panel_id = metadata
+                .get("panel_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("panel-{}", state.nodes.len() + 1));
+            let role = metadata
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("Pane");
+            let bounds = metadata
+                .get("bounds")
+                .and_then(Value::as_array)
+                .filter(|items| items.len() == 4)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_i64)
+                        .map(|item| item as i32)
+                        .collect::<Vec<i32>>()
+                })
+                .filter(|items| items.len() == 4)
+                .unwrap_or_else(|| vec![220, 180, 420, 560]);
+            let mut panel = node_record_with_bounds(&panel_id, role, &panel_name, bounds);
+            panel.metadata.insert(
+                "parent".to_string(),
+                Value::String(state.nodes[index].node_id.clone()),
+            );
+            panel.metadata.insert(
+                "panel_type".to_string(),
+                Value::String(
+                    metadata
+                        .get("panel_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("dynamic")
+                        .to_string(),
+                ),
+            );
+            state.nodes.push(panel);
+            json!({"status": "panel-opened", "panel_id": panel_id})
+        }
+        _ => json!({}),
+    }
 }
 
 fn cell_edit_payload(metadata: &Map<String, Value>, raw_value: &str) -> Value {
@@ -539,13 +1068,16 @@ fn launch_app(state: &mut SandboxState, app_name: &str) -> Value {
     state.nodes.push(window_node(&window_id, app_name));
     let surface_spec = surface_for_app_name(app_name);
     let surface = surface_node(&surface_spec);
+    let support_panels = support_panel_nodes(&surface_spec, &window_id);
     let payload = json!({
         "family": surface_spec.family,
         "selector": surface_spec.node_id,
         "role": surface_spec.role,
         "name": surface_spec.name,
+        "panel_count": support_panels.len() + 1,
     });
     state.nodes.push(surface);
+    state.nodes.extend(support_panels);
     payload
 }
 
@@ -599,12 +1131,44 @@ fn edit_node(node_id: &str, name: &str, value: &str) -> NodeRecord {
     node
 }
 
+fn panel_node(
+    node_id: &str,
+    role: &str,
+    name: &str,
+    family: &str,
+    panel_type: &str,
+    bounds: Vec<i32>,
+) -> NodeRecord {
+    let mut node = node_record_with_bounds(node_id, role, name, bounds);
+    node.metadata
+        .insert("app_family".to_string(), Value::String(family.to_string()));
+    node.metadata.insert(
+        "panel_type".to_string(),
+        Value::String(panel_type.to_string()),
+    );
+    node
+}
+
 fn document_node(node_id: &str, name: &str) -> NodeRecord {
     node_record(node_id, "Document", name)
 }
 
 fn default_bounds() -> Vec<i32> {
     vec![0, 0, 100, 30]
+}
+
+fn remember_receipt(state: &mut SandboxState, receipt: &Value) {
+    state.last_action = Some(receipt.clone());
+    state.agent_history.push(receipt.clone());
+    if state.agent_history.len() > 5000 {
+        let excess = state.agent_history.len() - 5000;
+        state.agent_history.drain(0..excess);
+    }
+}
+
+fn recent_history(history: &[Value]) -> Vec<Value> {
+    let start = history.len().saturating_sub(20);
+    history[start..].to_vec()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -739,7 +1303,201 @@ fn surface_node(spec: &SurfaceSpec) -> NodeRecord {
         "app_context".to_string(),
         Value::String(spec.family.to_string()),
     );
+    node.metadata.insert(
+        "panel_type".to_string(),
+        Value::String("primary".to_string()),
+    );
     node
+}
+
+fn support_panel_nodes(spec: &SurfaceSpec, window_id: &str) -> Vec<NodeRecord> {
+    let panels: Vec<(&str, &str, &str, Vec<i32>, &str)> = match spec.family {
+        "browser" => vec![
+            (
+                "browser-tabs",
+                "TabList",
+                "Browser Tabs",
+                vec![180, 118, 900, 28],
+                "tab_strip",
+            ),
+            (
+                "browser-main-doc",
+                "Document",
+                "Browser Document",
+                vec![180, 170, 860, 560],
+                "document",
+            ),
+            (
+                "browser-research-panel",
+                "Pane",
+                "Research Side Panel",
+                vec![1048, 170, 280, 560],
+                "side_panel",
+            ),
+        ],
+        "file_explorer" => vec![
+            (
+                "explorer-navigation-tree",
+                "Tree",
+                "Explorer Navigation Tree",
+                vec![180, 160, 240, 620],
+                "navigation",
+            ),
+            (
+                "explorer-preview-pane",
+                "Pane",
+                "Explorer Preview Pane",
+                vec![1060, 160, 260, 620],
+                "preview",
+            ),
+        ],
+        "terminal" => vec![
+            (
+                "terminal-toolbar",
+                "ToolBar",
+                "Terminal Toolbar",
+                vec![180, 160, 920, 44],
+                "toolbar",
+            ),
+            (
+                "terminal-input",
+                "Edit",
+                "Sandbox Terminal",
+                vec![180, 210, 920, 570],
+                "primary",
+            ),
+        ],
+        "editor" => vec![
+            (
+                "editor-explorer",
+                "Tree",
+                "Editor Explorer",
+                vec![180, 160, 230, 620],
+                "navigation",
+            ),
+            (
+                "editor-outline",
+                "Tree",
+                "Editor Outline",
+                vec![1120, 160, 200, 620],
+                "side_panel",
+            ),
+        ],
+        "office_form" => vec![
+            (
+                "office-ribbon",
+                "ToolBar",
+                "Office Ribbon",
+                vec![180, 150, 1140, 76],
+                "toolbar",
+            ),
+            (
+                "formula-bar",
+                "Edit",
+                "Formula Bar",
+                vec![180, 232, 1140, 34],
+                "formula",
+            ),
+        ],
+        "pdf_viewer" => vec![
+            (
+                "pdf-thumbnail-pane",
+                "List",
+                "PDF Thumbnail Pane",
+                vec![180, 160, 220, 620],
+                "navigation",
+            ),
+            (
+                "pdf-document",
+                "Document",
+                "PDF Document",
+                vec![410, 160, 690, 620],
+                "primary",
+            ),
+        ],
+        "chat_app" => vec![
+            (
+                "chat-thread-list",
+                "List",
+                "Chat Thread List",
+                vec![180, 160, 260, 620],
+                "navigation",
+            ),
+            (
+                "chat-history",
+                "Document",
+                "Chat History",
+                vec![450, 160, 640, 520],
+                "primary",
+            ),
+        ],
+        "design_canvas" => vec![
+            (
+                "design-toolbox",
+                "ToolBar",
+                "Design Toolbox",
+                vec![180, 160, 90, 620],
+                "toolbar",
+            ),
+            (
+                "layers-panel",
+                "Pane",
+                "Layers Panel",
+                vec![1050, 160, 270, 620],
+                "side_panel",
+            ),
+        ],
+        "trading_terminal" => vec![
+            (
+                "market-watchlist",
+                "Table",
+                "Market Watchlist",
+                vec![180, 160, 280, 620],
+                "watchlist",
+            ),
+            (
+                "price-chart",
+                "Chart",
+                "Price Chart",
+                vec![470, 160, 560, 390],
+                "chart",
+            ),
+            (
+                "positions-grid",
+                "Table",
+                "Positions Grid",
+                vec![470, 560, 850, 220],
+                "positions",
+            ),
+        ],
+        "enterprise_grid" => vec![
+            (
+                "enterprise-filter-panel",
+                "Pane",
+                "Enterprise Filter Panel",
+                vec![180, 160, 260, 620],
+                "filters",
+            ),
+            (
+                "enterprise-detail-panel",
+                "Pane",
+                "Enterprise Detail Panel",
+                vec![1080, 160, 240, 620],
+                "detail",
+            ),
+        ],
+        _ => Vec::new(),
+    };
+    panels
+        .into_iter()
+        .filter(|(node_id, _, _, _, _)| *node_id != spec.node_id)
+        .map(|(node_id, role, name, bounds, panel_type)| {
+            let mut node = panel_node(node_id, role, name, spec.family, panel_type, bounds);
+            node.metadata
+                .insert("parent".to_string(), Value::String(window_id.to_string()));
+            node
+        })
+        .collect()
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
@@ -758,8 +1516,16 @@ fn capabilities_payload() -> Value {
             "exec",
             "reset",
             "adaptive-app-surfaces",
+            "multi-panel-app-surfaces",
             "virtual-file-mutation",
-            "stateful-control-receipts"
+            "virtual-filesystem",
+            "virtual-processes",
+            "clipboard",
+            "modal-mutation",
+            "sandbox-confined-full-privileges",
+            "stateful-control-receipts",
+            "history-preserving-reset",
+            "window-panel-mutation"
         ],
         "families": [
             "browser",
@@ -859,6 +1625,96 @@ mod tests {
             Some("launched")
         );
         assert!(find_node_index(&state, "order-ticket").is_some());
+        assert!(find_node_index(&state, "market-watchlist").is_some());
+        assert!(find_node_index(&state, "positions-grid").is_some());
+    }
+
+    #[test]
+    fn reset_preserves_agent_history() {
+        let mut state = default_state();
+        handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "focus".to_string(),
+                selector: "browser-address-bar".to_string(),
+                value: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(state.agent_history.len(), 1);
+        handle_command(&mut state, CommandEnvelope::Reset);
+        assert_eq!(state.agent_history.len(), 1);
+        let snapshot = handle_command(&mut state, CommandEnvelope::Snapshot);
+        assert_eq!(
+            snapshot.get("agent_history_count").and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn virtual_system_actions_are_confined_and_stateful() {
+        let mut state = default_state();
+        let mut metadata = Map::new();
+        metadata.insert(
+            "path".to_string(),
+            Value::String("artifacts/workflows/new.txt".to_string()),
+        );
+        metadata.insert(
+            "content".to_string(),
+            Value::String("hello sandbox".to_string()),
+        );
+        let write_payload = handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "write_file".to_string(),
+                selector: "".to_string(),
+                value: None,
+                metadata: Some(metadata),
+            },
+        );
+        assert_eq!(
+            write_payload.get("status").and_then(Value::as_str),
+            Some("file-op-executed")
+        );
+        assert!(state
+            .virtual_file_contents
+            .contains_key("artifacts/workflows/new.txt"));
+
+        let clip_payload = handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "set_clipboard".to_string(),
+                selector: "".to_string(),
+                value: Some("copied text".to_string()),
+                metadata: None,
+            },
+        );
+        assert_eq!(
+            clip_payload.get("clipboard").and_then(Value::as_str),
+            Some("copied text")
+        );
+
+        handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "execute_command".to_string(),
+                selector: "python -V".to_string(),
+                value: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(state.virtual_processes.len(), 1);
+
+        handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "open_modal".to_string(),
+                selector: "Sandbox Dialog".to_string(),
+                value: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(state.modals.len(), 1);
     }
 
     #[test]

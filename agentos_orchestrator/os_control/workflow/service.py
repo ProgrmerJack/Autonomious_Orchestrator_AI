@@ -139,8 +139,9 @@ class DesktopWorkflowService:
             plan,
             backend,
             receipts,
+            step_budget=self._adaptive_step_budget(objective, plan),
         )
-        # Universal agent cognitive loop: handles arbitrary tasks beyond templates
+        # Universal agent cognitive loop: handles arbitrary tasks through state feedback.
         if self._universal_agent is not None:
             try:
                 run = self._universal_agent.run_with_planned_bootstrap(objective, plan)
@@ -196,8 +197,13 @@ class DesktopWorkflowService:
         plan: Any,
         backend: Any,
         receipts: list[dict[str, Any]],
+        step_budget: int | None = None,
     ) -> None:
-        for _ in range(self.max_adaptive_steps):
+        budget = int(
+            step_budget if step_budget is not None else self.max_adaptive_steps
+        )
+        budget = max(1, min(12, budget))
+        for _ in range(budget):
             try:
                 nodes = backend.snapshot()
             except (AttributeError, RuntimeError, ValueError, OSError):
@@ -226,6 +232,14 @@ class DesktopWorkflowService:
                     "rationale": decision.rationale,
                 }
             )
+
+    def _adaptive_step_budget(self, objective: str, plan: Any) -> int:
+        words = len(str(objective or "").split())
+        sub_task_count = len(getattr(plan, "sub_tasks", []) or [])
+        mode = str(getattr(plan, "mode", "") or "").lower()
+        mode_boost = 2 if mode in {"script", "report", "spreadsheet", "drawing"} else 1
+        complexity = words // 8 + sub_task_count + mode_boost
+        return max(self.max_adaptive_steps, min(12, 2 + complexity))
 
     def _perform_with_recovery(
         self,

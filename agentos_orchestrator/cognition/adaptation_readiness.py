@@ -18,6 +18,11 @@ class AdaptationReadiness:
     heldout_task_count: int = 0
     underfilled: bool = False
     missing_total: int = 0
+    minimum_scale_met: bool = False
+    production_scale_met: bool = False
+    production_target: int = 0
+    grounding_remaining_to_production: int = 0
+    transition_remaining_to_production: int = 0
     blockers: list[str] = field(default_factory=list)
     guidance: list[str] = field(default_factory=list)
 
@@ -37,6 +42,10 @@ def collect_adaptation_readiness(workspace_root: str | Path) -> AdaptationReadin
     heldout = dict(live_fire.get("heldout_metrics") or {})
     grounding = _safe_int(scale.get("grounding_examples"))
     transitions = _safe_int(scale.get("world_model_transitions"))
+    minimum_scale_met = bool(scale.get("meets_minimum_scale"))
+    production_scale_met = bool(
+        scale.get("meets_production_scale") or scale.get("meets_stretch_scale")
+    )
     success_rate = _safe_float(heldout.get("success_rate"))
     heldout_count = _safe_int(heldout.get("task_count"))
     blockers: list[str] = []
@@ -46,7 +55,7 @@ def collect_adaptation_readiness(workspace_root: str | Path) -> AdaptationReadin
         blockers.append("no_heldout_live_fire_artifact")
     if underfill.get("underfilled"):
         blockers.append("dataset_underfill")
-    if not bool(scale.get("meets_minimum_scale")):
+    if not minimum_scale_met:
         blockers.append("scale_target_not_met")
     if heldout_count == 0 or success_rate < 0.8:
         blockers.append("heldout_success_target_not_met")
@@ -56,6 +65,8 @@ def collect_adaptation_readiness(workspace_root: str | Path) -> AdaptationReadin
     status = "ready" if connected and not blockers else "needs_training_or_eval"
     if connected and blockers == ["scale_target_not_met"]:
         status = "bootstrap_ready_scale_incomplete"
+    if status == "ready" and production_scale_met:
+        status = "production_ready"
     return AdaptationReadiness(
         status=status,
         connected=connected,
@@ -67,6 +78,19 @@ def collect_adaptation_readiness(workspace_root: str | Path) -> AdaptationReadin
         heldout_task_count=heldout_count,
         underfilled=bool(underfill.get("underfilled")),
         missing_total=_safe_int(underfill.get("missing_total")),
+        minimum_scale_met=minimum_scale_met,
+        production_scale_met=production_scale_met,
+        production_target=_safe_int(
+            scale.get("production_target") or scale.get("stretch_target")
+        ),
+        grounding_remaining_to_production=_safe_int(
+            scale.get("grounding_remaining_to_production")
+            or scale.get("grounding_remaining_to_stretch")
+        ),
+        transition_remaining_to_production=_safe_int(
+            scale.get("transition_remaining_to_production")
+            or scale.get("transition_remaining_to_stretch")
+        ),
         blockers=blockers,
         guidance=guidance,
     )
@@ -135,7 +159,7 @@ def _guidance(blockers: list[str]) -> list[str]:
         "no_adaptation_training_artifact": "Run pc-train-adaptation-longrun so learned grounding and world-model state are persisted.",
         "no_heldout_live_fire_artifact": "Run held-out live-fire eval against the virtual sandbox before claiming generality.",
         "dataset_underfill": "Resume long-run training with fresh GUI-Actor or OSWorld cache candidates to recover missing budget.",
-        "scale_target_not_met": "Continue shard training toward the 100K+ minimum scale target.",
+        "scale_target_not_met": "Continue shard training toward the 100K+ minimum, then the 10M+ production UI target.",
         "heldout_success_target_not_met": "Promote failures, shadow-train, then rerun held-out live-fire eval.",
     }
     return [messages[item] for item in blockers if item in messages]

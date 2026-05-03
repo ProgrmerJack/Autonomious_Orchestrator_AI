@@ -421,6 +421,11 @@ class UnknownAppAdaptationTrainer:
                 "Scale target not yet met: continue resumable long-run training "
                 "toward 100K+ grounding examples and trajectory transitions."
             )
+        elif not scale_report["meets_production_scale"]:
+            notes.append(
+                "Bootstrap scale is met; continue resumable UI long-run training "
+                "toward the 10M+ production target."
+            )
 
         result = AdaptationTrainingResult(
             run_id=run_id,
@@ -660,6 +665,11 @@ class UnknownAppAdaptationTrainer:
                 "Scale target not yet met: keep resuming with fresh cache batches "
                 "until the 100K+ minimum is reached."
             )
+        elif not scale_report["meets_production_scale"]:
+            notes.append(
+                "Minimum scale is met; keep resuming shard training until the "
+                "10M+ production target is reached."
+            )
         result = AdaptationLongRunResult(
             run_id=run_id,
             success=bool(
@@ -709,7 +719,7 @@ class UnknownAppAdaptationTrainer:
         output_path: Path,
     ) -> int:
         return self._train_vla_from_rows_dataset(
-            url_template=SCREENSPOT_ROWS_URL,
+            url_pattern=SCREENSPOT_ROWS_URL,
             limit=limit,
             start_offset=start_offset,
             output_path=output_path,
@@ -725,7 +735,7 @@ class UnknownAppAdaptationTrainer:
         output_path: Path,
     ) -> int:
         return self._train_vla_from_rows_dataset(
-            url_template=CLICK100K_ROWS_URL,
+            url_pattern=CLICK100K_ROWS_URL,
             limit=limit,
             start_offset=start_offset,
             output_path=output_path,
@@ -806,7 +816,7 @@ class UnknownAppAdaptationTrainer:
     def _train_vla_from_rows_dataset(
         self,
         *,
-        url_template: str,
+        url_pattern: str,
         limit: int,
         start_offset: int,
         output_path: Path,
@@ -822,7 +832,7 @@ class UnknownAppAdaptationTrainer:
         lines: list[str] = []
         while used < limit:
             payload = self._fetch_json(
-                url_template.format(offset=offset, length=page_size)
+                url_pattern.format(offset=offset, length=page_size)
             )
             rows = list((payload or {}).get("rows") or [])
             if not rows:
@@ -1840,26 +1850,44 @@ def _scale_report(
     app_families: list[str],
 ) -> dict[str, Any]:
     minimum_target = 100_000
-    stretch_target = 10_000_000
+    production_target = 10_000_000
     grounding = max(0, _safe_int(grounding_examples))
     transitions = max(0, _safe_int(world_model_transitions))
     families = sorted({str(item) for item in app_families if str(item)})
+    meets_minimum = grounding >= minimum_target and transitions >= minimum_target
+    meets_production = (
+        grounding >= production_target and transitions >= production_target
+    )
     return {
         "grounding_examples": grounding,
         "world_model_transitions": transitions,
         "app_family_count": len(families),
         "app_families": families,
         "minimum_target": minimum_target,
-        "stretch_target": stretch_target,
+        "stretch_target": production_target,
+        "production_target": production_target,
         "grounding_remaining_to_minimum": max(0, minimum_target - grounding),
         "transition_remaining_to_minimum": max(0, minimum_target - transitions),
-        "grounding_remaining_to_stretch": max(0, stretch_target - grounding),
-        "transition_remaining_to_stretch": max(0, stretch_target - transitions),
-        "meets_minimum_scale": grounding >= minimum_target
-        and transitions >= minimum_target,
-        "meets_stretch_scale": grounding >= stretch_target
-        and transitions >= stretch_target,
+        "grounding_remaining_to_stretch": max(0, production_target - grounding),
+        "transition_remaining_to_stretch": max(0, production_target - transitions),
+        "grounding_remaining_to_production": max(0, production_target - grounding),
+        "transition_remaining_to_production": max(
+            0,
+            production_target - transitions,
+        ),
+        "meets_minimum_scale": meets_minimum,
+        "meets_stretch_scale": meets_production,
+        "meets_production_scale": meets_production,
+        "scale_stage": _scale_stage(meets_minimum, meets_production),
     }
+
+
+def _scale_stage(meets_minimum: bool, meets_production: bool) -> str:
+    if meets_production:
+        return "production"
+    if meets_minimum:
+        return "minimum"
+    return "bootstrap"
 
 
 def _chunked(items: list[str], chunk_size: int) -> list[list[str]]:

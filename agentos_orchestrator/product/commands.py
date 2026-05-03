@@ -11,11 +11,10 @@ class WorkflowCommand:
     command_id: str
     label: str
     description: str
-    template: str
     enabled: bool = True
 
-    def render(self, argument: str) -> str:
-        return self.template.format(argument=argument.strip())
+    def objective_for(self, argument: str) -> str:
+        return argument.strip()
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
@@ -56,6 +55,16 @@ class CommandRegistry:
         return command
 
     def _load_user_commands(self) -> list[WorkflowCommand]:
+        return [
+            command
+            for command in map(
+                self._command_from_payload,
+                self._read_user_commands_payload(),
+            )
+            if command is not None
+        ]
+
+    def _read_user_commands_payload(self) -> list[Any]:
         if self.path is None or not self.path.exists():
             return []
         try:
@@ -64,74 +73,55 @@ class CommandRegistry:
             return []
         if not isinstance(payload, list):
             return []
-        commands: list[WorkflowCommand] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            try:
-                commands.append(
-                    WorkflowCommand(
-                        command_id=(str(item["command_id"]).strip().removeprefix("/")),
-                        label=str(item.get("label") or item["command_id"]),
-                        description=str(item.get("description") or ""),
-                        template=str(item["template"]),
-                        enabled=bool(item.get("enabled", True)),
-                    )
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-        return commands
+        return payload
+
+    @staticmethod
+    def _command_from_payload(item: Any) -> WorkflowCommand | None:
+        if not isinstance(item, dict):
+            return None
+        try:
+            command_id = str(item["command_id"]).strip().removeprefix("/")
+        except (KeyError, TypeError, ValueError):
+            return None
+        return WorkflowCommand(
+            command_id=command_id,
+            label=str(item.get("label") or item["command_id"]),
+            description=str(item.get("description") or ""),
+            enabled=bool(item.get("enabled", True)),
+        )
 
 
 def _default_commands() -> list[WorkflowCommand]:
     return [
         WorkflowCommand(
             command_id="quick-research",
-            label="Quick research",
-            description="Fast evidence scan with structured sources.",
-            template="[quick] {argument}",
+            label="Adaptive lookup",
+            description="Run a prompt-scaled evidence-gathering workflow.",
         ),
         WorkflowCommand(
             command_id="research",
-            label="Research",
-            description=("Alias for multi-hour deep research from channel inputs."),
-            template=(
-                "[multi-hour] Execute paper-mode deep research with "
-                "iterative retrieval and evidence-coverage gates for: "
-                "{argument}"
-            ),
+            label="Adaptive research",
+            description=("Alias for prompt-scaled research from channel inputs."),
         ),
         WorkflowCommand(
             command_id="deep-research",
-            label="Multi-hour research",
-            description=("Budgeted long-horizon research with durable artifacts."),
-            template=(
-                "[multi-hour] Execute paper-mode deep research with "
-                "iterative retrieval, evidence-coverage gates, and active "
-                "PC research actions (approval-gated) for: {argument}"
-            ),
+            label="Deep research",
+            description=("Prompt-scaled long-horizon research with durable artifacts."),
         ),
         WorkflowCommand(
             command_id="pc-research-smoke",
             label="PC research smoke",
             description=(
-                "Research objective shaped to exercise PC-control evidence paths."
-            ),
-            template=(
-                "[quick] Use local PC control, browser evidence, "
-                "channel routing, and OpenCode/OpenClaw-style "
-                "operator workflows to investigate: {argument}"
+                "Prompt-scaled research command that keeps PC-control evidence "
+                "paths available when the request calls for them."
             ),
         ),
         WorkflowCommand(
             command_id="competitive-audit",
             label="Competitive audit",
             description=(
-                "Compare AgentOS against OS-agent and coding-agent competitors."
-            ),
-            template=(
-                "[standard] Compare AgentOS against OpenClaw, OpenCode, "
-                "and OpenHands for: {argument}"
+                "Prompt-scaled audit command; competitors and effort come from "
+                "the request text."
             ),
         ),
     ]

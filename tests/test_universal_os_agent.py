@@ -36,9 +36,11 @@ from agentos_orchestrator.cognition.control_surface_discovery import (
     GenericControlSurfaceDiscoverer,
 )
 from agentos_orchestrator.cognition.frontier_api import (
+    FrontierContextBudget,
     FrontierDecision,
     FrontierPrompt,
     StaticFrontierClient,
+    estimate_tokens,
     extract_json_object,
     normalize_decision,
 )
@@ -261,6 +263,56 @@ class FrontierApiTests(unittest.TestCase):
         self.assertIn("orientation", text)
         self.assertIn("expected_observation", text)
         self.assertIn('"action": "explore"', text)
+
+    def test_prompt_compacts_context_under_budget(self) -> None:
+        repeated_docs = "\n".join(["same irrelevant line"] * 200)
+        relevant_docs = "\n".join(
+            [f"market risk evidence source {index}" for index in range(80)]
+        )
+        marks = [
+            {
+                "id": index,
+                "bbox": [index, index, 10, 10],
+                "center": [index + 5, index + 5],
+                "type": "button",
+                "confidence": 0.99,
+                "text_like": index % 2 == 0,
+            }
+            for index in range(1, 120)
+        ]
+        prompt = FrontierPrompt(
+            objective="research market risk evidence",
+            annotated_png=b"png",
+            mark_payload={"image_size": [1000, 800], "marks": marks},
+            documentation_context=f"{repeated_docs}\n{relevant_docs}",
+            memory_context="\n".join(f"memory item {index}" for index in range(80)),
+            tool_context="Local Python sandbox\nLocal Python sandbox",
+            state_context={
+                "last_actions": [
+                    {"action": "click", "target": index} for index in range(40)
+                ],
+                "large_note": "state " * 80,
+            },
+            context_budget=FrontierContextBudget(
+                total_tokens=1100,
+                documentation_tokens=160,
+                memory_tokens=120,
+                tool_tokens=60,
+                state_tokens=320,
+                mark_tokens=160,
+                objective_tokens=40,
+            ),
+        )
+
+        text = prompt.instruction_text()
+        telemetry = prompt.token_estimate()
+
+        self.assertLess(estimate_tokens(text), 1800)
+        self.assertIn("compacted_context", text)
+        self.assertIn("omitted_prior_items", text)
+        self.assertLess(telemetry["prompt_mark_count"], telemetry["mark_count"])
+        self.assertLess(text.count("same irrelevant line"), 2)
+        self.assertIn("Token budget estimate", text)
 
     def test_normalize_preserves_orientation_and_hypothesis(self) -> None:
         decision = normalize_decision(

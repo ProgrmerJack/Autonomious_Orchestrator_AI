@@ -92,6 +92,25 @@ class PermissionPolicyTests(unittest.TestCase):
                 rejected.reasons,
             )
 
+    def test_sandbox_exec_is_not_trust_escalated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.sqlite3"
+            trust = TrustMonitor(db_path)
+
+            decision = trust.assess(
+                "run_sandbox_1",
+                ActionRequest(
+                    "agent",
+                    "sandbox.exec",
+                    "sandbox://virtual-desktop/browser-research",
+                    payload={"action": "browse"},
+                ),
+            )
+
+            self.assertFalse(decision.requires_approval)
+            self.assertEqual(decision.score_delta, 0)
+            self.assertIn("sandbox-confined execution action", decision.reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

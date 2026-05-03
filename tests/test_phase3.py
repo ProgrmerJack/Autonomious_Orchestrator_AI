@@ -8,20 +8,17 @@ Covers:
 
 from __future__ import annotations
 
-import io
 import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw
 
 from agentos_orchestrator.cognition.tool_executor import (
     ToolExecutor,
-    ToolResult,
     QuantAnalysisRequest,
-    get_template,
-    register_template,
+    get_analysis_snippet,
+    register_analysis_snippet,
 )
 from agentos_orchestrator.cognition.vlm_adapter import (
     ClassicalVLMAdapter,
@@ -31,7 +28,6 @@ from agentos_orchestrator.cognition.vlm_adapter import (
 )
 from agentos_orchestrator.cognition.hierarchical_task_decomposer import (
     HierarchicalTaskDecomposer,
-    TaskHierarchy,
 )
 
 
@@ -190,8 +186,7 @@ class ToolExecutorSecurityTests(unittest.TestCase):
         )
         result = self.executor.run(req)
         self.assertFalse(result.success)
-        self.assertIsNotNone(result.error)
-        self.assertIn("os.system", result.error)
+        self.assertIn("os.system", result.error or "")
 
     def test_blocked_subprocess_import(self) -> None:
         req = QuantAnalysisRequest(
@@ -212,9 +207,6 @@ class ToolExecutorSecurityTests(unittest.TestCase):
         self.assertIn("eval(", result.error or "")
 
     def test_write_outside_sandbox_blocked(self) -> None:
-        # Try to write to the workspace root (outside the run_dir)
-        import os
-
         parent = str(Path(self._tmpdir).parent).replace("\\", "/")
         req = QuantAnalysisRequest(
             objective="path escape",
@@ -234,17 +226,17 @@ class ToolExecutorSecurityTests(unittest.TestCase):
         self.assertIn("allow-list", result.error or "")
 
 
-class ToolExecutorTemplateTests(unittest.TestCase):
-    def test_template_registry_contains_defaults(self) -> None:
+class ToolExecutorSnippetTests(unittest.TestCase):
+    def test_snippet_registry_contains_defaults(self) -> None:
         for name in ("portfolio_stats", "rolling_volatility", "market_regime_hmm"):
-            tmpl = get_template(name)
-            self.assertIsNotNone(tmpl, f"Template '{name}' missing")
-            self.assertIn("RESULT:", tmpl)
+            snippet = get_analysis_snippet(name)
+            self.assertIsNotNone(snippet, f"Snippet '{name}' missing")
+            self.assertIn("RESULT:", snippet or "")
 
-    def test_custom_template_registration(self) -> None:
-        register_template("custom_test", 'print("RESULT: custom=1")')
-        tmpl = get_template("custom_test")
-        self.assertIsNotNone(tmpl)
+    def test_custom_snippet_registration(self) -> None:
+        register_analysis_snippet("custom_test", 'print("RESULT: custom=1")')
+        snippet = get_analysis_snippet("custom_test")
+        self.assertIsNotNone(snippet)
 
     def test_build_quant_analysis_code_generates_valid_python(self) -> None:
         tmpdir = tempfile.mkdtemp()

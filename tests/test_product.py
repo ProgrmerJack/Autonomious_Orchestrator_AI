@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 from agentos_orchestrator.product import (
@@ -104,6 +104,10 @@ class ProductTests(unittest.TestCase):
         )
         self.assertEqual(client.eval_pack()["path"], "/benchmarks/eval-pack")
         self.assertEqual(client.replay_debug()["path"], "/debug/replay")
+
+    def test_sdk_shapes_benchmark_and_pc_requests(self) -> None:
+        client = FakeClient()
+
         self.assertEqual(
             client.live_fire_eval(
                 max_tasks=1,
@@ -112,8 +116,9 @@ class ProductTests(unittest.TestCase):
             )["path"],
             "/benchmarks/live-fire-eval",
         )
-        self.assertTrue(client.calls[-1][2]["windows_safe_pack"])
-        self.assertEqual(client.calls[-1][2]["repeat"], 2)
+        payload = cast(dict[str, Any], client.calls[-1][2])
+        self.assertTrue(payload["windows_safe_pack"])
+        self.assertEqual(payload["repeat"], 2)
         self.assertEqual(
             client.live_fire_review()["path"],
             "/benchmarks/live-fire-review?limit=10",
@@ -148,11 +153,10 @@ class ProductTests(unittest.TestCase):
                     command_id="audit",
                     label="Audit",
                     description="Custom audit",
-                    template="[quick] audit {argument}",
                 )
             )
 
-            self.assertEqual(saved.render("topic"), "[quick] audit topic")
+            self.assertEqual(saved.objective_for("topic"), "topic")
             self.assertIsNotNone(registry.get("quick-research"))
             self.assertIsNotNone(registry.get("research"))
             loaded = registry.get("/audit")

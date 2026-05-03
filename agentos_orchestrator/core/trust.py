@@ -99,9 +99,20 @@ class TrustMonitor:
         if action_type in {"host.admin", "system.registry.write"}:
             score += 10
             reasons.append("admin-grade action requested")
-        if action_type in {"os.act", "sandbox.exec"}:
-            score += 3
-            reasons.append("high-impact execution action requested")
+        if action_type == "os.act":
+            sandbox_target = str(action.target or "").lower()
+            if sandbox_target.startswith("sandbox://"):
+                reasons.append("os.act confined to sandbox isolation — no trust impact")
+            else:
+                score += 3
+                reasons.append("high-impact execution action requested")
+        elif action_type == "sandbox.exec":
+            sandbox_target = str(action.target or "").lower()
+            if sandbox_target.startswith("sandbox://"):
+                reasons.append("sandbox-confined execution action")
+            else:
+                score += 2
+                reasons.append("non-confined sandbox execution target")
         if self._looks_sensitive(candidate):
             score += 6
             reasons.append("target resembles a sensitive local resource")

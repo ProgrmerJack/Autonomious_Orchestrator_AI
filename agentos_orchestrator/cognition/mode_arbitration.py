@@ -17,6 +17,9 @@ from .runtime_state import AgentRuntimeState
 
 AGENT_MODES = {"ui", "tool", "hybrid", "research", "filesystem", "explore"}
 
+_CONF_MIN = 0.35
+_CONF_MAX = 0.95
+
 
 @dataclass(slots=True)
 class ModeDecision:
@@ -77,9 +80,16 @@ class ModeArbiter:
 def _blocker_decision(blockers: list[Any]) -> ModeDecision | None:
     if not blockers or not _blockers_need_exploration(blockers):
         return None
+    blocker_text = " ".join(
+        f"{b.kind} {b.description} {b.repair_hint}".lower() for b in blockers
+    )
+    blocker_hits = _signal_hits(
+        blocker_text,
+        {"selector", "not found", "missing", "stale", "occluded", "tag"},
+    )
     return ModeDecision(
         mode="explore",
-        confidence=0.9,
+        confidence=_bounded_confidence(0.72 + 0.05 * min(blocker_hits, 4)),
         rationale="Active blockers indicate stale or missing targets.",
         should_use_frontier=False,
         evidence={"blockers": [b.to_prompt_dict() for b in blockers[-3:]]},
@@ -93,12 +103,16 @@ def _tool_decision(
 ) -> ModeDecision | None:
     if not context.tool_action_available and not _tool_task(lower):
         return None
+    cue_hits = _signal_hits(lower, _TOOL_TASK_CUES)
+    confidence = _bounded_confidence(
+        0.6 + 0.05 * min(cue_hits, 5) + (0.1 if context.tool_action_available else 0.0)
+    )
     return ModeDecision(
         mode="tool",
-        confidence=0.88,
+        confidence=confidence,
         rationale=("The objective is better served by deterministic code execution."),
         should_use_frontier=False,
-        evidence={"option": option_name},
+        evidence={"option": option_name, "tool_cue_hits": cue_hits},
     )
 
 
@@ -107,15 +121,16 @@ def _filesystem_decision(lower: str, option_name: str) -> ModeDecision | None:
         return None
     if not _filesystem_task(lower):
         return None
+    fs_strength = _filesystem_signal_strength(lower)
     return ModeDecision(
         mode="filesystem",
-        confidence=0.82,
+        confidence=_bounded_confidence(0.62 + 0.26 * fs_strength),
         rationale=(
             "The option is a file operation and should use structured "
             "path-aware actions."
         ),
         should_use_frontier=False,
-        evidence={"option": option_name},
+        evidence={"option": option_name, "filesystem_signal_strength": fs_strength},
     )
 
 
@@ -131,14 +146,18 @@ def _research_decision(
         cue in lower for cue in {"research", "look up", "compare", "investigate"}
     ):
         return None
+    cue_hits = _signal_hits(lower, _RESEARCH_TASK_CUES)
+    context_boost = (
+        0.08 if state.app_context in {"unknown", "browser", "chat_app"} else 0.0
+    )
     return ModeDecision(
         mode="research",
-        confidence=0.78,
+        confidence=_bounded_confidence(0.58 + 0.05 * min(cue_hits, 5) + context_boost),
         rationale=(
             "The option needs information gathering before desktop manipulation."
         ),
         should_use_frontier=state.app_context in {"unknown", "browser"},
-        evidence={"app_context": state.app_context},
+        evidence={"app_context": state.app_context, "research_cue_hits": cue_hits},
     )
 
 
@@ -149,7 +168,9 @@ def _uncertain_surface_decision(
     if state.app_context == "unknown" and context.perceived_element_count == 0:
         return ModeDecision(
             mode="explore",
-            confidence=0.74,
+            confidence=_bounded_confidence(
+                0.68 + 0.03 * min(len(context.similar_failures), 4)
+            ),
             rationale="No reliable local affordances are visible.",
             should_use_frontier=False,
             evidence={"perceived_element_count": context.perceived_element_count},
@@ -158,7 +179,9 @@ def _uncertain_surface_decision(
         return None
     return ModeDecision(
         mode="hybrid",
-        confidence=0.68,
+        confidence=_bounded_confidence(
+            0.6 + 0.04 * min(len(context.similar_failures), 5)
+        ),
         rationale=(
             "Local perception is uncertain, so combine local marks with "
             "frontier semantics."
@@ -172,16 +195,18 @@ def _uncertain_surface_decision(
 
 
 def _ui_decision(state: AbstractUIState) -> ModeDecision:
+    interactive_count = sum(1 for item in state.elements if item.is_interactive)
+    app_bonus = 0.08 if state.app_context not in {"unknown", "other"} else 0.0
     return ModeDecision(
         mode="ui",
-        confidence=0.72,
+        confidence=_bounded_confidence(
+            0.5 + 0.04 * min(interactive_count, 6) + app_bonus
+        ),
         rationale=("The visible UI has enough structure for local action selection."),
         should_use_frontier=False,
         evidence={
             "app_context": state.app_context,
-            "interactive_count": sum(
-                1 for item in state.elements if item.is_interactive
-            ),
+            "interactive_count": interactive_count,
         },
     )
 
@@ -194,59 +219,97 @@ def _blockers_need_exploration(blockers: list[Any]) -> bool:
 
 
 def _tool_task(lower: str) -> bool:
-    cues = {
-        "analysis",
-        "analyse",
-        "analyze",
-        "calculate",
-        "compute",
-        "quant",
-        "statistics",
-        "regression",
-        "forecast",
-        "script",
-        "code",
-        "pipeline",
-    }
+    # Configurable cue sets — expressed as module-level constants so they can
+    # be extended without editing decision logic.
+    cues = _TOOL_TASK_CUES
     return any(cue in lower for cue in cues)
+
+
+def _signal_hits(lower: str, cues: set[str]) -> int:
+    return sum(1 for cue in cues if cue in lower)
+
+
+def _filesystem_signal_strength(lower: str) -> float:
+    phrase_hits = _signal_hits(lower, _FILESYSTEM_PHRASES)
+    verb_hits = _signal_hits(lower, _FILESYSTEM_VERBS)
+    noun_hits = _signal_hits(lower, _FILESYSTEM_NOUNS)
+    # Phrase matches are strongest; verb+noun combination is secondary evidence.
+    raw = min(
+        1.0, 0.6 * min(phrase_hits, 2) / 2.0 + 0.4 * min(verb_hits * noun_hits, 4) / 4.0
+    )
+    return max(0.0, raw)
+
+
+def _bounded_confidence(value: float) -> float:
+    return max(_CONF_MIN, min(_CONF_MAX, value))
+
+
+_TOOL_TASK_CUES = {
+    "analysis",
+    "analyse",
+    "analyze",
+    "calculate",
+    "compute",
+    "quant",
+    "statistics",
+    "regression",
+    "forecast",
+    "script",
+    "code",
+    "pipeline",
+}
 
 
 def _filesystem_task(lower: str) -> bool:
-    if any(
-        phrase in lower
-        for phrase in {
-            "file path",
-            "folder path",
-            "directory",
-            "filename",
-            "file name",
-            "open file",
-            "save file",
-            "select file",
-            "choose file",
-            "browse folder",
-            "browse file",
-        }
-    ):
+    if any(phrase in lower for phrase in _FILESYSTEM_PHRASES):
         return True
-    verbs = {
-        "copy",
-        "move",
-        "rename",
-        "delete",
-        "save",
-        "open",
-        "select",
-        "choose",
-        "browse",
-    }
-    nouns = {"folder", "path", "directory", "filename", "file name", "file"}
-    return any(verb in lower for verb in verbs) and any(noun in lower for noun in nouns)
+    return any(verb in lower for verb in _FILESYSTEM_VERBS) and any(
+        noun in lower for noun in _FILESYSTEM_NOUNS
+    )
+
+
+_FILESYSTEM_PHRASES = {
+    "file path",
+    "folder path",
+    "directory",
+    "filename",
+    "file name",
+    "open file",
+    "save file",
+    "select file",
+    "choose file",
+    "browse folder",
+    "browse file",
+}
+_FILESYSTEM_VERBS = {
+    "copy",
+    "move",
+    "rename",
+    "delete",
+    "save",
+    "open",
+    "select",
+    "choose",
+    "browse",
+}
+_FILESYSTEM_NOUNS = {"folder", "path", "directory", "filename", "file name", "file"}
 
 
 def _research_task(lower: str) -> bool:
-    cues = {"research", "search", "find", "look up", "compare", "investigate"}
-    return any(cue in lower for cue in cues)
+    return any(cue in lower for cue in _RESEARCH_TASK_CUES)
+
+
+_RESEARCH_TASK_CUES = {
+    "research",
+    "search",
+    "find",
+    "look up",
+    "compare",
+    "investigate",
+    "analyse",
+    "analyze",
+    "review",
+}
 
 
 def _profile_context_decision(context: ModeContext) -> ModeDecision | None:
@@ -260,7 +323,7 @@ def _profile_context_decision(context: ModeContext) -> ModeDecision | None:
     if profile.recommended_mode == "explore":
         return ModeDecision(
             mode="explore",
-            confidence=0.82,
+            confidence=_bounded_confidence(profile.confidence + 0.1),
             rationale=(
                 "Capability profile indicates low-confidence or visual-heavy control."
             ),
@@ -270,7 +333,7 @@ def _profile_context_decision(context: ModeContext) -> ModeDecision | None:
     if profile.recommended_mode == "tool" and profile.app_family == "terminal":
         return ModeDecision(
             mode="tool",
-            confidence=0.76,
+            confidence=_bounded_confidence(max(profile.confidence, 0.68)),
             rationale=(
                 "Terminal-like surface should prefer structured tool execution."
             ),

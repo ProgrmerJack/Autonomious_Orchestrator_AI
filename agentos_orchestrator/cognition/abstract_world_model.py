@@ -444,17 +444,19 @@ class AbstractWorldModel:
         return delta
 
     @staticmethod
-    def _vector_to_state(vec: np.ndarray, template: AbstractUIState) -> AbstractUIState:
+    def _vector_to_state(
+        vec: np.ndarray, reference: AbstractUIState
+    ) -> AbstractUIState:
         """Convert state vector back to AbstractUIState (approximate)."""
-        # This is approximate — we keep the template structure but update
+        # This is approximate; keep the reference structure but update
         # task progress from the vector
         new_state = AbstractUIState(
-            app_context=template.app_context,
-            layout_mode=template.layout_mode,
-            elements=list(template.elements),
-            active_modal=template.active_modal,
-            focus_region=template.focus_region,
-            task_progress=dict(template.task_progress),
+            app_context=reference.app_context,
+            layout_mode=reference.layout_mode,
+            elements=list(reference.elements),
+            active_modal=reference.active_modal,
+            focus_region=reference.focus_region,
+            task_progress=dict(reference.task_progress),
             screen_embedding=vec[128:256].astype(np.float32)
             if len(vec) >= 256
             else vec[-128:].astype(np.float32),

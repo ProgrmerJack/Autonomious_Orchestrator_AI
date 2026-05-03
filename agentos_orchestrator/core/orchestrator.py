@@ -70,8 +70,8 @@ class ResearchOrchestrator:
             policy_path=policy_path,
         )
 
-    def run(self, objective: str) -> RunReport:
-        run_id = new_id("run")
+    def run(self, objective: str, run_id: str | None = None) -> RunReport:
+        run_id = run_id or new_id("run")
         self.event_bus.publish(
             run_id,
             "run.started",
@@ -149,7 +149,31 @@ class ResearchOrchestrator:
         task: TaskSpec,
         prior_results: list[WorkerResult],
     ) -> dict:
-        self._authorize_task(run_id, task)
+        try:
+            self._authorize_task(run_id, task)
+        except (ApprovalRequired, PermissionError) as exc:
+            if not task.inputs.get("optional"):
+                raise
+            skipped = WorkerResult(
+                task_id=task.task_id,
+                role=task.role,
+                summary=f"Skipped optional {task.role} step: {exc}",
+                evidence=[
+                    {
+                        "source": "authorization",
+                        "claim": "Optional adaptive step was skipped by policy.",
+                        "reason": str(exc),
+                    }
+                ],
+                confidence=0.4,
+            )
+            self.event_bus.publish(
+                run_id,
+                "policy.optional_skipped",
+                "policy",
+                {"task_id": task.task_id, "role": task.role, "reason": str(exc)},
+            )
+            return asdict(skipped)
         self.event_bus.publish(
             run_id,
             "policy.accepted",
@@ -161,13 +185,37 @@ class ResearchOrchestrator:
             result = self.worker.run(run_id, current_task, prior_results)
             return asdict(result)
 
-        return self.runtime.run_json_step(
-            run_id,
-            task.task_id,
-            f"worker:{task.role}",
-            {"task": asdict(task)},
-            run_worker_step,
-        )
+        try:
+            return self.runtime.run_json_step(
+                run_id,
+                task.task_id,
+                f"worker:{task.role}",
+                {"task": asdict(task)},
+                run_worker_step,
+            )
+        except (ApprovalRequired, PermissionError) as exc:
+            if not task.inputs.get("optional"):
+                raise
+            skipped = WorkerResult(
+                task_id=task.task_id,
+                role=task.role,
+                summary=f"Skipped optional {task.role} step: {exc}",
+                evidence=[
+                    {
+                        "source": "authorization",
+                        "claim": "Optional adaptive step was skipped by policy.",
+                        "reason": str(exc),
+                    }
+                ],
+                confidence=0.4,
+            )
+            self.event_bus.publish(
+                run_id,
+                "policy.optional_skipped",
+                "policy",
+                {"task_id": task.task_id, "role": task.role, "reason": str(exc)},
+            )
+            return asdict(skipped)
 
     def _run_verification(
         self,
@@ -396,6 +444,17 @@ class ResearchOrchestrator:
 
     @staticmethod
     def _coverage_targets(results: list[WorkerResult]) -> dict:
+        for result in reversed(results):
+            if result.role != "literature":
+                continue
+            for evidence in result.evidence:
+                if evidence.get("source") != "research-metrics":
+                    continue
+                metadata = evidence.get("metadata") or {}
+                retrieval = metadata.get("retrieval") or {}
+                targets = retrieval.get("targets")
+                if isinstance(targets, dict):
+                    return targets
         for result in reversed(results):
             for artifact in result.artifacts:
                 normalized = str(artifact).replace("\\", "/")

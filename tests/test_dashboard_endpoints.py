@@ -228,7 +228,9 @@ class DashboardEndpointsTests(unittest.TestCase):
                     },
                 ).json()
                 self.assertEqual(job["status"], "queued")
-                self.assertTrue(job["objective"].startswith("[multi-hour]"))
+                self.assertEqual(job["objective"], "dashboard topic")
+                self.assertEqual(job["depth"], "multi-hour")
+                self.assertTrue(job["run_objective"].startswith("[multi-hour] "))
 
                 for _attempt in range(40):
                     job = api.get(f"/jobs/{job['job_id']}").json()
@@ -238,6 +240,32 @@ class DashboardEndpointsTests(unittest.TestCase):
 
                 self.assertEqual(job["status"], "completed")
                 self.assertTrue(job["run_id"].startswith("run_"))
+                self.assertEqual(
+                    job["report"]["objective"],
+                    "[multi-hour] dashboard topic",
+                )
+
+    def test_dashboard_background_job_preserves_objective_depth_tag(self) -> None:
+        temp_dir, client = self._client()
+        with temp_dir:
+            with client as api:
+                job = api.post(
+                    "/runs",
+                    json={
+                        "objective": "[multi-hour] depth-tagged dashboard topic",
+                    },
+                ).json()
+                self.assertEqual(job["status"], "queued")
+                self.assertEqual(job["depth"], "multi-hour")
+                self.assertTrue(job["run_objective"].startswith("[multi-hour] "))
+
+                for _attempt in range(40):
+                    job = api.get(f"/jobs/{job['job_id']}").json()
+                    if job["status"] in {"completed", "failed"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertEqual(job["status"], "completed")
 
 
 if __name__ == "__main__":

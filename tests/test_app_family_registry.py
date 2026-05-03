@@ -54,6 +54,68 @@ class AppFamilyRegistryTests(unittest.TestCase):
             selectors = {node.node_id for node in backend.snapshot()}
             for spec in app_family_specs(include_unknown=False):
                 self.assertIn(spec.primary_selector, selectors)
+            self.assertIn("office-ribbon", selectors)
+            self.assertIn("layers-panel", selectors)
+            self.assertIn("enterprise-detail-panel", selectors)
+
+    def test_virtual_sandbox_preserves_action_history_on_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "sandbox.json"
+            backend = VirtualDesktopSandboxBackend(state_path)
+            capabilities = backend.capabilities()["capabilities"]
+            self.assertIn("history-preserving-reset", capabilities)
+            self.assertIn("multi-panel-app-surfaces", capabilities)
+
+            backend.perform(UiAction("focus", "browser-address-bar"))
+            backend.reset()
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(payload.get("agent_history") or []), 1)
+
+    def test_virtual_sandbox_confines_full_system_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "sandbox.json"
+            backend = VirtualDesktopSandboxBackend(state_path)
+            capabilities = backend.capabilities()["capabilities"]
+            self.assertIn("virtual-filesystem", capabilities)
+            self.assertIn("virtual-processes", capabilities)
+            self.assertIn("clipboard", capabilities)
+
+            write_receipt = json.loads(
+                backend.perform(
+                    UiAction(
+                        "write_file",
+                        "",
+                        metadata={
+                            "path": "artifacts/workflows/new.txt",
+                            "content": "hello sandbox",
+                        },
+                    )
+                )
+            )
+            self.assertEqual(write_receipt.get("status"), "file-op-executed")
+
+            read_receipt = json.loads(
+                backend.perform(
+                    UiAction(
+                        "read_file",
+                        "",
+                        metadata={"path": "artifacts/workflows/new.txt"},
+                    )
+                )
+            )
+            self.assertEqual(
+                read_receipt.get("file_op", {}).get("content"),
+                "hello sandbox",
+            )
+
+            backend.perform(UiAction("set_clipboard", "", "copied text"))
+            backend.perform(UiAction("execute_command", "", "python -V"))
+            backend.perform(UiAction("open_modal", "", "Sandbox Dialog"))
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("clipboard"), "copied text")
+            self.assertGreaterEqual(len(payload.get("virtual_processes") or []), 1)
+            self.assertGreaterEqual(len(payload.get("modals") or []), 1)
+            self.assertFalse((state_path.parent / "new.txt").exists())
 
     def test_adaptation_readiness_connects_training_and_live_fire_artifacts(
         self,

@@ -57,7 +57,10 @@ class DesktopWorkflowReasoner:
         if not nodes:
             return ActionDecision(None, done=True, rationale="No UI nodes available.")
 
-        if self._is_browser_plan(plan) and self._has_action(receipts, "open_url"):
+        if self._is_browser_plan(plan) and self._browser_navigation_complete(
+            objective,
+            receipts,
+        ):
             return ActionDecision(
                 None,
                 done=True,
@@ -67,7 +70,7 @@ class DesktopWorkflowReasoner:
                 ),
             )
 
-        primary_surface = self._best_surface_node(nodes)
+        primary_surface = self._best_surface_node(nodes, objective, plan.mode)
         if primary_surface is None:
             return ActionDecision(
                 None,
@@ -237,6 +240,35 @@ class DesktopWorkflowReasoner:
     def _has_action(receipts: list[dict[str, Any]], action_type: str) -> bool:
         return any(item.get("action_type") == action_type for item in receipts)
 
+    @classmethod
+    def _browser_navigation_complete(
+        cls,
+        objective: str,
+        receipts: list[dict[str, Any]],
+    ) -> bool:
+        if not cls._has_action(receipts, "open_url"):
+            return False
+        lower = objective.lower()
+        navigation_only = any(
+            cue in lower for cue in ("open", "go to", "navigate", "visit")
+        ) and not any(
+            cue in lower
+            for cue in (
+                "analyze",
+                "analyse",
+                "compare",
+                "research",
+                "write",
+                "draft",
+                "extract",
+                "summarize",
+            )
+        )
+        if navigation_only:
+            return True
+        # If semantic write-like progress already happened, navigation phase is done.
+        return cls._has_semantic_surface_write(receipts)
+
     @staticmethod
     def _has_semantic_surface_write(receipts: list[dict[str, Any]]) -> bool:
         writable_actions = {"type", "set_text", "set_value", "cell_edit", "draw_path"}
@@ -256,15 +288,25 @@ class DesktopWorkflowReasoner:
         return False
 
     @classmethod
-    def _best_surface_node(cls, nodes: list[UiNode]) -> UiNode | None:
-        ranked = sorted(nodes, key=cls._surface_score, reverse=True)
+    def _best_surface_node(
+        cls,
+        nodes: list[UiNode],
+        objective: str,
+        mode: str,
+    ) -> UiNode | None:
+        objective_terms = cls._objective_terms(objective)
+        ranked = sorted(
+            nodes,
+            key=lambda item: cls._surface_score(item, objective_terms, mode),
+            reverse=True,
+        )
         for node in ranked:
-            if cls._surface_score(node) > 0:
+            if cls._surface_score(node, objective_terms, mode) > 0:
                 return node
         return None
 
     @staticmethod
-    def _surface_score(node: UiNode) -> int:
+    def _surface_score(node: UiNode, objective_terms: set[str], mode: str) -> int:
         role_scores = {
             "Edit": 100,
             "Document": 95,
@@ -275,6 +317,21 @@ class DesktopWorkflowReasoner:
         }
         score = role_scores.get(node.role, 0)
         name = node.name.lower()
+
+        # Objective relevance: prefer nodes whose labels overlap with query terms.
+        score += sum(8 for term in objective_terms if term in name)
+
+        mode_lower = (mode or "").lower()
+        if mode_lower in {"spreadsheet", "report"} and node.role in {
+            "Table",
+            "Document",
+        }:
+            score += 12
+        if mode_lower in {"script", "app-task"} and node.role in {"Edit", "Pane"}:
+            score += 10
+        if mode_lower == "drawing" and node.role in {"Canvas", "Pane"}:
+            score += 12
+
         if any(token in name for token in ("address", "search bar", "toolbar", "menu")):
             score -= 80
         if any(
@@ -295,6 +352,14 @@ class DesktopWorkflowReasoner:
         if not node.enabled:
             score -= 100
         return score
+
+    @staticmethod
+    def _objective_terms(objective: str) -> set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-z0-9_\-]+", objective.lower())
+            if len(term) >= 4
+        }
 
     @staticmethod
     def _selector_for_node(node: UiNode) -> str:

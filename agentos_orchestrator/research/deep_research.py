@@ -16,6 +16,71 @@ from pathlib import Path
 from typing import Any
 
 
+def _extract_ticker_candidates(text: str) -> list[str]:
+    blocked = {
+        "THE",
+        "AND",
+        "FOR",
+        "NOW",
+        "BEST",
+        "TOP",
+        "LIST",
+        "AI",
+        "API",
+        "ETF",
+        "UTF",
+        "FFF",
+        "STOCK",
+        "STOCKS",
+        "LIVE",
+        "ANY",
+        "LIST",
+        "BEST",
+        "RIGHT",
+        "NOW",
+        "BULLISH",
+        "USA",
+        "US",
+        "GDP",
+    }
+    tokens = re.findall(r"\b[A-Z]{1,5}\b", text or "")
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        if token in blocked:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result[:8]
+
+
+def _sanitize_evidence_claim_text(title: str, abstract: str, url: str) -> str:
+    raw = (abstract or "").strip()
+    lower = raw.lower()
+    if (
+        not raw
+        or lower.startswith("generic web result")
+        or "snippet unavailable" in lower
+    ):
+        tickers = _extract_ticker_candidates(f"{title} {abstract}")
+        if tickers:
+            return f"Ticker candidates mentioned by source: {', '.join(tickers)}."
+        return (title or url)[:240]
+
+    cleaned = re.sub(r"\s+", " ", raw)
+    sentence = re.split(r"[.!?]", cleaned, maxsplit=1)[0].strip()
+    if sentence and len(sentence) >= 30:
+        cleaned = sentence
+    tickers = _extract_ticker_candidates(f"{title} {cleaned}")
+    if tickers and all(t not in cleaned for t in tickers):
+        cleaned = f"{cleaned}. Tickers referenced: {', '.join(tickers)}"
+    return cleaned[:500] or (title or url)[:240]
+
+
 @dataclass(slots=True)
 class ResearchSource:
     provider: str
@@ -40,7 +105,7 @@ class ResearchSource:
             "provider": self.provider,
             "title": self.title,
             "year": self.year,
-            "claim": self.abstract[:500] or self.title,
+            "claim": _sanitize_evidence_claim_text(self.title, self.abstract, self.url),
             "citation_count": self.citation_count,
             "evidence_grade": self.evidence_grade,
             "relevance": self.relevance,
@@ -85,6 +150,10 @@ class DeepResearchEngine:
         self.limit_per_provider = limit_per_provider
         self.timeout_seconds = timeout_seconds
         self.provider_diagnostics: list[dict[str, Any]] = []
+        self._durable_note_urls: set[str] = set()
+        self._durable_note_passes: set[int] = set()
+        self._dotenv_loaded = False
+        self._semantic_gate_cache: dict[str, bool] = {}
 
     def run(
         self,
@@ -95,10 +164,33 @@ class DeepResearchEngine:
         evidence_targets: dict[str, Any] | None = None,
     ) -> ResearchBrief:
         self.provider_diagnostics = []
+        self._durable_note_urls = set()
+        self._durable_note_passes = set()
+        self._semantic_gate_cache = {}
+        self._load_env_from_dotenv()
+        self._record_provider_preflight()
         depth, cleaned_objective = self._split_depth(objective)
         research_objective = self._clean_objective(cleaned_objective)
         settings = self._settings_for_depth(depth)
         query = self._query_from_objective(research_objective)
+        self._write_progress_checkpoint(
+            run_id,
+            {
+                "run_id": run_id,
+                "depth": settings.depth,
+                "stage": "research-initialized",
+                "pass_index": 0,
+                "stop_reason": None,
+                "recent_queries": [],
+                "passes": [],
+                "last_updated": datetime.now(UTC).isoformat(),
+            },
+        )
+        current_web_mode = self._looks_like_current_evidence_query(
+            research_objective
+        ) and not self._looks_like_academic_query(research_objective)
+        if current_web_mode:
+            settings = self._settings_for_current_web(settings)
         pc_context_info = self._pc_context_summary(pc_context)
         plan = self._build_research_plan(
             research_objective,
@@ -119,21 +211,47 @@ class DeepResearchEngine:
             else {}
         )
         merged_targets.update(evidence_targets or {})
+        if current_web_mode:
+            merged_targets = self._current_web_target_overrides(
+                merged_targets,
+                settings.depth,
+            )
+        self._write_progress_checkpoint(
+            run_id,
+            {
+                "run_id": run_id,
+                "depth": settings.depth,
+                "stage": "retrieval-starting",
+                "pass_index": 0,
+                "stop_reason": None,
+                "recent_queries": list(plan.get("query_plan") or [])[:3],
+                "passes": [],
+                "last_updated": datetime.now(UTC).isoformat(),
+            },
+        )
         retrieval = self._iterative_retrieval(
             query=query,
             settings=settings,
             plan=plan,
             targets=merged_targets,
+            run_id=run_id,
         )
         selected = retrieval["selected"]
         query_variants = retrieval["query_variants"]
         coverage = retrieval["coverage"]
+        durable_notes = self._load_durable_notes(run_id)
+        synthesis_mode = self._resolve_final_synthesis_mode(
+            settings.depth,
+            durable_notes,
+        )
         summary = self._summarize(
             research_objective,
             selected,
             settings.depth,
             plan,
             query,
+            durable_notes,
+            synthesis_mode,
         )
         artifacts = self._write_artifacts(
             run_id,
@@ -146,6 +264,8 @@ class DeepResearchEngine:
             plan,
             pc_context_info,
             retrieval,
+            run_id,
+            synthesis_mode,
         )
         confidence = self._confidence(selected)
         return ResearchBrief(
@@ -162,6 +282,51 @@ class DeepResearchEngine:
                     "stop_reason": retrieval["stop_reason"],
                     "targets": merged_targets,
                 },
+            },
+        )
+
+    def _write_progress_checkpoint(self, run_id: str, payload: dict[str, Any]) -> None:
+        if not run_id:
+            return
+        try:
+            progress_dir = self.workspace_root / "runs" / run_id / "research"
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            progress_path = progress_dir / "progress.json"
+            progress_path.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
+    def _write_retrieval_heartbeat(
+        self,
+        run_id: str,
+        depth: str,
+        pass_index: int,
+        search_query: str,
+        query_index: int,
+        query_total: int,
+        retrieval_passes: list[dict[str, Any]],
+        started_at: float,
+    ) -> None:
+        if not run_id:
+            return
+        self._write_progress_checkpoint(
+            run_id,
+            {
+                "run_id": run_id,
+                "depth": depth,
+                "stage": "retrieval-query-active",
+                "pass_index": pass_index + 1,
+                "query_index": query_index,
+                "query_total": query_total,
+                "active_query": search_query[:160],
+                "stop_reason": None,
+                "recent_queries": [search_query[:160]],
+                "passes": retrieval_passes,
+                "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                "last_updated": datetime.now(UTC).isoformat(),
             },
         )
 
@@ -184,6 +349,8 @@ class DeepResearchEngine:
         for url in candidates:
             cleaned = url.rstrip(").,;]}>\"'")
             if not cls._is_safe_public_url(cleaned):
+                continue
+            if cls._is_search_result_url(cleaned):
                 continue
             if cleaned in seen:
                 continue
@@ -212,6 +379,21 @@ class DeepResearchEngine:
         if not text:
             return []
         return re.findall(r"https?://[^\s<>()]+", text)
+
+    @staticmethod
+    def _is_search_result_url(url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower().lstrip("www.")
+        path = parsed.path.lower()
+        query = urllib.parse.parse_qs(parsed.query)
+        search_routes = {
+            "duckduckgo.com": bool(query.get("q")),
+            "html.duckduckgo.com": bool(query.get("q")),
+            "google.com": path.startswith("/search"),
+            "bing.com": path.startswith("/search"),
+            "github.com": path == "/search",
+        }
+        return search_routes.get(host, False)
 
     def _seed_sources(self, seed_urls: list[str]) -> list[ResearchSource]:
         if not seed_urls:
@@ -257,12 +439,34 @@ class DeepResearchEngine:
         settings: ResearchSettings,
         plan: dict[str, Any],
         targets: dict[str, Any],
+        run_id: str = "",
     ) -> dict[str, Any]:
+        durable_report_path = self._initialize_durable_report(
+            run_id,
+            settings.depth,
+            plan.get("core_question") or query,
+        )
         all_sources: list[ResearchSource] = self._seed_sources(
             plan.get("source_seeds") or []
         )
-        all_variants = plan["query_plan"][: settings.max_query_variants * 4]
-        min_runtime_seconds = self._min_runtime_seconds(settings.depth, targets)
+        # Seed AI-reasoned authoritative domains as sources so they are
+        # considered from the very first pass.
+        ai_domains = plan.get("ai_authoritative_domains") or []
+        if ai_domains:
+            all_sources.extend(
+                self._ai_domain_seed_sources(
+                    plan.get("core_question") or query,
+                    ai_domains,
+                )
+            )
+        all_variants = self._sanitize_query_variants(
+            plan["query_plan"][: settings.max_query_variants * 4],
+            query,
+        )
+        # Artificial runtime floors removed — depth is driven by
+        # information exhaustion (enrichment, citation chasing, gap analysis)
+        # not wall-clock timers.
+        min_runtime_seconds = 0
         min_depth_passes = self._min_depth_passes(settings.depth, targets)
         max_low_novelty_streak = self._max_low_novelty_streak(
             settings.depth,
@@ -273,17 +477,26 @@ class DeepResearchEngine:
             targets.get("max_retrieval_passes")
             or self._default_max_passes(settings.depth)
         )
-        max_passes = max(max_passes, self._runtime_pass_floor(min_runtime_seconds))
+        # No runtime-based pass floor — passes are information-driven.
         max_passes = max(max_passes, min_depth_passes)
         max_passes = max(1, min(max_passes, 240))
         started_at = time.monotonic()
         retrieval_passes: list[dict[str, Any]] = []
         previous_titles: set[str] = set()
+        selected_domain_counts: dict[str, int] = {}
         low_novelty_streak = 0
+        starvation_streak = 0
         stop_reason = "max_passes_reached"
         passing_snapshot: dict[str, Any] | None = None
         # Classify the query once to gate providers for every pass.
-        allowed_providers = self._classify_query(query)
+        # Classify the query once to gate providers for every pass.
+        # Use the full original question from the plan when available so that
+        # stop-word stripping in _query_core_terms does not erase cues like
+        # "as of now" → "as now", which would cause _classify_query to fall
+        # back to the default scholarly stack and include OpenAlex for live
+        # market / current-evidence queries.
+        classify_input = plan.get("core_question") or query
+        allowed_providers = self._classify_query(classify_input)
 
         for pass_index in range(max_passes):
             pass_variants = self._pass_variants(
@@ -292,14 +505,23 @@ class DeepResearchEngine:
                 settings.max_query_variants,
             )
             if not pass_variants:
-                elapsed = time.monotonic() - started_at
-                if elapsed < min_runtime_seconds and all_variants:
+                if all_variants:
                     pass_variants = all_variants[: settings.max_query_variants]
                 else:
                     stop_reason = "no_query_variants"
                     break
             pass_sources: list[ResearchSource] = []
-            for search_query in pass_variants:
+            for query_index, search_query in enumerate(pass_variants, start=1):
+                self._write_retrieval_heartbeat(
+                    run_id,
+                    settings.depth,
+                    pass_index,
+                    search_query,
+                    query_index,
+                    len(pass_variants),
+                    retrieval_passes,
+                    started_at,
+                )
                 pass_sources.extend(
                     self._search_query_across_providers(
                         search_query,
@@ -310,60 +532,72 @@ class DeepResearchEngine:
 
             if pass_index == 0 and self._looks_like_software_agent_query(query):
                 pass_sources.extend(self._software_reference_sources(query))
-            if pass_index == 0:
+            # Call gemini observation on pass 0 and, for multi-hour depth, on
+            # every 4th subsequent pass (passes 4, 8, 12…).  This ensures
+            # gemini-flash remains a live provider throughout long runs,
+            # preventing structural provider monoculture after pass 0.
+            _is_periodic_gemini_pass = (
+                settings.depth == "multi-hour"
+                and pass_index > 0
+                and pass_index % 4 == 0
+            )
+            if pass_index == 0 or _is_periodic_gemini_pass:
                 pass_sources.extend(
                     self._search_gemini_observation(query, settings.depth)
                 )
 
             all_sources.extend(pass_sources)
             ranked = self._rank_sources(self._dedupe_sources(all_sources), query)
-            selected = self._select_balanced_top(
+            reranked = self._rerank_for_domain_diversity(
                 ranked,
+                selected_domain_counts,
+                low_novelty_streak,
+                pass_index,
+            )
+            selected = self._select_balanced_top(
+                reranked,
                 settings.max_sources,
                 query,
             )
+            self._accumulate_domain_counts(selected_domain_counts, selected)
 
-            # --- ENRICHMENT: fetch real content and chase citations ---
-            # This is the work that makes research genuinely take time.
-            # It runs after the first API pass so we enrich concrete results.
-            if pass_index == 0 and settings.depth in {"standard", "multi-hour"}:
+            # --- ENRICHMENT: deep-read high-value sources on EVERY pass ---
+            # A scientist reads full papers, not just abstracts.  We enrich
+            # top sources every pass so the engine accumulates genuine
+            # understanding through real I/O, not timers.
+            if settings.depth in {"standard", "multi-hour"}:
+                enrich_count = (
+                    min(12, settings.max_sources)
+                    if pass_index == 0
+                    else min(8, settings.max_sources)
+                )
                 content_queries = self._enrich_top_sources(
-                    selected[: min(12, settings.max_sources)],
+                    selected[:enrich_count],
+                    query,
+                )
+                self._append_durable_claim_notes(
+                    durable_report_path,
+                    pass_index + 1,
+                    selected[:enrich_count],
                     query,
                 )
                 for cq in content_queries:
                     if cq and cq not in all_variants:
                         all_variants.append(cq)
-            if pass_index == 0 and settings.depth == "multi-hour":
-                # Follow citations of the top scholarly sources (depth=1).
-                cited = self._citation_chase(selected[:10], query, citation_depth=1)
+                # Flush transient enrichment text from local loop context after
+                # durable write so synthesis does not rely on large in-memory blobs.
+                del content_queries
+
+            # --- CITATION CHASING: follow references every pass for multi-hour ---
+            # Real scientists follow footnotes and build literature trees.
+            if settings.depth == "multi-hour":
+                chase_depth = 2 if pass_index <= 2 else 1
+                chase_count = min(10, len(selected))
+                cited = self._citation_chase(
+                    selected[:chase_count], query, citation_depth=chase_depth
+                )
                 if cited:
                     all_sources.extend(cited)
-                    ranked = self._rank_sources(
-                        self._dedupe_sources(all_sources), query
-                    )
-                    selected = ranked[: settings.max_sources]
-            if pass_index == 2 and settings.depth == "multi-hour":
-                # Follow citations of citations (depth=2) for maximum coverage.
-                cited2 = self._citation_chase(selected[:8], query, citation_depth=2)
-                if cited2:
-                    all_sources.extend(cited2)
-                    ranked = self._rank_sources(
-                        self._dedupe_sources(all_sources), query
-                    )
-                    selected = ranked[: settings.max_sources]
-            if (
-                settings.depth == "multi-hour"
-                and pass_index >= 5
-                and (pass_index + 1) % 4 == 0
-            ):
-                cited_more = self._citation_chase(
-                    selected[:6],
-                    query,
-                    citation_depth=1,
-                )
-                if cited_more:
-                    all_sources.extend(cited_more)
                     ranked = self._rank_sources(
                         self._dedupe_sources(all_sources), query
                     )
@@ -376,35 +610,165 @@ class DeepResearchEngine:
             }
             new_titles = current_titles - previous_titles
             novelty_rate = len(new_titles) / max(len(current_titles), 1)
-            coverage = self._coverage_metrics(selected, novelty_rate, plan)
-            retrieval_passes.append(
+            coverage = self._coverage_metrics(selected, novelty_rate, plan, query)
+            domain_count = len(
                 {
-                    "pass_index": pass_index + 1,
-                    "query_variants": pass_variants,
-                    "selected_count": len(selected),
-                    "provider_count": coverage["provider_count"],
-                    "novelty_rate": round(coverage["novelty_rate"], 3),
-                    "max_contradiction_risk": round(
-                        coverage["max_contradiction_risk"],
-                        3,
-                    ),
-                    "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                    self._source_domain(source.url)
+                    for source in selected
+                    if self._source_domain(source.url)
                 }
             )
+            min_provider_target = max(
+                1,
+                int(coverage_targets.get("min_provider_count") or 1),
+            )
+            min_domain_target = max(2, min_provider_target)
+            unreachable_count = sum(
+                1
+                for source in selected
+                if "unreachable-paywalled" in (source.quality_flags or [])
+            )
+            source_count = max(len(selected), 1)
+            source_starved = (
+                int(coverage.get("provider_count") or 0) < min_provider_target
+                or domain_count < min_domain_target
+                or unreachable_count >= max(2, source_count // 3)
+            )
+            if source_starved and pass_index > 0:
+                starvation_streak += 1
+            else:
+                starvation_streak = 0
+            if settings.depth in {"standard", "multi-hour"}:
+                expanded = self._expand_provider_mix_for_diversity(
+                    query,
+                    allowed_providers,
+                    coverage,
+                )
+                if expanded:
+                    self._record_provider_diagnostic(
+                        "provider-mix",
+                        "expanded",
+                        "expanded provider set after low-diversity pass",
+                    )
+                    allowed_providers = expanded
+            pass_record = {
+                "pass_index": pass_index + 1,
+                "query_variants": pass_variants,
+                "selected_count": len(selected),
+                "provider_count": coverage["provider_count"],
+                "domain_count": domain_count,
+                "novelty_rate": round(coverage["novelty_rate"], 3),
+                "on_topic_ratio": round(
+                    float(coverage.get("on_topic_ratio") or 0.0), 3
+                ),
+                "weak_ratio": round(float(coverage.get("weak_ratio") or 0.0), 3),
+                "max_contradiction_risk": round(
+                    coverage["max_contradiction_risk"],
+                    3,
+                ),
+                "source_starved": source_starved,
+                "starvation_streak": starvation_streak,
+                "unreachable_count": unreachable_count,
+                "elapsed_seconds": round(time.monotonic() - started_at, 1),
+            }
+            retrieval_passes.append(pass_record)
+            if starvation_streak >= 2:
+                pivot_queries = self._domain_diversification_queries(
+                    plan.get("core_question") or query,
+                    selected,
+                    pass_index,
+                    coverage,
+                )
+                if pivot_queries:
+                    self._record_provider_diagnostic(
+                        "starvation-pivot",
+                        "triggered",
+                        (
+                            f"pass {pass_index + 1}: provider_count="
+                            f"{coverage.get('provider_count')} domain_count={domain_count}"
+                        ),
+                    )
+                    all_variants.extend(
+                        self._sanitize_query_variants(
+                            pivot_queries,
+                            query,
+                        )
+                    )
+                expanded = self._expand_provider_mix_for_diversity(
+                    query,
+                    allowed_providers,
+                    {
+                        "provider_count": 0,
+                    },
+                )
+                if expanded:
+                    allowed_providers = expanded
+                starvation_streak = 0
+            # Write live progress so external monitors can track the run.
+            if run_id:
+                try:
+                    progress_dir = self.workspace_root / "runs" / run_id / "research"
+                    progress_dir.mkdir(parents=True, exist_ok=True)
+                    progress_path = progress_dir / "progress.json"
+                    progress_history: list[dict[str, Any]] = []
+                    if progress_path.exists():
+                        try:
+                            current_progress = json.loads(
+                                progress_path.read_text(encoding="utf-8")
+                            )
+                            loaded_history = current_progress.get("passes")
+                            if isinstance(loaded_history, list):
+                                progress_history = [
+                                    item
+                                    for item in loaded_history
+                                    if isinstance(item, dict)
+                                ]
+                        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                            progress_history = []
+                    progress_history.append(dict(pass_record))
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "run_id": run_id,
+                                "depth": settings.depth,
+                                "pass_index": pass_index + 1,
+                                "max_passes": max_passes,
+                                "sources_found": len(selected),
+                                "elapsed_seconds": pass_record["elapsed_seconds"],
+                                "novelty_rate": pass_record["novelty_rate"],
+                                "domain_count": pass_record["domain_count"],
+                                "stage": "retrieval-active",
+                                "stop_reason": None,
+                                "recent_queries": pass_variants[:3],
+                                "passes": progress_history,
+                                "last_updated": datetime.now(UTC).isoformat(),
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
             previous_titles = current_titles
-            budget_met = (time.monotonic() - started_at) >= min_runtime_seconds
+            # No artificial budget — depth is information-driven.
+            budget_met = True
             depth_met = (pass_index + 1) >= min_depth_passes
             novelty_threshold = float(targets.get("min_novelty_rate") or 0.0)
             if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
                 low_novelty_streak += 1
             else:
                 low_novelty_streak = 0
-            if self._meets_targets(coverage, coverage_targets):
+            _raw_weak = coverage.get("weak_ratio")
+            quality_gate_passed = (
+                float(coverage.get("on_topic_ratio") or 0.0) >= 0.7
+                and float(1.0 if _raw_weak is None else _raw_weak) <= 0.45
+            )
+            if self._meets_targets(coverage, coverage_targets) and quality_gate_passed:
                 passing_snapshot = {
                     "selected": list(selected),
                     "coverage": dict(coverage),
                 }
-                if not budget_met or not depth_met:
+                if not depth_met:
                     continue
                 stop_reason = "coverage_targets_met"
                 selected = self._finalize_selected_sources(
@@ -417,6 +781,7 @@ class DeepResearchEngine:
                     selected,
                     coverage["novelty_rate"],
                     plan,
+                    query,
                 )
                 return {
                     "selected": selected,
@@ -426,31 +791,50 @@ class DeepResearchEngine:
                     "query_variants": all_variants,
                 }
             if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
-                if (
-                    not budget_met
-                    or not depth_met
-                    or low_novelty_streak < max_low_novelty_streak
-                ):
+                if not depth_met or low_novelty_streak < max_low_novelty_streak:
                     continue
                 stop_reason = "novelty_below_threshold"
                 break
             if coverage["max_contradiction_risk"] > float(
                 targets.get("max_contradiction_risk") or 1.0
             ):
-                if not budget_met or not depth_met:
+                if not depth_met:
                     continue
                 stop_reason = "contradiction_above_threshold"
                 break
 
             all_variants.extend(
-                self._refinement_variants(
+                self._sanitize_query_variants(
+                    self._refinement_variants(
+                        query,
+                        selected,
+                        settings.depth,
+                        pass_index,
+                        plan,
+                    ),
                     query,
-                    selected,
-                    settings.depth,
-                    pass_index,
-                    plan,
                 )
             )
+
+            # --------------------------------------------------------
+            # AI GAP ANALYSIS: run EVERY pass to reason about what's
+            # missing and generate targeted follow-up queries based on
+            # the actual evidence found — not pre-baked templates.
+            # A real scientist re-evaluates gaps after each evidence round.
+            # --------------------------------------------------------
+            if pass_index >= 1:
+                gap_queries = self._ai_evidence_gap_analysis(
+                    plan.get("core_question") or query,
+                    selected,
+                    pass_index,
+                )
+                all_variants.extend(
+                    self._sanitize_query_variants(
+                        gap_queries,
+                        query,
+                    )
+                )
+            all_variants = self._sanitize_query_variants(all_variants, query)
 
         if passing_snapshot is not None:
             selected = self._finalize_selected_sources(
@@ -463,6 +847,7 @@ class DeepResearchEngine:
                 selected,
                 float(passing_snapshot["coverage"].get("novelty_rate") or 0.0),
                 plan,
+                query,
             )
             return {
                 "selected": selected,
@@ -489,7 +874,7 @@ class DeepResearchEngine:
             settings.max_sources,
         )
         novelty_rate = retrieval_passes[-1]["novelty_rate"] if retrieval_passes else 0.0
-        coverage = self._coverage_metrics(selected, float(novelty_rate), plan)
+        coverage = self._coverage_metrics(selected, float(novelty_rate), plan, query)
         return {
             "selected": selected,
             "coverage": coverage,
@@ -497,6 +882,62 @@ class DeepResearchEngine:
             "stop_reason": stop_reason,
             "query_variants": all_variants[: settings.max_query_variants],
         }
+
+    @staticmethod
+    def _source_domain(url: str) -> str:
+        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+        return host
+
+    @classmethod
+    def _accumulate_domain_counts(
+        cls,
+        domain_counts: dict[str, int],
+        selected: list[ResearchSource],
+    ) -> None:
+        for source in selected:
+            domain = cls._source_domain(source.url)
+            if not domain:
+                continue
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+    @classmethod
+    def _rerank_for_domain_diversity(
+        cls,
+        ranked: list[ResearchSource],
+        domain_counts: dict[str, int],
+        low_novelty_streak: int,
+        pass_index: int,
+    ) -> list[ResearchSource]:
+        if not ranked:
+            return ranked
+        # Do not force diversity early; apply pressure only after novelty has
+        # started collapsing so the loop can still converge on strong evidence.
+        if low_novelty_streak <= 0 and pass_index < 2:
+            return ranked
+
+        intensity = min(
+            0.4,
+            0.08 * max(low_novelty_streak, 1) + 0.02 * max(pass_index - 1, 0),
+        )
+        rescored: list[tuple[float, ResearchSource]] = []
+        for source in ranked:
+            domain = cls._source_domain(source.url)
+            repeats = domain_counts.get(domain, 0)
+            novelty_bonus = 0.07 if repeats == 0 else 0.0
+            penalty = intensity * repeats
+            adjusted = float(source.score) + novelty_bonus - penalty
+            rescored.append((adjusted, source))
+
+        rescored.sort(
+            key=lambda item: (
+                item[0],
+                item[1].relevance,
+                item[1].credibility_score,
+                item[1].recency,
+            ),
+            reverse=True,
+        )
+        return [source for _score, source in rescored]
 
     @staticmethod
     def _min_runtime_seconds(depth: str, targets: dict[str, Any]) -> int:
@@ -512,21 +953,29 @@ class DeepResearchEngine:
     @staticmethod
     def _min_depth_passes(depth: str, targets: dict[str, Any]) -> int:
         raw_value = targets.get("min_depth_passes", 0)
+        raw_floor = targets.get("depth_pass_floor", 12)
         try:
             target_passes = int(raw_value)
         except (TypeError, ValueError):
             target_passes = 0
+        try:
+            depth_floor = int(raw_floor)
+        except (TypeError, ValueError):
+            depth_floor = 12
         if depth != "multi-hour":
             return max(target_passes, 1)
-        return max(target_passes, 12)
+        return max(target_passes, max(depth_floor, 1))
 
     @staticmethod
     def _default_max_passes(depth: str) -> int:
         if depth == "quick":
             return 1
         if depth == "multi-hour":
-            return 12
-        return 4
+            # 48 passes guarantees naturally long runtimes through real I/O:
+            # each pass triggers network fetches, enrichment, and citation
+            # chasing that accumulate genuine elapsed time.
+            return 48
+        return 6
 
     @staticmethod
     def _coverage_targets(targets: dict[str, Any]) -> dict[str, Any]:
@@ -539,6 +988,8 @@ class DeepResearchEngine:
             "max_contradiction_risk",
             "min_perspective_count",
             "min_perspective_ratio",
+            "min_on_topic_ratio",
+            "max_weak_ratio",
         )
         return {key: targets[key] for key in keys if key in targets}
 
@@ -551,7 +1002,10 @@ class DeepResearchEngine:
             streak = 0
         if depth != "multi-hour":
             return max(streak, 1)
-        return max(streak, 3)
+        # Give multi-hour runs more tolerance for low-novelty passes so that
+        # the gap-analysis mechanism has time to generate fresh query angles
+        # before the streak limit fires.
+        return max(streak, 6)
 
     @staticmethod
     def _pass_variants(
@@ -567,6 +1021,33 @@ class DeepResearchEngine:
         return [
             variants[(start + index) % len(variants)] for index in range(window_size)
         ]
+
+    @classmethod
+    def _sanitize_query_variants(
+        cls,
+        variants: list[str],
+        query: str,
+    ) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for variant in variants:
+            text = str(variant or "").strip()
+            if not text:
+                continue
+            # Truncate FIRST so variants that differ only beyond 240 chars
+            # are treated as duplicates, preventing 4 identical shortened
+            # strings from polluting the query pool.
+            text = text[:240]
+            if cls._is_low_signal_query_variant(text, query):
+                continue
+            if cls._is_noisy_query_variant(text, query):
+                continue
+            normalized = cls._normalize_title(text)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(text)
+        return deduped
 
     @staticmethod
     def _runtime_pass_floor(min_runtime_seconds: int) -> int:
@@ -586,6 +1067,7 @@ class DeepResearchEngine:
         selected: list[ResearchSource],
         novelty_rate: float,
         plan: dict[str, Any] | None = None,
+        query: str = "",
     ) -> dict[str, Any]:
         provider_count = len({source.provider for source in selected})
         scholarly_source_count = sum(
@@ -598,6 +1080,18 @@ class DeepResearchEngine:
             for source in selected
             if source.evidence_grade in {"strong", "moderate", "tool-observation"}
         )
+        weak_count = sum(1 for source in selected if source.evidence_grade == "weak")
+        on_topic_count = sum(
+            1
+            for source in selected
+            if cls._objective_alignment_score(
+                f"{source.title} {source.abstract}",
+                query,
+            )
+            >= 0.35
+        )
+        on_topic_ratio = on_topic_count / max(len(selected), 1)
+        weak_ratio = weak_count / max(len(selected), 1)
         contradiction_max = max(
             (source.contradiction_risk for source in selected),
             default=0.0,
@@ -611,7 +1105,11 @@ class DeepResearchEngine:
             "provider_count": provider_count,
             "scholarly_source_count": scholarly_source_count,
             "strong_or_moderate": strong_or_moderate,
+            "weak_count": weak_count,
+            "weak_ratio": weak_ratio,
             "novelty_rate": novelty_rate,
+            "on_topic_count": on_topic_count,
+            "on_topic_ratio": on_topic_ratio,
             "max_contradiction_risk": contradiction_max,
             "perspective_count": perspective_coverage["count"],
             "perspective_total": perspective_coverage["total"],
@@ -720,6 +1218,10 @@ class DeepResearchEngine:
             >= int(targets.get("min_perspective_count", 0)),
             coverage["perspective_ratio"]
             >= float(targets.get("min_perspective_ratio", 0.0)),
+            coverage.get("on_topic_ratio", 0.0)
+            >= float(targets.get("min_on_topic_ratio", 0.0)),
+            coverage.get("weak_ratio", 1.0)
+            <= float(targets.get("max_weak_ratio", 1.0)),
         ]
         return all(checks)
 
@@ -731,40 +1233,63 @@ class DeepResearchEngine:
         pass_index: int,
         plan: dict[str, Any] | None = None,
     ) -> list[str]:
-        providers = {source.provider for source in selected}
-        software_mode = self._looks_like_software_agent_query(query)
-        math_mode = self._looks_like_math_query(query)
         variants: list[str] = []
-        if software_mode:
-            variants.extend(
-                [
-                    f"{query} benchmark reproducibility pass {pass_index + 2}",
-                    f"{query} limitations failure analysis pass {pass_index + 2}",
-                ]
-            )
-            if "openalex" not in providers or "semantic-scholar" not in providers:
-                variants.append(f"{query} survey paper evaluation methods")
-            if "github-repositories" not in providers:
-                variants.append(f"{query} repository architecture implementation")
-        elif math_mode:
-            variants.extend(
-                [
-                    f"{query} theorem barrier",
-                    f"{query} obstruction transfer",
-                    f"{query} density to pointwise",
-                ]
-            )
-            if "openalex" not in providers or "semantic-scholar" not in providers:
-                variants.append(f"{query} expository survey")
-        else:
-            variants.extend(
-                [
-                    f"{query} literature review",
-                    f"{query} limitations open problems",
-                ]
-            )
-            if "openalex" not in providers or "semantic-scholar" not in providers:
-                variants.append(f"{query} survey paper")
+        core = self._query_core_terms(query) or query
+        providers = {source.provider for source in selected}
+
+        # Generate follow-ups from strongest current evidence terms.
+        evidence_terms: list[str] = []
+        for source in selected[:10]:
+            text = f"{source.title} {source.abstract}"
+            for token in self._keywords(text):
+                if len(token) < 4:
+                    continue
+                if token in evidence_terms:
+                    continue
+                evidence_terms.append(token)
+                if len(evidence_terms) >= 12:
+                    break
+            if len(evidence_terms) >= 12:
+                break
+
+        math_mode = self._looks_like_math_query(query)
+        axes = [
+            "primary evidence",
+            "counterevidence",
+            "methodology quality",
+            "uncertainty bounds",
+            "independent replication",
+            "failure modes",
+            "causal factors",
+        ]
+        if self._looks_like_current_evidence_query(query):
+            axes = [
+                "latest evidence",
+                "current analysis",
+                "timeline",
+                "near-term scenarios",
+                "risk factors",
+                "counterevidence",
+                "independent verification",
+            ]
+        if math_mode:
+            axes = [
+                "theorem barrier",
+                "transfer mechanism",
+                "counterexample search",
+                "formal verification",
+                "independent verification",
+                "limitations",
+            ]
+
+        variants.append(core)
+        if math_mode:
+            for focus in self._math_focus_terms(query):
+                variants.append(str(focus))
+        for term in evidence_terms[:5]:
+            for axis in axes[: 4 if depth == "quick" else 6]:
+                variants.append(f"{term} {axis}")
+
         if plan is not None and plan.get("perspectives"):
             missing = self._perspective_coverage(
                 selected,
@@ -773,19 +1298,30 @@ class DeepResearchEngine:
             for perspective in plan.get("perspectives") or []:
                 if perspective.get("name") not in missing:
                     continue
-                variants.extend((perspective.get("queries") or [])[:2])
+                variants.extend((perspective.get("queries") or [])[:3])
+
+        if "web-search" not in providers:
+            variants.append(f"{core} independent sources")
+
         variants.extend(self._query_variants(query, depth))
+
         deduped: list[str] = []
         seen: set[str] = set()
         for variant in variants:
-            if self._is_low_signal_query_variant(variant, query):
+            candidate = str(variant or "").strip()[:240]
+            if not candidate:
                 continue
-            normalized = self._normalize_title(variant)
+            if self._is_low_signal_query_variant(candidate, query):
+                continue
+            if self._is_noisy_query_variant(candidate, query):
+                continue
+            normalized = self._normalize_title(candidate)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
-            deduped.append(variant[:240])
-        return deduped
+            deduped.append(candidate)
+        max_items = 6 if depth == "quick" else 12 if depth == "standard" else 20
+        return deduped[:max_items]
 
     def _search_openalex(
         self,
@@ -905,19 +1441,39 @@ class DeepResearchEngine:
     ) -> list[ResearchSource]:
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
+            self._load_env_from_dotenv()
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+                "GOOGLE_API_KEY"
+            )
+        if not api_key:
             self._record_provider_diagnostic(
                 "gemini-flash",
                 "skipped",
-                "GEMINI_API_KEY or GOOGLE_API_KEY was not configured.",
+                (
+                    "GEMINI_API_KEY or GOOGLE_API_KEY was not configured "
+                    "in process env or .env file."
+                ),
             )
             return []
-        prompt = (
-            "Act as a concise tool observer for an AgentOS smoke test. "
-            "Compare the named local OS/coding/research agents only at a "
-            "high level, mention uncertainty, and list concrete capabilities "
-            "to verify locally. Query: "
-            f"{query}. Depth: {depth}."
-        )
+        # Build a query-aware prompt so the observation is on-topic for
+        # non-software queries (e.g. market research, scientific topics).
+        if self._looks_like_software_agent_query(query):
+            prompt = (
+                "Act as a concise tool observer for an AgentOS smoke test. "
+                "Compare the named local OS/coding/research agents only at a "
+                "high level, mention uncertainty, and list concrete capabilities "
+                "to verify locally. Query: "
+                f"{query}. Depth: {depth}."
+            )
+        else:
+            prompt = (
+                "You are an expert research analyst. Provide a concise, "
+                "factual synthesis on the following research query. Include "
+                "key evidence, quantitative data where available, important "
+                "uncertainties, and your analytical assessment. Do not pad "
+                "with marketing language. Query: "
+                f"{query}. Research depth: {depth}."
+            )
         payload = json.dumps(
             {"contents": [{"parts": [{"text": prompt}]}]},
         ).encode("utf-8")
@@ -984,6 +1540,542 @@ class DeepResearchEngine:
                 score=25.0,
             )
         ]
+
+    # ------------------------------------------------------------------
+    # AI REASONING LAYER
+    # The engine must THINK about where to look and why — not just rotate
+    # through templates.  These helpers call a lightweight text-only AI
+    # endpoint (Gemini Flash when available, graceful no-op otherwise).
+    # ------------------------------------------------------------------
+
+    def _call_ai_text(self, system: str, user: str) -> str:
+        """Call a text-only AI endpoint and return the raw text response.
+
+        Uses Gemini Flash when a key is configured, falls back to an empty
+        string so callers can degrade gracefully.
+        """
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            self._load_env_from_dotenv()
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+                "GOOGLE_API_KEY"
+            )
+        if not api_key:
+            return ""
+        payload = json.dumps(
+            {
+                "systemInstruction": {"parts": [{"text": system}]},
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 4096},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-2.0-flash-lite:generateContent"
+            ),
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-goog-api-key": api_key,
+                "User-Agent": "agentos-orchestrator/0.1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as resp:  # noqa: S310
+                return _gemini_text(json.loads(resp.read().decode("utf-8")))
+        except Exception:
+            return ""
+
+    def _ai_research_strategy(
+        self,
+        objective: str,
+        query: str,
+        depth: str,
+    ) -> dict[str, Any]:
+        """Ask AI to THINK about the best research strategy for this objective.
+
+        Returns a dict with keys:
+          causal_connections  – list of "A affects B because ..." strings
+          authoritative_domains – specific domains/URLs worth targeting
+          reasoning_queries – search queries derived from causal thinking
+          subquestions – specific sub-questions to answer
+
+        If AI is unavailable, returns empty lists so callers fall back to
+        template-based defaults.
+        """
+        system = (
+            "You are a research strategy advisor for a deep research engine. "
+            "Think carefully about the objective and reason about (1) what "
+            "entities and causal relationships are at play, (2) which specific "
+            "authoritative domains or pages would have the best evidence, "
+            "(3) what events or factors could influence the answer, and (4) "
+            "what targeted search queries (not generic expansions) would uncover "
+            "the strongest evidence. Respond ONLY with valid JSON."
+        )
+        user = (
+            f"Research objective: {objective}\n"
+            f"Core query: {query}\n"
+            f"Depth: {depth}\n\n"
+            "Reason step-by-step, then produce JSON with these exact keys:\n"
+            "{\n"
+            '  "causal_connections": ["<A> affects <B> because <reason>", ...],\n'
+            '  "authoritative_domains": ["example.gov", "domain.org/path", ...],\n'
+            '  "reasoning_queries": ["specific query derived from causal thinking", ...],\n'
+            '  "subquestions": ["precise sub-question to answer", ...]\n'
+            "}\n"
+            "reasoning_queries must be 3-10 concrete search phrases (not generic "
+            "variations). authoritative_domains should be real domains likely to "
+            "have primary-source evidence."
+        )
+        raw = self._call_ai_text(system, user)
+        try:
+            # Find the first JSON object in the response.
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(raw[start:end])
+                return {
+                    "causal_connections": list(parsed.get("causal_connections") or [])[
+                        :8
+                    ],
+                    "authoritative_domains": list(
+                        parsed.get("authoritative_domains") or []
+                    )[:10],
+                    "reasoning_queries": list(parsed.get("reasoning_queries") or [])[
+                        :10
+                    ],
+                    "subquestions": list(parsed.get("subquestions") or [])[:8],
+                }
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return {
+            "causal_connections": [],
+            "authoritative_domains": [],
+            "reasoning_queries": [],
+            "subquestions": [],
+        }
+
+    def _ai_evidence_gap_analysis(
+        self,
+        objective: str,
+        selected: list[ResearchSource],
+        pass_index: int,
+        force_new_domains: bool = False,
+        existing_domains: list[str] | None = None,
+        coverage: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """After a retrieval pass, ask AI what's missing and what to pursue next.
+
+        Returns a list of follow-up search queries derived from reasoning about
+        gaps, causal connections, recency, and missing angles — NOT templates.
+        Falls back to an empty list when AI is unavailable.
+        """
+        if not selected:
+            return []
+        # Build a compact summary of what was found.
+        source_lines: list[str] = []
+        for src in selected[:15]:
+            year = f" ({src.year})" if src.year else ""
+            snippet = (src.abstract or src.title)[:120].replace("\n", " ")
+            source_lines.append(f"- [{src.provider}] {src.title}{year}: {snippet}")
+        source_summary = "\n".join(source_lines)
+        domain_hint = ", ".join(existing_domains[:12]) if existing_domains else "none"
+        coverage_hint = coverage or {}
+        system = (
+            "You are a research gap analyst. Given what a research engine has "
+            "found so far, reason about what important angles are missing, what "
+            "causal connections implied by the findings should be followed up, "
+            "whether the evidence is current enough, and what specific search "
+            "queries would best fill the gaps. Respond ONLY with valid JSON."
+        )
+        user = (
+            f"Research objective: {objective}\n"
+            f"Retrieval pass: {pass_index + 1}\n\n"
+            f"Current coverage: {json.dumps(coverage_hint, ensure_ascii=True)}\n"
+            f"Current domains consulted: {domain_hint}\n\n"
+            f"Sources found so far:\n{source_summary}\n\n"
+            "Analyze the above and produce JSON with these exact keys:\n"
+            "{\n"
+            '  "gaps": ["missing angle or unanswered aspect", ...],\n'
+            '  "follow_up_queries": ["specific search query to fill gap", ...]\n'
+            "}\n"
+            "follow_up_queries must be 3-6 targeted search phrases derived "
+            "from your gap analysis — not generic expansions of the core query. "
+            "Think: what causal factor is implied but not yet sourced? What "
+            "recent event could change the picture? Which authority has not yet "
+            "been consulted?"
+        )
+        if force_new_domains:
+            user += (
+                "\n\nCritical constraint: the retrieval loop is starved. "
+                "Generate follow_up_queries that force evidence from entirely new "
+                "authoritative domains/providers than those already listed."
+            )
+        raw = self._call_ai_text(system, user)
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(raw[start:end])
+                queries = list(parsed.get("follow_up_queries") or [])
+                # Relevance guard: reject any AI-generated query that shares
+                # ZERO domain terms with the original objective.  This prevents
+                # off-topic sources (Planck papers, chatgpt, etc.) from poisoning
+                # the gap analysis when the retrieval engine found wrong results.
+                obj_terms = set(
+                    re.findall(r"\b[a-z][a-z0-9-]{3,}\b", objective.lower())
+                ) - {
+                    "what",
+                    "that",
+                    "this",
+                    "have",
+                    "been",
+                    "will",
+                    "were",
+                    "they",
+                    "their",
+                    "which",
+                    "about",
+                    "also",
+                    "into",
+                    "with",
+                    "from",
+                    "then",
+                    "than",
+                    "some",
+                    "such",
+                    "both",
+                    "each",
+                    "more",
+                    "most",
+                    "just",
+                    "does",
+                    "other",
+                }
+                filtered: list[str] = []
+                for q in queries:
+                    candidate = str(q or "").strip()[:240]
+                    if not candidate:
+                        continue
+                    if self._is_low_signal_query_variant(candidate, objective):
+                        continue
+                    if self._is_noisy_query_variant(candidate, objective):
+                        continue
+                    q_lower = candidate.lower()
+                    overlap = sum(1 for term in obj_terms if term in q_lower)
+                    if overlap == 0:
+                        continue
+                    if (
+                        len(obj_terms) >= 4
+                        and overlap < 2
+                        and self._objective_alignment_score(candidate, objective) < 0.4
+                    ):
+                        continue
+                    if self._objective_alignment_score(candidate, objective) < 0.35:
+                        continue
+                    filtered.append(candidate)
+                return filtered[:6]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return []
+
+    def _domain_diversification_queries(
+        self,
+        objective: str,
+        selected: list[ResearchSource],
+        pass_index: int,
+        coverage: dict[str, Any],
+    ) -> list[str]:
+        existing_domains = sorted(
+            {
+                self._source_domain(source.url)
+                for source in selected
+                if self._source_domain(source.url)
+            }
+        )
+        ai_queries = self._ai_evidence_gap_analysis(
+            objective,
+            selected,
+            pass_index,
+            force_new_domains=True,
+            existing_domains=existing_domains,
+            coverage=coverage,
+        )
+        if ai_queries:
+            return ai_queries[:8]
+
+        anchors = sorted(self._entity_terms_from_query(objective))[:3]
+        if not anchors:
+            anchors = self._keywords(objective)[:3]
+        if not anchors:
+            anchors = [self._query_core_terms(objective)[:40] or "objective"]
+
+        templates = [
+            "{anchor} independent primary source dataset",
+            "{anchor} regulatory filing primary evidence",
+            "{anchor} counterevidence bear case independent analyst",
+            "{anchor} methodology critique data limitations",
+            "{anchor} competing viewpoint contradictory analysis",
+            "{anchor} official statistics longitudinal evidence",
+        ]
+        queries: list[str] = []
+        for anchor in anchors[:3]:
+            for template in templates[:3]:
+                queries.append(template.format(anchor=anchor))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in queries:
+            normalized = self._normalize_title(item)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(item[:120])
+        return deduped[:8]
+
+    def _ai_research_axes(
+        self,
+        objective: str,
+        query: str,
+        depth: str,
+    ) -> dict[str, Any]:
+        """Ask AI for comparative axes and evidence requirements specific to this objective.
+
+        Returns a dict with keys ``comparative_axes`` and ``evidence_requirements``.
+        Returns an empty dict when AI is unavailable so callers fall back to templates.
+        """
+        system = (
+            "You are a research design expert. Given a research objective, generate "
+            "the specific comparative axes and evidence quality requirements needed to "
+            "evaluate findings for THAT topic. Be concrete and topic-specific — not "
+            "generic placeholders. Respond ONLY with valid JSON."
+        )
+        user = (
+            f"Research objective: {objective}\n"
+            f"Core query: {query}\n"
+            f"Depth: {depth}\n\n"
+            "Produce JSON with these exact keys:\n"
+            "{\n"
+            '  "comparative_axes": ["specific dimension 1", ...],\n'
+            '  "evidence_requirements": ["quality criterion 1", ...]\n'
+            "}\n"
+            "comparative_axes: 4-6 dimensions specific to THIS topic for comparing/evaluating evidence.\n"
+            "evidence_requirements: 3-5 concrete quality criteria the evidence must meet for THIS topic.\n"
+            "Both lists must be grounded in the actual subject matter."
+        )
+        raw = self._call_ai_text(system, user)
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(raw[start:end])
+                axes = [
+                    str(a)[:120]
+                    for a in (parsed.get("comparative_axes") or [])
+                    if str(a).strip()
+                ][:6]
+                reqs = [
+                    str(r)[:120]
+                    for r in (parsed.get("evidence_requirements") or [])
+                    if str(r).strip()
+                ][:5]
+                if axes and reqs:
+                    return {"comparative_axes": axes, "evidence_requirements": reqs}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _ai_domain_seed_sources(
+        self,
+        objective: str,
+        authoritative_domains: list[str],
+    ) -> list[ResearchSource]:
+        """Convert AI-reasoned authoritative domains into seed ResearchSources.
+
+        This lets the engine consult specific authoritative pages that the AI
+        identified through causal reasoning, not just search-API results.
+        """
+        sources: list[ResearchSource] = []
+        for domain in authoritative_domains[:6]:
+            domain = domain.strip()
+            if not domain:
+                continue
+            # Validate it looks like a domain/URL (basic safety check).
+            if not re.match(r"^[a-zA-Z0-9._\-/:%?=&#]+$", domain):
+                continue
+            url = domain if domain.startswith("http") else f"https://{domain}"
+            # Validate it's not a private/local address.
+            try:
+                hostname = urllib.parse.urlparse(url).hostname or ""
+                if hostname:
+                    ipaddress.ip_address(hostname)
+                    continue  # skip raw IP addresses
+            except ValueError:
+                pass  # not an IP, fine
+            sources.append(
+                ResearchSource(
+                    provider="ai-reasoned-domain",
+                    title=f"AI-identified authoritative source: {domain}",
+                    url=url,
+                    year=datetime.now(UTC).year,
+                    abstract=(
+                        f"Authoritative domain identified by AI reasoning for: "
+                        f"{objective[:120]}"
+                    ),
+                    score=30.0,
+                )
+            )
+        return sources
+
+    def _ai_generate_perspectives(
+        self,
+        query: str,
+        objective: str,
+        depth: str,
+    ) -> list[dict[str, Any]]:
+        """Generate research perspectives tailored to this objective via AI.
+
+        Asks the frontier model what distinct research angles matter for this
+        specific topic — no hardcoded mode flags. Falls back to
+        ``_generic_perspectives`` when the AI is unavailable or returns
+        invalid JSON.
+        """
+        n = 6 if depth == "multi-hour" else (5 if depth == "standard" else 3)
+        system = (
+            "You are a research design specialist. Given a research query, "
+            "generate search perspectives that each reveal complementary evidence "
+            "a single broad query would miss. Each perspective must target a "
+            "distinct evidence type. Respond with a valid JSON array only — "
+            "no prose, no markdown fences."
+        )
+        user = (
+            f"Query: {query}\n"
+            f"Objective: {objective}\n\n"
+            f"Generate {n} research perspectives as a JSON array. "
+            "Each element must have: "
+            '"name" (short lowercase-hyphenated slug), '
+            '"goal" (one sentence describing what evidence this perspective collects), '
+            '"keywords" (list of 4-6 relevant search keywords specific to the topic), '
+            '"queries" (list of 1-3 short search phrases derived directly from the '
+            "actual query terms — NOT generic placeholders like '{query} methodology').\n"
+            "All keywords and queries must be grounded in the specific topic, "
+            "not copy-paste templates."
+        )
+        try:
+            raw = self._call_ai_text(system, user)
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, list) and len(parsed) >= 2:
+                    valid: list[dict[str, Any]] = []
+                    for p in parsed:
+                        if (
+                            isinstance(p, dict)
+                            and isinstance(p.get("name"), str)
+                            and isinstance(p.get("goal"), str)
+                            and isinstance(p.get("keywords"), list)
+                            and isinstance(p.get("queries"), list)
+                            and len(p.get("queries") or []) >= 1
+                        ):
+                            valid.append(p)
+                    if len(valid) >= 2:
+                        return valid
+        except Exception:
+            pass
+        return self._generic_perspectives(query, depth)
+
+    @staticmethod
+    def _generic_perspectives(query: str, depth: str) -> list[dict[str, Any]]:
+        """Fallback perspectives that stay domain-agnostic and evidence-driven."""
+        core = DeepResearchEngine._query_core_terms(query) or query
+        seed_terms = [
+            token for token in DeepResearchEngine._keywords(query) if len(token) >= 4
+        ]
+        if not seed_terms:
+            seed_terms = [
+                token for token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9-]{3,}\b", core)
+            ]
+        seed_terms = list(dict.fromkeys(seed_terms))[:8]
+
+        axis_specs: list[tuple[str, str, list[str]]]
+        if DeepResearchEngine._looks_like_current_evidence_query(query):
+            axis_specs = [
+                (
+                    "current-signals",
+                    "Track how evidence changed over time and what is newest.",
+                    ["latest evidence", "current analysis", "timeline"],
+                ),
+                (
+                    "drivers",
+                    "Identify strongest causal drivers and catalysts.",
+                    ["causal factors", "drivers", "mechanisms"],
+                ),
+                (
+                    "counterevidence",
+                    "Capture competing claims and disconfirming evidence.",
+                    ["counterevidence", "alternative explanation", "disagreement"],
+                ),
+                (
+                    "risk",
+                    "Quantify uncertainty, scenario spread, and confidence limits.",
+                    ["uncertainty", "risk scenarios", "confidence bounds"],
+                ),
+            ]
+        else:
+            axis_specs = [
+                (
+                    "baseline",
+                    "Establish the factual baseline and scope.",
+                    ["baseline", "scope", "definitions"],
+                ),
+                (
+                    "evidence",
+                    "Gather primary evidence and independent validation.",
+                    ["primary evidence", "independent verification", "data sources"],
+                ),
+                (
+                    "mechanisms",
+                    "Explain causal mechanisms and constraints.",
+                    ["causal factors", "mechanisms", "constraints"],
+                ),
+                (
+                    "limitations",
+                    "Evaluate limitations, edge cases, and uncertainty.",
+                    ["limitations", "failure modes", "uncertainty"],
+                ),
+                (
+                    "counterevidence",
+                    "Collect contradictory evidence and alternative interpretations.",
+                    ["counterevidence", "alternative interpretation", "disagreement"],
+                ),
+            ]
+
+        if depth == "quick":
+            axis_specs = axis_specs[:3]
+        elif depth == "standard":
+            axis_specs = axis_specs[:4]
+
+        perspectives: list[dict[str, Any]] = []
+        for name, goal, axis_keywords in axis_specs:
+            keywords = [core, *axis_keywords, *seed_terms[:3]]
+            keywords = list(dict.fromkeys(keywords))[:6]
+            queries = [
+                f"{core} {axis_keywords[0]}",
+                f"{core} {axis_keywords[1]}",
+            ]
+            if seed_terms:
+                queries.append(f"{seed_terms[0]} {axis_keywords[0]}")
+            perspectives.append(
+                {
+                    "name": name,
+                    "goal": goal,
+                    "keywords": keywords,
+                    "queries": queries[:3],
+                }
+            )
+        return perspectives
 
     def _search_semantic_scholar(
         self,
@@ -1106,27 +2198,61 @@ class DeepResearchEngine:
         query: str,
         limit: int | None = None,
     ) -> list[ResearchSource]:
-        params = urllib.parse.urlencode({"q": query})
-        raw_html = self._get_text(
-            f"https://html.duckduckgo.com/html/?{params}",
-            accept="text/html,application/xhtml+xml",
-            max_bytes=120_000,
-        )
         sources: list[ResearchSource] = []
-        if raw_html:
-            for rank, match in enumerate(
-                re.finditer(
-                    (
-                        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"'
-                        r"[^>]*>(.*?)</a>"
-                    ),
-                    raw_html,
-                    flags=re.IGNORECASE | re.DOTALL,
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        page_stride = 20
+        max_pages = max(1, min(8, (target_limit + page_stride - 1) // page_stride + 1))
+        seen_urls: set[str] = set()
+        seen_pages: set[str] = set()
+        global_rank = 0
+        preview_fetch_budget = (
+            12 if self._looks_like_current_evidence_query(query) else 6
+        )
+        preview_fetches = 0
+
+        for page_index in range(max_pages):
+            page_start = page_index * page_stride
+            params = {"q": query}
+            if page_start > 0:
+                params["s"] = str(page_start)
+                params["dc"] = str(page_start)
+            search_url = (
+                f"https://html.duckduckgo.com/html/?{urllib.parse.urlencode(params)}"
+            )
+            try:
+                raw_html = self._get_text(
+                    search_url,
+                    accept="text/html,application/xhtml+xml",
+                    max_bytes=120_000,
+                    timeout_seconds=6,
+                )
+            except TypeError:
+                raw_html = self._get_text(
+                    search_url,
+                    accept="text/html,application/xhtml+xml",
+                    max_bytes=120_000,
+                )
+            if not raw_html:
+                break
+
+            page_fingerprint = self._normalize_title(raw_html[:2400])
+            if page_fingerprint in seen_pages:
+                break
+            seen_pages.add(page_fingerprint)
+
+            added_this_page = 0
+            for match in re.finditer(
+                (
+                    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"'
+                    r"[^>]*>(.*?)</a>"
                 ),
-                start=1,
+                raw_html,
+                flags=re.IGNORECASE | re.DOTALL,
             ):
                 raw_url = self._normalize_web_result_url(match.group(1))
                 if not self._is_safe_public_url(raw_url):
+                    continue
+                if raw_url in seen_urls:
                     continue
                 title = self._html_to_text(match.group(2)) or self._label_from_url(
                     raw_url
@@ -1142,8 +2268,38 @@ class DeepResearchEngine:
                     if snippet_match is not None
                     else ""
                 )
+                quality_flags: list[str] = []
+                if not snippet.strip() and preview_fetches < preview_fetch_budget:
+                    preview_fetches += 1
+                    try:
+                        preview = self._get_text(
+                            raw_url,
+                            accept="text/html,application/xhtml+xml,*/*",
+                            max_bytes=30_000,
+                            timeout_seconds=4,
+                        )
+                    except TypeError:
+                        preview = self._get_text(
+                            raw_url,
+                            accept="text/html,application/xhtml+xml,*/*",
+                            max_bytes=30_000,
+                        )
+                    preview_text = self._html_to_text(preview)
+                    tickers = _extract_ticker_candidates(f"{title} {preview_text}")
+                    if tickers:
+                        snippet = f"Ticker candidates mentioned: {', '.join(tickers)}."
+                    elif len(preview_text) >= 80:
+                        snippet = re.sub(r"\s+", " ", preview_text)[:320]
+                    else:
+                        quality_flags.append("snippet-unavailable")
+                elif not snippet.strip():
+                    quality_flags.append("snippet-unavailable")
+
+                seen_urls.add(raw_url)
+                added_this_page += 1
+                global_rank += 1
                 host = urllib.parse.urlparse(raw_url).netloc.lower().lstrip("www.")
-                score = max((limit or self.limit_per_provider) - rank + 1, 0)
+                score = max(target_limit - global_rank + 1, 0)
                 sources.append(
                     ResearchSource(
                         provider="web-search",
@@ -1155,10 +2311,14 @@ class DeepResearchEngine:
                         )[:1200],
                         citation_count=score,
                         score=float(score),
+                        quality_flags=quality_flags,
                     )
                 )
-                if len(sources) >= (limit or self.limit_per_provider):
+                if len(sources) >= target_limit:
                     break
+            if len(sources) >= target_limit or added_this_page == 0:
+                break
+
         self._record_provider_diagnostic(
             "web-search",
             "ok" if sources else "empty",
@@ -1264,6 +2424,20 @@ class DeepResearchEngine:
             # broad web search and tool observations.
             return {"web-search", "gemini-flash"}
 
+        if cls._looks_like_current_evidence_query(
+            query
+        ) and not cls._looks_like_academic_query(query):
+            if cls._looks_like_market_query(
+                query
+            ) and not cls._looks_like_quant_finance_query(query):
+                # Current market tasks should prioritize real-time web/provider
+                # evidence. Scholarly providers are admitted only for explicit
+                # quant-finance modeling objectives.
+                return {"web-search", "gemini-flash", "software-reference"}
+            # Include software-reference for price/product data, and crossref for
+            # reports/whitepapers that may index financial analyses.
+            return {"web-search", "gemini-flash", "software-reference", "crossref"}
+
         # Default scholarly stack is always included.
         selected: set[str] = {
             "openalex",
@@ -1296,6 +2470,31 @@ class DeepResearchEngine:
 
         return selected
 
+    @classmethod
+    def _expand_provider_mix_for_diversity(
+        cls,
+        query: str,
+        allowed_providers: set[str],
+        coverage: dict[str, Any],
+    ) -> set[str] | None:
+        # Only expand when provider diversity is genuinely low relative to what
+        # is available (fewer than 3 distinct providers delivering results).
+        if int(coverage.get("provider_count") or 0) >= 3:
+            return None
+        expanded = set(allowed_providers)
+        # Respect the original classification domain: only expand to scholarly
+        # providers when the query was already classified as needing scholarly
+        # coverage.  Market and current-evidence queries must not be poisoned
+        # with academic literature — scholarly providers are added only when
+        # the original allowed set already contains at least one of them.
+        scholarly = {"openalex", "semantic-scholar", "crossref"}
+        if allowed_providers & scholarly:
+            expanded.update(scholarly)
+        expanded.add("web-search")
+        if cls._looks_like_software_agent_query(query):
+            expanded.add("github-repositories")
+        return expanded if expanded != allowed_providers else None
+
     # ------------------------------------------------------------------
     # Content enrichment and citation chasing
     # ------------------------------------------------------------------
@@ -1316,14 +2515,48 @@ class DeepResearchEngine:
         for source in sources:
             if not self._is_safe_public_url(source.url):
                 continue
-            content = self._fetch_page_text(source.url, max_bytes=40_000)
+            # Deterministically page and stitch long-form sources so we do not
+            # over-index on metadata-heavy front matter.
+            raw_html = self._get_text_stitched(
+                source.url,
+                accept="text/html,application/xhtml+xml,*/*",
+                page_bytes=60_000,
+                max_pages=4,
+                overlap_bytes=1_600,
+                query=query,
+            )
+            if not raw_html:
+                continue
+
+            # Interrupt-handler state machine: if signal collapses and overlay
+            # markers are present, enter a bounded modal-dismissal routine.
+            # If still blocked after two attempts, tag as unreachable-paywalled.
+            signal_before = self._text_signal_score(self._html_to_text(raw_html))
+            overlay_markers = self._overlay_marker_count(raw_html)
+            if signal_before < 0.16 and overlay_markers > 0:
+                resolved_html, status = self._interrupt_resolve_overlays(raw_html)
+                if status != "resolved":
+                    if "unreachable-paywalled" not in source.quality_flags:
+                        source.quality_flags.append("unreachable-paywalled")
+                    self.provider_diagnostics.append(
+                        {
+                            "provider": source.provider,
+                            "query": query,
+                            "status": "unreachable-paywalled",
+                            "url": source.url,
+                        }
+                    )
+                    continue
+                raw_html = resolved_html
+
+            content = self._html_to_text(raw_html)
             if len(content) > 80:
                 # Extend the abstract so ranking gets real signal.
-                extra = content[:600]
+                extra = content[:1200]
                 if source.abstract.lower().startswith("generic web result for "):
-                    source.abstract = extra[:2000]
+                    source.abstract = extra[:3000]
                 else:
-                    source.abstract = f"{source.abstract} {extra}".strip()[:2000]
+                    source.abstract = f"{source.abstract} {extra}".strip()[:3000]
                 # Derive new focused queries from the fetched content.
                 new_queries.extend(
                     self._content_to_new_queries(content, source.title, query)
@@ -1339,6 +2572,72 @@ class DeepResearchEngine:
                 seen.add(norm)
                 result.append(q[:80])
         return result[:12]
+
+    @staticmethod
+    def _text_signal_score(text: str) -> float:
+        words = re.findall(r"\b[a-zA-Z]{3,}\b", text)
+        if not words:
+            return 0.0
+        noise_tokens = {
+            "cookie",
+            "consent",
+            "privacy",
+            "terms",
+            "subscribe",
+            "newsletter",
+            "sign",
+            "login",
+            "close",
+            "accept",
+            "decline",
+        }
+        lower_words = [word.lower() for word in words]
+        noise_hits = sum(1 for word in lower_words if word in noise_tokens)
+        density = min(1.0, len(words) / 260.0)
+        noise_ratio = noise_hits / max(len(lower_words), 1)
+        return max(0.0, min(1.0, density * (1.0 - min(noise_ratio * 6.0, 1.0))))
+
+    @staticmethod
+    def _overlay_marker_count(raw_html: str) -> int:
+        lower = raw_html.lower()
+        markers = (
+            'role="dialog"',
+            "role='dialog'",
+            'role="alert"',
+            "position:fixed",
+            "position: fixed",
+            "cookie",
+            "consent",
+            "paywall",
+            "subscribe",
+            "newsletter",
+            "modal",
+            "overlay",
+        )
+        return sum(1 for marker in markers if marker in lower)
+
+    @classmethod
+    def _interrupt_resolve_overlays(cls, raw_html: str) -> tuple[str, str]:
+        html_candidate = raw_html
+        for _ in range(2):
+            html_candidate = cls._strip_known_overlays(html_candidate)
+            signal = cls._text_signal_score(cls._html_to_text(html_candidate))
+            if signal >= 0.2:
+                return html_candidate, "resolved"
+        return raw_html, "unreachable-paywalled"
+
+    @staticmethod
+    def _strip_known_overlays(raw_html: str) -> str:
+        patterns = [
+            r"<div[^>]*role=['\"](?:dialog|alert)['\"][^>]*>.*?</div>",
+            r"<div[^>]*(?:cookie|consent|newsletter|subscribe|paywall|modal|overlay)[^>]*>.*?</div>",
+            r"<aside[^>]*(?:cookie|consent|newsletter|subscribe|paywall|modal|overlay)[^>]*>.*?</aside>",
+            r"<section[^>]*(?:cookie|consent|newsletter|subscribe|paywall|modal|overlay)[^>]*>.*?</section>",
+        ]
+        cleaned = raw_html
+        for pattern in patterns:
+            cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        return cleaned
 
     def _fetch_page_text(self, url: str, max_bytes: int = 40_000) -> str:
         """Fetch *url* and return stripped plain text.
@@ -1380,18 +2679,34 @@ class DeepResearchEngine:
         url: str,
         accept: str = "text/html,application/xhtml+xml,*/*",
         max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> str:
+        headers = {
+            "Accept": accept,
+            "User-Agent": "agentos-orchestrator/0.1 (research enrichment)",
+        }
+        if range_start is not None:
+            bounded_start = max(0, range_start)
+            bounded_end = max(
+                bounded_start,
+                range_end if range_end is not None else bounded_start + max_bytes - 1,
+            )
+            headers["Range"] = f"bytes={bounded_start}-{bounded_end}"
+        if extra_headers:
+            headers.update(
+                {str(key): str(value) for key, value in extra_headers.items()}
+            )
         request = urllib.request.Request(
             url,
-            headers={
-                "Accept": accept,
-                "User-Agent": "agentos-orchestrator/0.1 (research enrichment)",
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(  # noqa: S310 - policy-gated URLs
                 request,
-                timeout=min(self.timeout_seconds, 15),
+                timeout=min(timeout_seconds or self.timeout_seconds, 15),
             ) as response:
                 content_type = str(response.headers.get("Content-Type") or "").lower()
                 if content_type and not any(
@@ -1402,6 +2717,276 @@ class DeepResearchEngine:
                 return response.read(max_bytes).decode("utf-8", errors="replace")
         except (OSError, urllib.error.URLError):
             return ""
+
+    def _get_text_stitched(
+        self,
+        url: str,
+        accept: str,
+        page_bytes: int,
+        max_pages: int,
+        overlap_bytes: int,
+        query: str,
+    ) -> str:
+        chunks: list[str] = []
+        seen_fingerprints: set[str] = set()
+        for index in range(max_pages):
+            start = index * max(1, page_bytes - overlap_bytes)
+            end = start + page_bytes - 1
+            raw = self._get_text(
+                url,
+                accept=accept,
+                max_bytes=page_bytes,
+                range_start=start,
+                range_end=end,
+                timeout_seconds=10,
+            )
+            if not raw:
+                break
+            fingerprint = self._normalize_title(raw[:1800])
+            if fingerprint in seen_fingerprints:
+                break
+            seen_fingerprints.add(fingerprint)
+
+            chunk = self._extract_signal_text_chunk(raw, query)
+            if not chunk:
+                if index == 0:
+                    continue
+                break
+            chunks.append(chunk)
+
+            if len(raw) < int(page_bytes * 0.85):
+                break
+
+        if not chunks:
+            return ""
+        stitched = self._stitch_text_chunks(chunks, overlap_chars=140)
+        return stitched[:24_000]
+
+    def _extract_signal_text_chunk(self, raw_html: str, query: str) -> str:
+        signal_pattern = re.compile(
+            (
+                r"<(?:h1|h2|h3|h4)[^>]*>[^<]*(?:Conclusion|Results|Discussion|"
+                r"Financial Summary|Risk Factors|Outlook|Guidance)[^<]*</(?:h1|h2|h3|h4)>"
+            ),
+            re.IGNORECASE | re.DOTALL,
+        )
+        signal_hits = signal_pattern.findall(raw_html)
+        if signal_hits:
+            candidate = self._strip_dom_noise_tokens(
+                self._html_to_text(" ".join(signal_hits[:8]))
+            )
+            if self._text_signal_score(candidate) >= 0.08:
+                if query and not self._passes_semantic_binary_gate(candidate, query):
+                    return ""
+                return candidate
+
+        candidate = self._strip_dom_noise_tokens(self._html_to_text(raw_html))
+        if self._text_signal_score(candidate) < 0.05:
+            return ""
+        if query and not self._passes_semantic_binary_gate(candidate, query):
+            return ""
+        if query:
+            anchors = set(self._keywords(query)) | set(
+                self._entity_terms_from_query(query)
+            )
+            if anchors and not any(anchor in candidate.lower() for anchor in anchors):
+                return ""
+        return candidate
+
+    @staticmethod
+    def _stitch_text_chunks(chunks: list[str], overlap_chars: int = 120) -> str:
+        if not chunks:
+            return ""
+        stitched = chunks[0]
+        for chunk in chunks[1:]:
+            suffix = stitched[-overlap_chars:]
+            prefix = chunk[:overlap_chars]
+            overlap = 0
+            max_window = min(len(suffix), len(prefix))
+            for width in range(max_window, 24, -1):
+                if suffix[-width:] == prefix[:width]:
+                    overlap = width
+                    break
+            stitched += chunk[overlap:]
+        return stitched
+
+    @staticmethod
+    def _looks_like_market_query(query: str) -> bool:
+        lower = query.lower()
+        market_tokens = {
+            "stock",
+            "stocks",
+            "equity",
+            "equities",
+            "market",
+            "markets",
+            "invest",
+            "investing",
+            "investor",
+            "upside",
+            "downside",
+            "earnings",
+            "valuation",
+            "price target",
+            "wall street",
+            "bull",
+            "bear",
+            "portfolio",
+            "ticker",
+        }
+        return any(token in lower for token in market_tokens)
+
+    @staticmethod
+    def _looks_like_quant_finance_query(query: str) -> bool:
+        lower = query.lower()
+        quant_tokens = {
+            "factor model",
+            "asset pricing",
+            "fama",
+            "carhart",
+            "garch",
+            "stochastic volatility",
+            "black-scholes",
+            "heston",
+            "value at risk",
+            "expected shortfall",
+            "portfolio optimization",
+            "mean variance",
+            "cointegration",
+            "statistical arbitrage",
+            "market microstructure",
+        }
+        return any(token in lower for token in quant_tokens)
+
+    @staticmethod
+    def _strip_dom_noise_tokens(text: str) -> str:
+        cleaned = text
+        cleaned = re.sub(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+){2,}\b", " ", cleaned)
+        cleaned = re.sub(r"\b[a-z]+[A-Z][a-zA-Z0-9]*\b", " ", cleaned)
+        cleaned = re.sub(
+            (
+                r"\b(?:hover|focus|active|visited|disabled|aria-|role=|"
+                r"min-width|max-width|font-size|font-weight|line-height|"
+                r"padding|margin|display|overflow|grid|flex|text-headline|"
+                r"text-title|className|querySelector|innerText|"
+                r"storywithleadvideo|storywith|leadvideo|flexi-page|"
+                r"nimbus|progressive-advanced)\b"
+            ),
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @staticmethod
+    def _has_dom_noise_pattern(text: str) -> bool:
+        lower = text.lower()
+        if re.search(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+){2,}\b", lower):
+            return True
+        if re.search(r"\b[a-z]+[A-Z][a-zA-Z0-9]*\b", text):
+            return True
+        return any(
+            token in lower
+            for token in (
+                "min-width",
+                "max-width",
+                "font-size",
+                "font-weight",
+                "text-headline",
+                "text-title",
+                "queryselector",
+                "innertext",
+            )
+        )
+
+    def _passes_semantic_binary_gate(self, text: str, query: str) -> bool:
+        sample = self._strip_dom_noise_tokens((text or "")[:4000])
+        if not sample.strip():
+            return False
+        cache_key = (
+            f"{self._normalize_title(query)}::{self._normalize_title(sample[:900])}"
+        )
+        if cache_key in self._semantic_gate_cache:
+            return self._semantic_gate_cache[cache_key]
+
+        deterministic = self._passes_deterministic_semantic_gate(sample, query)
+        if deterministic:
+            self._semantic_gate_cache[cache_key] = True
+            return True
+        anchors = self._objective_anchor_terms(query)
+        words = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", sample.lower()))
+        overlap = len(anchors & words) if anchors else 0
+        if anchors and overlap == 0:
+            self._semantic_gate_cache[cache_key] = False
+            return False
+
+        # Optional LLM arbitration for ambiguous edge cases.
+        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            prompt = (
+                "Binary relevance gate. Answer only TRUE or FALSE. "
+                "TRUE only if the text explicitly addresses the objective. "
+                f"Objective: {query}\nText: {sample[:1200]}"
+            )
+            decision = (
+                self._call_ai_text(
+                    "You are a strict relevance gate. Return only TRUE or FALSE.",
+                    prompt,
+                )
+                .strip()
+                .upper()
+            )
+            allowed = decision.startswith("TRUE")
+            self._semantic_gate_cache[cache_key] = allowed
+            return allowed
+
+        allowed = overlap >= 1 and not self._has_dom_noise_pattern(sample)
+        self._semantic_gate_cache[cache_key] = allowed
+        return allowed
+
+    @classmethod
+    def _passes_deterministic_semantic_gate(cls, text: str, query: str) -> bool:
+        sample = cls._strip_dom_noise_tokens(text)
+        anchors = cls._objective_anchor_terms(query)
+        words = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", sample.lower()))
+        overlap = len(anchors & words) if anchors else 0
+        if cls._looks_like_market_query(query):
+            market_vocab = {
+                "stock",
+                "stocks",
+                "equity",
+                "equities",
+                "market",
+                "markets",
+                "earnings",
+                "valuation",
+                "price",
+                "target",
+                "revenue",
+                "margin",
+                "growth",
+                "upside",
+                "downside",
+                "ticker",
+                "guidance",
+            }
+            offdomain_vocab = {
+                "radiocarbon",
+                "paleoenvironmental",
+                "antarctica",
+                "hepatocellular",
+                "osteoarthritis",
+                "clinical",
+                "blood pressure",
+                "tumour",
+                "trial",
+            }
+            has_market = any(token in sample.lower() for token in market_vocab)
+            has_offdomain = any(token in sample.lower() for token in offdomain_vocab)
+            if has_offdomain and not has_market:
+                return False
+            if not has_market and overlap < 2:
+                return False
+        return overlap >= 2 and not cls._has_dom_noise_pattern(sample)
 
     @staticmethod
     def _html_to_text(raw: str) -> str:
@@ -1468,6 +3053,27 @@ class DeepResearchEngine:
         query: str = "",
     ) -> list[str]:
         """Extract 2-4 focused keyword phrases from fetched page content."""
+        # Detect JS-blocked / error pages — these produce garbage queries.
+        _js_block_signals = (
+            "enable javascript",
+            "javascript is required",
+            "javascript is disabled",
+            "please enable javascript",
+            "this site requires javascript",
+            "pardon our interruption",
+            "access denied",
+            "403 forbidden",
+            "404 not found",
+            "cloudflare ray id",
+            "captcha",
+            "you are being rate limited",
+            "your request has been blocked",
+        )
+        content = cls._strip_dom_noise_tokens(content)
+        source_title = cls._strip_dom_noise_tokens(source_title)
+        _content_lower = content.lower()[:2000]
+        if any(sig in _content_lower for sig in _js_block_signals):
+            return []
         # Pick the most frequent non-stop content words.
         words = re.findall(r"\b[a-zA-Z][a-zA-Z-]{3,}\b", content.lower())
         stop = {
@@ -1522,6 +3128,48 @@ class DeepResearchEngine:
             "manifest",
             "version",
             "supplementary",
+            # JS/browser error page tokens — these appear when pages are blocked
+            "javascript",
+            "function",
+            "return",
+            "window",
+            "pardon",
+            "captcha",
+            "cloudflare",
+            "browser",
+            "cookies",
+            "forbidden",
+            "interruption",
+            "enable",
+            "script",
+            "loading",
+            "redirect",
+            # Common web-nav / financial-site UI noise — these words appear
+            # in sidebars, menus, and ticker widgets and produce garbage n-gram
+            # queries like "marketbeat stock stocks stock" or "english investing".
+            "english",
+            "investing",
+            "financial",
+            "markets",
+            "market",
+            "today",
+            "movers",
+            "gainers",
+            "shares",
+            "ticker",
+            "click",
+            "search",
+            "login",
+            "register",
+            "subscribe",
+            "newsletter",
+            "privacy",
+            "terms",
+            "contact",
+            "homepage",
+            "sidebar",
+            "widget",
+            "footer",
         }
         anchor_stop = {
             "how",
@@ -1583,6 +3231,10 @@ class DeepResearchEngine:
         for candidate in queries:
             normalized = cls._normalize_title(candidate)
             if not normalized or normalized in seen:
+                continue
+            if cls._has_dom_noise_pattern(candidate):
+                continue
+            if query and cls._objective_alignment_score(candidate, query) < 0.35:
                 continue
             if query and not any(
                 term in candidate.lower() for term in matching_anchors
@@ -1728,6 +3380,42 @@ class DeepResearchEngine:
             }
         )
 
+    def _load_env_from_dotenv(self) -> None:
+        if self._dotenv_loaded:
+            return
+        self._dotenv_loaded = True
+        dotenv_path = self.workspace_root / ".env"
+        if not dotenv_path.exists():
+            return
+        try:
+            for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                env_key = key.strip()
+                if not env_key:
+                    continue
+                cleaned = value.strip().strip('"').strip("'")
+                if env_key not in os.environ and cleaned:
+                    os.environ[env_key] = cleaned
+        except OSError:
+            return
+
+    def _record_provider_preflight(self) -> None:
+        gemini_present = bool(
+            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        )
+        self._record_provider_diagnostic(
+            "provider-preflight",
+            "ok" if gemini_present else "warning",
+            (
+                "gemini key configured"
+                if gemini_present
+                else "gemini key not found in env/.env; gemini provider can be skipped"
+            ),
+        )
+
     def _write_artifacts(
         self,
         run_id: str,
@@ -1740,6 +3428,8 @@ class DeepResearchEngine:
         plan: dict[str, Any],
         pc_context_info: dict[str, Any],
         retrieval: dict[str, Any],
+        run_id_for_durable_notes: str,
+        synthesis_mode: str,
     ) -> list[str]:
         artifact_dir = self.workspace_root / "runs" / run_id / "research"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1755,6 +3445,7 @@ class DeepResearchEngine:
         retrieval_metrics_path = artifact_dir / "retrieval_metrics.json"
         evidence_graph_path = artifact_dir / "evidence_graph.json"
         benchmark_adapters_path = artifact_dir / "benchmark_adapters.json"
+        durable_notes_path = self._durable_report_path(run_id_for_durable_notes)
         findings = self._finding_ledger(query, sources, plan)
         retrieval_payload = {
             "coverage": retrieval["coverage"],
@@ -1763,6 +3454,23 @@ class DeepResearchEngine:
             "query_variants": retrieval["query_variants"],
         }
         benchmark_adapters = self._benchmark_adapters(sources)
+        token_strategy_parts = [
+            "structured scholarly APIs",
+            "broad web search",
+            "explicit URL seeding",
+        ]
+        if self._looks_like_software_agent_query(f"{query} {objective}"):
+            token_strategy_parts.append("software repository search")
+        token_strategy_parts.extend(
+            [
+                "optional model observations",
+                "exact dedupe",
+                "plan-first multi-perspective query decomposition",
+                "finding support/conflict ledger",
+                "relevance ranking",
+                "compressed digest artifacts",
+            ]
+        )
 
         sources_path.write_text(
             json.dumps([asdict(source) for source in sources], indent=2),
@@ -1827,14 +3535,8 @@ class DeepResearchEngine:
                     "pc_context": pc_context_info,
                     "coverage": retrieval["coverage"],
                     "stop_reason": retrieval["stop_reason"],
-                    "token_strategy": (
-                        "structured scholarly APIs, broad web search, "
-                        "explicit URL seeding, software repository search, "
-                        "optional model observations, exact dedupe, plan-first "
-                        "multi-perspective query decomposition, finding "
-                        "support/conflict ledger, relevance ranking, "
-                        "compressed digest artifacts"
-                    ),
+                    "final_synthesis_mode": synthesis_mode,
+                    "token_strategy": ", ".join(token_strategy_parts),
                 },
                 indent=2,
             ),
@@ -1897,7 +3599,7 @@ class DeepResearchEngine:
             json.dumps(self.provider_diagnostics, indent=2),
             encoding="utf-8",
         )
-        return [
+        artifacts = [
             str(sources_path.relative_to(self.workspace_root)),
             str(brief_path.relative_to(self.workspace_root)),
             str(digest_path.relative_to(self.workspace_root)),
@@ -1911,6 +3613,9 @@ class DeepResearchEngine:
             str(benchmark_adapters_path.relative_to(self.workspace_root)),
             str(diagnostics_path.relative_to(self.workspace_root)),
         ]
+        if durable_notes_path is not None and durable_notes_path.exists():
+            artifacts.append(str(durable_notes_path.relative_to(self.workspace_root)))
+        return artifacts
 
     def _benchmark_adapters(
         self,
@@ -2400,6 +4105,8 @@ class DeepResearchEngine:
         depth: str = "standard",
         plan: dict[str, Any] | None = None,
         query: str = "",
+        durable_notes: str = "",
+        synthesis_mode: str = "hybrid",
     ) -> str:
         if not sources:
             return (
@@ -2407,12 +4114,50 @@ class DeepResearchEngine:
                 f"providers for: {objective}. Check network policy, API "
                 "availability, or attach MCP research servers."
             )
+        if synthesis_mode == "durable-notes-only" and durable_notes.strip():
+            ai_synthesis = self._ai_durable_notes_synthesis(
+                objective,
+                sources,
+                durable_notes,
+                plan,
+            )
+            if ai_synthesis:
+                return ai_synthesis
+            note_lines = [
+                line
+                for line in durable_notes.splitlines()
+                if line.strip().startswith("- [")
+            ]
+            return (
+                f"Durable-notes synthesis mode used for: {objective}. "
+                f"Integrated {len(note_lines)} distilled claims from workflows/report.md "
+                "with minimal source metadata."
+            )
         findings = self._finding_ledger(query or objective, sources, plan)
         perspective_coverage = self._perspective_coverage(
             sources,
             (plan or {}).get("perspectives") or [],
         )
         subquestion_count = len((plan or {}).get("subquestions", []))
+
+        # ------------------------------------------------------------------
+        # SCIENTIST SYNTHESIS: ask AI to reason about what the evidence
+        # actually says — forming conclusions, noting contradictions, and
+        # flagging gaps — rather than generating a boilerplate summary.
+        # ------------------------------------------------------------------
+        ai_synthesis = self._ai_scientist_synthesis(
+            objective,
+            sources,
+            findings,
+            plan,
+            perspective_coverage,
+            durable_notes,
+            synthesis_mode,
+        )
+        if ai_synthesis:
+            return ai_synthesis
+
+        # Fallback template summary when AI is unavailable.
         leading_findings = "; ".join(
             f"{finding['perspective']}: {finding['finding']}"
             for finding in findings[:3]
@@ -2437,6 +4182,303 @@ class DeepResearchEngine:
             f"Contradiction signals were observed in {conflict_count} finding clusters."
         )
 
+    def _ai_scientist_synthesis(
+        self,
+        objective: str,
+        sources: list[ResearchSource],
+        findings: list[dict[str, Any]],
+        plan: dict[str, Any] | None,
+        perspective_coverage: dict[str, Any],
+        durable_notes: str = "",
+        synthesis_mode: str = "hybrid",
+    ) -> str:
+        """Ask AI to synthesize evidence like a scientist: form conclusions,
+        note contradictions and gaps, and calibrate confidence.
+
+        Returns an empty string when AI is unavailable.
+        """
+        if not sources:
+            return ""
+        # Build compact evidence digest. In durable-notes-only mode we only use
+        # minimal metadata and never include source abstracts/snippets.
+        source_lines: list[str]
+        if synthesis_mode == "durable-notes-only":
+            source_lines = self._minimal_source_metadata_lines(sources)
+        else:
+            source_lines = []
+            for src in sources[:20]:
+                year = f" ({src.year})" if src.year else ""
+                grade = src.evidence_grade
+                snippet = (src.abstract or src.title)[:160].replace("\n", " ")
+                source_lines.append(
+                    f"[{src.provider}/{grade}] {src.title}{year}: {snippet}"
+                )
+        finding_lines: list[str] = []
+        for f in findings[:6]:
+            finding_lines.append(
+                f"  {f['perspective']} ({f['confidence']}, "
+                f"{f['support_count']} sources, "
+                f"{f['contradiction_count']} contradictions): {f['finding']}"
+            )
+        missing = ", ".join(perspective_coverage.get("missing") or []) or "none"
+        subquestions = (
+            "\n".join(f"  - {sq}" for sq in (plan or {}).get("subquestions", [])[:6])
+            or "  (none recorded)"
+        )
+        system = (
+            "You are a senior research scientist writing an evidence synthesis. "
+            "Your task is NOT to summarize — it is to ANALYZE. You must:\n"
+            "1. WEIGH contradictory evidence: when sources disagree, explain "
+            "WHY they disagree (methodology, scope, recency, bias) and which "
+            "position is better supported.\n"
+            "2. GRADE credibility: for each major claim, state whether it is "
+            "supported by high-credibility sources (peer-reviewed, gov data, "
+            "authoritative institutions) or low-credibility ones (preprints, "
+            "blogs, uncited papers).\n"
+            "3. FORM conclusions: don't just list findings — reason about what "
+            "the aggregate evidence means, what is robust, and what is speculative.\n"
+            "4. IDENTIFY gaps: explicitly state what evidence is missing and "
+            "what additional investigation would change the conclusions.\n"
+            "5. CALIBRATE confidence: assign explicit confidence levels "
+            "(high/moderate/low/speculative) to each conclusion with justification.\n"
+            "Be specific, cite evidence types, and never use generic filler phrases."
+        )
+        user = (
+            f"Research objective: {objective}\n\n"
+            f"Subquestions investigated:\n{subquestions}\n\n"
+            f"Evidence found ({len(sources)} sources):\n"
+            + "\n".join(source_lines)
+            + (
+                "\n\nDurable distilled report notes (primary synthesis input):\n"
+                + durable_notes[:12000]
+                if durable_notes
+                else ""
+            )
+            + f"\n\nPer-perspective findings:\n"
+            + "\n".join(finding_lines or ["  (none yet)"])
+            + f"\n\nUncovered perspectives: {missing}\n\n"
+            "Synthesize this evidence as a senior research analyst would:\n"
+            "1. What does the evidence most strongly support? Grade each conclusion "
+            "(high/moderate/low/speculative confidence) with justification.\n"
+            "2. Where do sources contradict? For EACH contradiction, explain the "
+            "likely cause (methodology, recency, scope, bias) and which side "
+            "the weight of evidence favors.\n"
+            "3. For each major claim, explicitly grade the supporting sources' "
+            "credibility (peer-reviewed > government data > industry reports > "
+            "preprints > blogs > uncited papers).\n"
+            "4. What important gaps remain? What specific evidence would be "
+            "needed to move speculative conclusions to moderate confidence?\n"
+            "5. What is the overall synthesis confidence and why?\n"
+            "Write a coherent 4-8 paragraph analysis. Be substantive and specific — "
+            "a reader should be able to make informed decisions based on your synthesis."
+        )
+        return self._call_ai_text(system, user)
+
+    def _ai_durable_notes_synthesis(
+        self,
+        objective: str,
+        sources: list[ResearchSource],
+        durable_notes: str,
+        plan: dict[str, Any] | None,
+    ) -> str:
+        """Synthesize using only durable report notes plus minimal metadata."""
+        if not durable_notes.strip():
+            return ""
+        metadata_lines = "\n".join(self._minimal_source_metadata_lines(sources))
+        subquestions = (
+            "\n".join(f"  - {sq}" for sq in (plan or {}).get("subquestions", [])[:6])
+            or "  (none recorded)"
+        )
+        system = (
+            "You are a senior research scientist. Build the final synthesis using "
+            "ONLY the provided durable notes and minimal source metadata. "
+            "Do not request or infer hidden abstract text. "
+            "Explicitly weigh contradictions, confidence, and missing evidence."
+        )
+        user = (
+            f"Research objective: {objective}\n\n"
+            f"Subquestions investigated:\n{subquestions}\n\n"
+            "Durable report notes:\n"
+            f"{durable_notes[:16000]}\n\n"
+            "Minimal source metadata:\n"
+            f"{metadata_lines}\n\n"
+            "Write a 4-8 paragraph final synthesis with confidence levels and "
+            "contradiction analysis."
+        )
+        return self._call_ai_text(system, user)
+
+    @staticmethod
+    def _minimal_source_metadata_lines(sources: list[ResearchSource]) -> list[str]:
+        lines: list[str] = []
+        for src in sources[:40]:
+            year = str(src.year) if src.year else "n.d."
+            lines.append(
+                (
+                    f"- [{src.provider}/{src.evidence_grade}] {src.title} "
+                    f"(year: {year}) url: {src.url}"
+                )[:320]
+            )
+        return lines
+
+    @staticmethod
+    def _resolve_final_synthesis_mode(depth: str, durable_notes: str) -> str:
+        configured = (
+            str(os.environ.get("AGENTOS_FINAL_SYNTHESIS_MODE") or "").strip().lower()
+        )
+        if configured in {"hybrid", "durable-notes-only"}:
+            return configured
+        if depth == "multi-hour" and durable_notes.strip():
+            return "durable-notes-only"
+        return "hybrid"
+
+    def _initialize_durable_report(
+        self,
+        run_id: str,
+        depth: str,
+        objective: str,
+    ) -> Path | None:
+        if not run_id:
+            return None
+        report_path = self._durable_report_path(run_id)
+        if report_path is None:
+            return None
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        if not report_path.exists():
+            report_path.write_text(
+                (
+                    "# Durable Research Report\n\n"
+                    f"Depth: {depth}\n\n"
+                    f"Objective: {objective}\n\n"
+                    "## Incremental Findings\n\n"
+                ),
+                encoding="utf-8",
+            )
+        else:
+            try:
+                existing = report_path.read_text(encoding="utf-8")
+                self._durable_note_passes = {
+                    int(match.group(1))
+                    for match in re.finditer(r"^###\s+Pass\s+(\d+)\b", existing, re.M)
+                }
+            except (OSError, ValueError):
+                self._durable_note_passes = set()
+        return report_path
+
+    def _append_durable_claim_notes(
+        self,
+        report_path: Path | None,
+        pass_index: int,
+        sources: list[ResearchSource],
+        query: str,
+    ) -> None:
+        if report_path is None or not sources:
+            return
+        if pass_index in self._durable_note_passes:
+            return
+        lines: list[str] = [f"### Pass {pass_index}"]
+        wrote_any = False
+        for source in sources:
+            if not source.url or source.url in self._durable_note_urls:
+                continue
+            if source.evidence_grade not in {"strong", "moderate", "tool-observation"}:
+                continue
+            claim = self._compressed_claim(source, query)
+            if not claim:
+                continue
+            wrote_any = True
+            self._durable_note_urls.add(source.url)
+            lines.append(
+                "- "
+                f"[{source.evidence_grade}/{source.provider}] {claim} "
+                f"(source: {source.url})"
+            )
+        if not wrote_any:
+            lines.append("- [info/system] no-new-distilled-claims this pass")
+        lines.append("")
+        with report_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        self._durable_note_passes.add(pass_index)
+
+    @staticmethod
+    def _compressed_claim(source: ResearchSource, query: str = "") -> str:
+        text = (source.abstract or source.title or "").strip()
+        if not text:
+            return ""
+        lower_raw = text.lower()
+        if (
+            query
+            and DeepResearchEngine._looks_like_market_query(query)
+            and source.provider == "gemini-flash"
+        ):
+            return ""
+        if query and DeepResearchEngine._looks_like_market_query(query):
+            tickers = _extract_ticker_candidates(f"{source.title} {source.abstract}")
+            if len(tickers) >= 2:
+                return f"Ticker candidates mentioned: {', '.join(tickers)}"
+        if (
+            lower_raw.startswith("generic web result")
+            or "snippet unavailable" in lower_raw
+        ):
+            return ""
+        text = DeepResearchEngine._html_to_text(text)
+        if re.search(r"\{.*\}|\[.*\]|\"[a-z0-9_-]+\"\s*:\s*", text[:500], re.I):
+            return ""
+        text = re.sub(
+            r"\b(?:jats|xml|xmlns|sec-type|content-type|article-meta)\b",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or DeepResearchEngine._text_signal_score(text) < 0.07:
+            return ""
+        if len(re.findall(r"[{}\[\]<>]", text)) >= 4:
+            return ""
+        promotional_markers = (
+            "skip to content",
+            "top rated",
+            "trading signals",
+            "subscribe",
+            "newsletter",
+            "market intelligence",
+        )
+        if sum(1 for marker in promotional_markers if marker in text.lower()) >= 2:
+            return ""
+        if query:
+            anchors = set(DeepResearchEngine._keywords(query)) | set(
+                DeepResearchEngine._entity_terms_from_query(query)
+            )
+            if anchors and not any(anchor in text.lower() for anchor in anchors):
+                return ""
+            if DeepResearchEngine._objective_alignment_score(text, query) < 0.22:
+                return ""
+        sentence = re.split(r"[.!?]", text, maxsplit=1)[0].strip()
+        if sentence and DeepResearchEngine._text_signal_score(sentence) >= 0.08:
+            claim = sentence
+        else:
+            # Short headline-like first sentences often have low token density.
+            # Fall back to the cleaned full text so valid web evidence can still
+            # be distilled into durable notes.
+            claim = text
+        claim = re.sub(r"\s+", " ", claim)
+        if DeepResearchEngine._text_signal_score(claim) < 0.07:
+            return ""
+        return claim[:260]
+
+    def _load_durable_notes(self, run_id: str) -> str:
+        report_path = self._durable_report_path(run_id)
+        if report_path is None or not report_path.exists():
+            return ""
+        try:
+            return report_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    def _durable_report_path(self, run_id: str) -> Path | None:
+        if not run_id:
+            return None
+        return self.workspace_root / "runs" / run_id / "workflows" / "report.md"
+
     def _build_research_plan(
         self,
         objective: str,
@@ -2444,95 +4486,83 @@ class DeepResearchEngine:
         depth: str,
         pc_context_info: dict[str, Any],
     ) -> dict[str, Any]:
-        software_mode = self._looks_like_software_agent_query(query)
-        math_mode = self._looks_like_math_query(query)
-        perspectives = self._research_perspectives(
-            query,
-            objective,
-            depth,
-            software_mode,
-            math_mode,
-        )
-        if software_mode:
-            subquestions = [
-                "What problem scope and evaluation claims are being made?",
-                "Which benchmark suites and task categories are reported?",
-                "What failure modes, safety limits, and uncertainty statements exist?",
+        # ----------------------------------------------------------------
+        # THINKING STEP: Ask AI to reason about this specific objective —
+        # what entities are involved, what causal relationships matter, what
+        # authoritative sources exist, and what queries would expose the
+        # strongest evidence.
+        # ----------------------------------------------------------------
+        ai_strategy = self._ai_research_strategy(objective, query, depth)
+
+        # ------------------------------------------------------------------
+        # ADAPTIVE PLANNING: derive perspectives, comparative axes, and
+        # evidence requirements from AI reasoning about THIS specific
+        # objective, not from domain-type templates.
+        # ------------------------------------------------------------------
+        perspectives = self._research_perspectives(query, objective, depth)
+
+        ai_axes = self._ai_research_axes(objective, query, depth)
+        comparative_axes = ai_axes.get("comparative_axes") or []
+        evidence_requirements = ai_axes.get("evidence_requirements") or []
+
+        # AI-derived subquestions from strategy call above.
+        ai_subquestions = list(ai_strategy.get("subquestions") or [])
+
+        if not ai_subquestions:
+            # Absolute minimal fallback if AI strategy generation failed.
+            ai_subquestions = [
+                "What exact problem statement defines the topic?",
+                "Which causal drivers and mechanisms recur across the evidence?",
+                "What explicit limitations or uncertainties remain?",
             ]
+
+        if not comparative_axes:
             comparative_axes = [
-                "task success rate",
-                "latency and token efficiency",
-                "desktop/browser action reliability",
-                "approval and safety model",
-                "checkpoint and recovery design",
-                "operator observability",
+                "source credibility and recency",
+                "methodological rigor",
+                "stated limitations and uncertainties",
+                "independent corroboration",
             ]
+
+        if not evidence_requirements:
             evidence_requirements = [
-                "peer-reviewed or benchmark-style evidence",
-                "official project documentation and release notes",
-                "reproducible implementation details",
-                "explicitly stated limitations and risks",
-            ]
-            subquestions.extend(
-                [
-                    "How do OpenClaw/OpenCode/OpenHands differ in planner-worker topology?",
-                    "How does accessibility-tree control compare with vision-only control?",
-                    "Which systems expose approval, trust, and durable replay primitives?",
-                ]
-            )
-        elif math_mode:
-            subquestions = [
-                "Which unconditional, almost-all, or density results are already established?",
-                "What exact barrier blocks transfer from finite verification or almost-all control to a universal theorem?",
-                "Which proof frameworks engage parity vectors, 2-adic dynamics, return maps, or well-quasi-order arguments?",
-                "Which infinity-to-finite proof strategies succeeded in other hard theorems, and what structure made them work?",
-            ]
-            comparative_axes = [
-                "strength of theorem",
-                "assumptions and prerequisites",
-                "proof mechanism",
-                "finite-to-infinite transfer method",
-                "explicit barrier statement",
-                "constructive certificate leverage",
-            ]
-            evidence_requirements = [
-                "peer-reviewed mathematics sources or primary technical references",
-                "explicit theorem statements and hypotheses",
-                "identified barriers, obstructions, or impossibility statements",
-                "proof sketches or mechanisms tied to the queried dynamics",
-            ]
-        else:
-            subquestions = [
-                "What exact problem statement and accepted prior results define the topic?",
-                "Which methods, reductions, or constructions recur across the literature?",
-                "What explicit limitations, barriers, or open questions remain?",
-            ]
-            comparative_axes = [
-                "strength of result",
-                "assumptions and prerequisites",
-                "method and mechanism",
-                "scope of evidence",
-                "stated limitations",
-                "independent verification",
-            ]
-            evidence_requirements = [
-                "primary or peer-reviewed evidence",
-                "explicit methods and assumptions",
-                "clear limitations or open questions",
+                "primary or authoritative evidence",
+                "explicit causal or methodological data",
                 "independent corroboration when available",
+                "clear risk, uncertainty, or limitation statements",
             ]
+
         if pc_context_info.get("browser_context_detected"):
-            subquestions.append(
+            ai_subquestions.append(
                 "How does live browser/app context from the local PC alter the evidence collection sequence?"
             )
+
+        # Deduplicate subquestions (AI-derived only — template_subquestions
+        # was removed when planning was made fully AI-first).
+        merged_subquestions: list[str] = []
+        seen_sq: set[str] = set()
+        for sq in list(ai_subquestions):
+            key = sq.lower().strip()[:80]
+            if key and key not in seen_sq:
+                merged_subquestions.append(sq)
+                seen_sq.add(key)
+        subquestions = merged_subquestions
 
         # Entity-focused short queries come FIRST so they are not cut by
         # max_query_variants when the list is later sliced.
         plan_queries = self._entity_queries(query, objective)
+
+        # AI-reasoned queries come next — these are derived from causal
+        # thinking, not generic template expansions.
+        for rq in ai_strategy.get("reasoning_queries") or []:
+            if rq and rq.strip():
+                plan_queries.append(rq.strip()[:240])
+        # Short keyword variants come BEFORE perspectives so that recency /
+        # domain-specific variants (e.g. "latest", "2-adic") are not pushed
+        # past the max_query_variants cutoff by the larger perspective lists.
+        plan_queries.extend(self._query_variants(query, depth))
         for perspective in perspectives:
             plan_queries.extend(perspective.get("queries") or [])
-        # Then add short keyword variants of the core query.
-        plan_queries.extend(self._query_variants(query, depth))
         # Subquestions are turned into short keyword phrases, NOT appended
         # verbatim as full sentence strings (those confuse API search).
         for question in subquestions:
@@ -2556,269 +4586,29 @@ class DeepResearchEngine:
             "evidence_requirements": evidence_requirements,
             "perspectives": perspectives,
             "query_plan": deduped_queries,
+            # AI-reasoned authoritative domains are stored so that
+            # _iterative_retrieval can seed the source list with them.
+            "ai_authoritative_domains": ai_strategy.get("authoritative_domains") or [],
+            "ai_causal_connections": ai_strategy.get("causal_connections") or [],
         }
 
-    @staticmethod
     def _research_perspectives(
+        self,
         query: str,
         objective: str,
         depth: str,
-        software_mode: bool,
-        math_mode: bool,
     ) -> list[dict[str, Any]]:
-        del objective
-        if software_mode:
-            return [
-                {
-                    "name": "overview",
-                    "goal": "Establish the current system landscape and accepted framing.",
-                    "keywords": ["survey", "overview", "state of the art", "landscape"],
-                    "queries": [query, f"{query} overview", f"{query} landscape"],
-                },
-                {
-                    "name": "architecture",
-                    "goal": "Compare planner-worker topology, grounding, and execution design.",
-                    "keywords": [
-                        "architecture",
-                        "planner",
-                        "worker",
-                        "grounding",
-                        "control",
-                    ],
-                    "queries": [f"{query} architecture", f"{query} planner worker"],
-                },
-                {
-                    "name": "evaluation",
-                    "goal": "Find benchmark results, task suites, and verification evidence.",
-                    "keywords": [
-                        "benchmark",
-                        "evaluation",
-                        "success rate",
-                        "verification",
-                        "osworld",
-                        "webarena",
-                    ],
-                    "queries": [f"{query} benchmark", f"{query} evaluation"],
-                },
-                {
-                    "name": "safety",
-                    "goal": "Find approval, safety, and trust-boundary evidence.",
-                    "keywords": [
-                        "safety",
-                        "approval",
-                        "trust",
-                        "policy",
-                        "risk",
-                        "guardrail",
-                    ],
-                    "queries": [
-                        f"{query} safety approval",
-                        f"{query} risk limitations",
-                    ],
-                },
-                {
-                    "name": "failure-analysis",
-                    "goal": "Surface failure modes, repairs, and uncertainty statements.",
-                    "keywords": [
-                        "failure",
-                        "limitation",
-                        "repair",
-                        "recovery",
-                        "uncertainty",
-                    ],
-                    "queries": [f"{query} failure analysis", f"{query} limitations"],
-                },
-                {
-                    "name": "operations",
-                    "goal": "Check deployment, observability, and operator workflow fit.",
-                    "keywords": [
-                        "deployment",
-                        "observability",
-                        "workflow",
-                        "operator",
-                        "production",
-                    ],
-                    "queries": [f"{query} deployment", f"{query} operator workflow"],
-                },
-            ]
-        if math_mode:
-            return [
-                {
-                    "name": "established-results",
-                    "goal": "Anchor the search in accepted unconditional results.",
-                    "keywords": [
-                        "theorem",
-                        "result",
-                        "almost all",
-                        "density",
-                        "orbits",
-                        "verification",
-                    ],
-                    "queries": [
-                        query,
-                        f"{query} established results",
-                        f"{query} unconditional results",
-                    ],
-                },
-                {
-                    "name": "proof-barriers",
-                    "goal": "Identify exact obstructions that block the missing bridge.",
-                    "keywords": [
-                        "barrier",
-                        "obstruction",
-                        "limitation",
-                        "cannot",
-                        "open problem",
-                    ],
-                    "queries": [f"{query} theorem barrier", f"{query} obstruction"],
-                },
-                {
-                    "name": "proof-mechanisms",
-                    "goal": "Collect mechanisms that could transfer local control into global structure.",
-                    "keywords": [
-                        "proof",
-                        "mechanism",
-                        "transfer",
-                        "conjugacy",
-                        "return map",
-                        "2-adic",
-                    ],
-                    "queries": [f"{query} mechanism", f"{query} transfer method"],
-                },
-                {
-                    "name": "computation",
-                    "goal": "Track finite verification, computation, and certificate leverage.",
-                    "keywords": [
-                        "computation",
-                        "verification",
-                        "finite",
-                        "certificate",
-                        "algorithm",
-                    ],
-                    "queries": [f"{query} finite verification", f"{query} computation"],
-                },
-                {
-                    "name": "analogies",
-                    "goal": "Search for analogous infinity-to-finite proof strategies in other theorems.",
-                    "keywords": [
-                        "analogy",
-                        "related theorem",
-                        "transfer",
-                        "well-quasi-order",
-                        "compactness",
-                    ],
-                    "queries": [
-                        f"{query} analogous theorems",
-                        f"{query} infinity to finite",
-                    ],
-                },
-            ]
-        perspectives = [
-            {
-                "name": "overview",
-                "goal": "Establish accepted framing, definitions, and prior work.",
-                "keywords": [
-                    "overview",
-                    "survey",
-                    "review",
-                    "background",
-                    "state of the art",
-                ],
-                "queries": [query, f"{query} overview", f"{query} survey"],
-            },
-            {
-                "name": "mechanisms",
-                "goal": "Collect recurring methods, models, or mechanisms.",
-                "keywords": [
-                    "method",
-                    "approach",
-                    "framework",
-                    "mechanism",
-                    "model",
-                    "process",
-                ],
-                "queries": [f"{query} methods", f"{query} approach"],
-            },
-            {
-                "name": "evidence",
-                "goal": "Identify direct studies, experiments, benchmarks, or measurements.",
-                "keywords": [
-                    "evaluation",
-                    "experiment",
-                    "study",
-                    "trial",
-                    "measurement",
-                    "result",
-                ],
-                "queries": [f"{query} evidence", f"{query} evaluation"],
-            },
-            {
-                "name": "limitations",
-                "goal": "Surface risks, critiques, and open problems.",
-                "keywords": [
-                    "limitation",
-                    "risk",
-                    "challenge",
-                    "critique",
-                    "uncertainty",
-                    "failure",
-                ],
-                "queries": [f"{query} limitations", f"{query} criticism"],
-            },
-            {
-                "name": "applications",
-                "goal": "Check practical impact, adoption, or deployment relevance.",
-                "keywords": [
-                    "application",
-                    "deployment",
-                    "impact",
-                    "adoption",
-                    "workflow",
-                    "use case",
-                ],
-                "queries": [f"{query} applications", f"{query} adoption"],
-            },
-            {
-                "name": "alternatives",
-                "goal": "Compare alternatives, baselines, or competing explanations.",
-                "keywords": [
-                    "alternative",
-                    "comparison",
-                    "baseline",
-                    "trade-off",
-                    "versus",
-                    "competitor",
-                ],
-                "queries": [f"{query} comparison", f"{query} alternatives"],
-            },
-        ]
-        if depth == "quick":
-            return perspectives[:4]
-        return perspectives
+        """Generate perspectives for this research objective via AI.
+
+        The ``software_mode`` and ``math_mode`` flags are retained in the
+        signature for backward compatibility but are no longer used to select
+        a hardcoded list — the AI derives what angles are relevant instead.
+        """
+        return self._ai_generate_perspectives(query, objective, depth)
 
     @staticmethod
     def _entity_queries(query: str, objective: str) -> list[str]:
         lower = f"{query} {objective}".lower()
-        if DeepResearchEngine._looks_like_math_query(lower):
-            focus_terms = DeepResearchEngine._math_focus_terms(lower)
-            focused: list[str] = []
-            if any("collatz" in term.lower() for term in focus_terms):
-                focused.extend(
-                    [
-                        "Collatz conjecture",
-                        "Collatz almost all",
-                        "Collatz finite verification",
-                        "Collatz universal theorem",
-                    ]
-                )
-            for term in focus_terms:
-                if term == "Collatz conjecture":
-                    continue
-                if "collatz" in lower and "collatz" not in term.lower():
-                    focused.append(f"Collatz {term}")
-                else:
-                    focused.append(term)
-            return focused
         entities = []
         for name in ("openclaw", "opencode", "openhands", "agentos"):
             if name in lower:
@@ -2936,9 +4726,13 @@ class DeepResearchEngine:
                 "node_count": 0,
                 "browser_context_detected": False,
                 "top_labels": [],
+                "judged_site_count": 0,
+                "direct_urls": [],
+                "discovered_domains": [],
             }
 
         snapshot_path = Path(str(pc_context.get("snapshot_path") or ""))
+        pc_findings = pc_context.get("pc_findings") or {}
         top_labels: list[str] = []
         node_count = 0
         browser_context = False
@@ -2962,12 +4756,35 @@ class DeepResearchEngine:
             except (OSError, json.JSONDecodeError, TypeError):
                 pass
 
+        direct_urls = [
+            url
+            for url in self._collect_urls(pc_findings)
+            if self._is_safe_public_url(url) and not self._is_search_result_url(url)
+        ]
+        discovered_domains = [
+            str(domain).strip()
+            for domain in (pc_findings.get("discovered_domains") or [])
+            if str(domain).strip()
+        ]
+        judged_results = pc_findings.get("judged_results") or []
+        if direct_urls or discovered_domains or judged_results:
+            browser_context = True
+        if not top_labels:
+            top_labels = [
+                str(label).strip()
+                for label in (pc_findings.get("post_snapshot_labels") or [])
+                if str(label).strip()
+            ][:8]
+
         return {
-            "available": snapshot_path.exists(),
+            "available": snapshot_path.exists() or bool(pc_findings),
             "snapshot_path": str(snapshot_path).replace("\\", "/"),
             "node_count": node_count,
             "browser_context_detected": browser_context,
             "top_labels": top_labels,
+            "judged_site_count": len(judged_results),
+            "direct_urls": direct_urls[:6],
+            "discovered_domains": discovered_domains[:6],
         }
 
     def _analysis_report_markdown(
@@ -3074,6 +4891,7 @@ class DeepResearchEngine:
     def _query_from_objective(objective: str) -> str:
         cleaned = re.sub(r"\s+", " ", objective).strip()
         prefixes = (
+            "Find authoritative sources, direct evidence, and major uncertainties for:",
             "Find authoritative sources, prior systems, and gaps for:",
             "Extract implementation constraints, security boundaries,",
         )
@@ -3082,126 +4900,345 @@ class DeepResearchEngine:
         distilled = DeepResearchEngine._query_core_terms(cleaned)
         return distilled[:240].strip() or cleaned[:240].strip() or objective[:240]
 
-    @staticmethod
-    def _split_depth(objective: str) -> tuple[str, str]:
-        match = re.search(r"\[(quick|standard|multi-hour)\]\s*", objective)
+    @classmethod
+    def _split_depth(cls, objective: str) -> tuple[str, str]:
+        match = re.search(r"\[(quick|standard|multi-hour|adaptive)\]\s*", objective)
         if match is None:
-            return "standard", objective.strip()
-        cleaned = f"{objective[: match.start()]}{objective[match.end() :]}"
-        return match.group(1), cleaned.strip()
+            cleaned = objective.strip()
+            return cls.adaptive_depth_for_objective(cleaned), cleaned
+        cleaned = f"{objective[: match.start()]}{objective[match.end() :]}".strip()
+        marker = match.group(1)
+        if marker == "adaptive":
+            return cls.adaptive_depth_for_objective(cleaned), cleaned
+        return marker, cleaned
+
+    @classmethod
+    def research_depth_for_objective(cls, objective: str) -> str:
+        depth, _cleaned = cls._split_depth(objective)
+        return depth
+
+    @classmethod
+    def adaptive_depth_for_objective(cls, objective: str) -> str:
+        """Infer research effort from task complexity using AI.
+
+        Analyzes the objective to decide if it needs a quick lookup,
+        standard research, or multi-hour deep investigation.
+        """
+        system = (
+            "You are a research effort estimator. Analyze the research objective "
+            "and decide which depth category it requires:\n"
+            "- 'quick': simple lookups, single facts, or basic definitions.\n"
+            "- 'standard': topics requiring cross-referencing multiple sources "
+            "or basic market/technical analysis.\n"
+            "- 'multi-hour': deep scientific, financial, or academic research "
+            "requiring citation chasing, evidence weighing, and exhaustive foraging.\n"
+            "Respond ONLY with one of the three strings: quick, standard, multi-hour."
+        )
+        try:
+            # We use a static-like call here; in practice the orchestrator
+            # would pass a client.
+            raw = cls()._call_ai_text(system, f"Objective: {objective}")
+            raw = raw.lower().strip()
+            for depth in ("multi-hour", "standard", "quick"):
+                if depth in raw:
+                    return depth
+        except Exception:
+            pass
+
+        # Minimal heuristic fallback if AI is unavailable.
+        lower = objective.lower()
+        if any(
+            c in lower for c in ("research", "literature", "systematic", "exhaustive")
+        ):
+            return "multi-hour"
+        if any(c in lower for c in ("compare", "analyze", "benchmark")):
+            return "standard"
+        return "quick"
+
+    @staticmethod
+    def _looks_like_simple_lookup(lower: str) -> bool:
+        if len(lower.split()) <= 10 and any(
+            cue in lower
+            for cue in (
+                "recipe",
+                "how many",
+                "what is",
+                "who is",
+                "when is",
+                "weather",
+                "definition",
+                "syntax",
+                "quick lookup",
+            )
+        ):
+            return True
+        return any(
+            phrase in lower
+            for phrase in (
+                "find a recipe",
+                "search for a recipe",
+                "quick recipe",
+                "one source",
+                "single source",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_comprehensive_research(lower: str) -> bool:
+        comprehensive_cues = (
+            "comprehensive",
+            "systematic review",
+            "scientific literature",
+            "literature review",
+            "meta-analysis",
+            "full report",
+            "market report",
+            "s&p 500",
+            "sp 500",
+            "all companies",
+            "exhaustive",
+            "deep research",
+            "state of the art",
+            "regulatory landscape",
+        )
+        if any(cue in lower for cue in comprehensive_cues):
+            return True
+        return (
+            sum(
+                1
+                for cue in (
+                    "compare",
+                    "rank",
+                    "sources",
+                    "evidence",
+                    "risks",
+                    "limitations",
+                    "opportunities",
+                    "benchmarks",
+                )
+                if cue in lower
+            )
+            >= 3
+        )
 
     @staticmethod
     def _settings_for_depth(depth: str) -> ResearchSettings:
         if depth == "quick":
             return ResearchSettings(
                 depth="quick",
-                max_sources=5,
+                max_sources=6,
                 per_provider=4,
                 max_query_variants=2,
             )
         if depth == "multi-hour":
             return ResearchSettings(
                 depth="multi-hour",
-                max_sources=48,
-                per_provider=12,
-                max_query_variants=12,
+                max_sources=72,
+                per_provider=24,
+                max_query_variants=18,
             )
         return ResearchSettings(
             depth="standard",
-            max_sources=10,
-            per_provider=6,
-            max_query_variants=5,
+            max_sources=18,
+            per_provider=10,
+            max_query_variants=8,
         )
+
+    @staticmethod
+    def _settings_for_current_web(settings: ResearchSettings) -> ResearchSettings:
+        if settings.depth == "multi-hour":
+            return ResearchSettings(
+                depth=settings.depth,
+                max_sources=max(settings.max_sources, 72),
+                per_provider=max(settings.per_provider, 24),
+                max_query_variants=max(settings.max_query_variants, 18),
+            )
+        if settings.depth == "standard":
+            return ResearchSettings(
+                depth=settings.depth,
+                max_sources=max(settings.max_sources, 24),
+                per_provider=max(settings.per_provider, 12),
+                max_query_variants=max(settings.max_query_variants, 10),
+            )
+        return ResearchSettings(
+            depth=settings.depth,
+            max_sources=max(settings.max_sources, 12),
+            per_provider=max(settings.per_provider, 8),
+            max_query_variants=max(settings.max_query_variants, 4),
+        )
+
+    @staticmethod
+    def _current_web_targets(depth: str) -> dict[str, int | float]:
+        if depth == "multi-hour":
+            return {
+                "max_retrieval_passes": 28,
+                "depth_pass_floor": 10,
+                "max_low_novelty_streak": 6,
+                "min_perspective_count": 5,
+                "min_perspective_ratio": 0.75,
+            }
+        if depth == "standard":
+            return {
+                "max_retrieval_passes": 8,
+                "depth_pass_floor": 4,
+                "min_perspective_count": 4,
+                "min_perspective_ratio": 0.7,
+            }
+        return {
+            "max_retrieval_passes": 3,
+            "depth_pass_floor": 2,
+        }
+
+    @classmethod
+    def _current_web_target_overrides(
+        cls,
+        targets: dict[str, Any],
+        depth: str,
+    ) -> dict[str, Any]:
+        merged = dict(targets)
+        for key, value in cls._current_web_targets(depth).items():
+            if key == "max_retrieval_passes":
+                # Preserve a higher planning-derived pass budget — only raise,
+                # never lower.  Planning may have set 48 for multi-hour jobs;
+                # the current-web override should be treated as a floor, not a cap.
+                merged[key] = max(int(merged.get(key) or 0), int(value))
+            else:
+                merged[key] = value
+
+        # Current-web tasks often rely on news/market/web signals where
+        # strict scholarly thresholds can be unattainable and cause false
+        # coverage-gate failures.  gemini-flash is a quality enhancer for
+        # current-evidence queries, but when it is rate-limited the run should
+        # still complete on web-search alone — so min_provider_count is always
+        # capped at 1, making diversity best-effort rather than a hard gate.
+        provider_cap = 1
+        merged["min_provider_count"] = min(
+            int(merged.get("min_provider_count") or provider_cap),
+            provider_cap,
+        )
+        merged["min_provider_count"] = max(int(merged["min_provider_count"]), 1)
+        # Current-web retrieval commonly yields fewer high-signal, on-topic
+        # sources than broad literature mode. Keep source-count thresholds
+        # ambitious but attainable so coverage gates do not become impossible.
+        source_floor = 18 if depth == "multi-hour" else 8 if depth == "standard" else 4
+        merged["min_source_count"] = min(
+            int(merged.get("min_source_count") or source_floor),
+            source_floor,
+        )
+        merged["min_source_count"] = max(int(merged["min_source_count"]), 1)
+        merged["min_scholarly_sources"] = 0
+        merged["min_novelty_rate"] = 0.0
+        return merged
 
     @classmethod
     def _query_variants(cls, query: str, depth: str = "standard") -> list[str]:
-        """Return short (≤80 char) keyword-phrase query variants suitable for
-        API search calls.  Long essay-style objectives are first decomposed
-        into focused terms before expansion."""
+        """Return query variants generated from objective terms, not fixed templates."""
+        ai_variants = cls._ai_query_variants(query, depth)
+        if ai_variants:
+            return ai_variants
+
         core = cls._query_core_terms(query)
-        lower = core.lower()
-        software_mode = cls._looks_like_software_agent_query(query)
+        if not core:
+            return []
+
+        max_variants = 4 if depth == "quick" else 8 if depth == "standard" else 14
+        axes = [
+            "primary evidence",
+            "methodology",
+            "counterevidence",
+            "uncertainty analysis",
+            "independent verification",
+            "limitations",
+            "comparative analysis",
+            "longitudinal data",
+        ]
         math_mode = cls._looks_like_math_query(query)
-        variants: list[str] = []
-        # Always start with the distilled core phrase.
-        if core:
-            variants.append(core)
+        if cls._looks_like_current_evidence_query(query):
+            axes = [
+                "latest evidence",
+                "current analysis",
+                "timeline",
+                "near-term drivers",
+                "risk scenarios",
+                "independent verification",
+                "counterevidence",
+                "uncertainty analysis",
+            ]
         if math_mode:
-            math_focus = cls._math_focus_terms(query)
-            variants.extend(
-                [
-                    f"{core} theorem",
-                    f"{core} proof barrier",
-                ]
-            )
-            if depth == "multi-hour":
-                variants.extend(
-                    [
-                        f"{core} almost all",
-                        f"{core} finite verification",
-                        f"{core} 2-adic",
-                        f"{core} density results",
-                        "Collatz conjecture unconditional results",
-                    ]
-                )
-            for term in math_focus:
-                if term.lower() == "collatz conjecture":
+            axes = [
+                "theorem barrier",
+                "transfer mechanism",
+                "counterexample search",
+                "formal verification",
+                "independent verification",
+                "limitations",
+            ]
+
+        anchors: list[str] = []
+        anchors.extend(sorted(cls._entity_terms_from_query(query)))
+        for keyword in cls._keywords(query):
+            if len(keyword) < 4:
+                continue
+            if keyword in anchors:
+                continue
+            anchors.append(keyword)
+            if len(anchors) >= 8:
+                break
+        if math_mode:
+            for focus in cls._math_focus_terms(query):
+                focus_term = str(focus).strip().lower()
+                if not focus_term or focus_term in anchors:
                     continue
-                variants.append(
-                    f"Collatz {term}" if "collatz" in query.lower() else term
-                )
-        elif software_mode:
-            if depth in {"standard", "multi-hour"} and core:
-                variants.extend(
-                    [
-                        f"{core} evaluation",
-                        f"{core} benchmark",
-                    ]
-                )
-            if depth == "multi-hour" and core:
-                variants.extend(
-                    [
-                        f"{core} survey",
-                        f"{core} state of the art",
-                        f"{core} limitations safety",
-                        f"{core} implementation framework",
-                        f"{core} systematic review",
-                    ]
-                )
-        else:
-            if depth in {"standard", "multi-hour"} and core:
-                variants.append(f"{core} literature")
-                variants.append(f"{core} prior work")
-            if depth == "multi-hour" and core:
-                variants.extend(
-                    [
-                        f"{core} survey",
-                        f"{core} limitations",
-                        f"{core} open problems",
-                        f"{core} review",
-                    ]
-                )
-        if any(t in lower for t in ("desktop", "computer use", "gui")):
-            variants.append("GUI agent computer use evaluation")
-            variants.append("LLM agent desktop control benchmark")
-        if software_mode:
-            variants.append("LLM autonomous agent WebArena OSWorld")
-            variants.append("autonomous agent planning execution evaluation")
+                anchors.append(focus_term)
+                if len(anchors) >= 12:
+                    break
+        if core not in anchors:
+            anchors.insert(0, core)
+
+        variants: list[str] = [core]
+        for anchor in anchors[:4]:
+            for axis in axes:
+                variants.append(f"{anchor} {axis}")
+                if len(variants) >= max_variants * 3:
+                    break
+            if len(variants) >= max_variants * 3:
+                break
+
         deduped: list[str] = []
         seen: set[str] = set()
         for variant in variants:
-            normalized = cls._normalize_title(variant)
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                deduped.append(variant[:80])
-        return deduped[:8]
+            candidate = variant[:120].strip()
+            if not candidate:
+                continue
+            if cls._is_low_signal_query_variant(candidate, query):
+                continue
+            if cls._is_noisy_query_variant(candidate, query):
+                continue
+            normalized = cls._normalize_title(candidate)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(candidate)
+            if len(deduped) >= max_variants:
+                break
+        return deduped
+
+    @classmethod
+    def _ai_query_variants(cls, query: str, depth: str = "standard") -> list[str]:
+        """Optional AI variant generator.
+
+        This class-level helper intentionally returns an empty list by default,
+        allowing instance-level refinement and evidence-gap analysis to remain
+        the primary adaptive path when no external model is available.
+        """
+        del query, depth
+        return []
 
     @staticmethod
     def _query_core_terms(query: str) -> str:
-        """Distil a (potentially long) query/objective down to a short
-        keyword phrase suitable as an API search string (≤60 chars)."""
-        # Strip known preamble prefixes.
+        """Distill long prompts into domain terms while removing orchestration boilerplate."""
         prefixes = (
+            "Find authoritative sources, direct evidence, and major uncertainties for:",
             "Find authoritative sources, prior systems, and gaps for:",
             "Extract implementation constraints, security boundaries,",
             "Merge worker outputs into a verified research brief for:",
@@ -3212,6 +5249,7 @@ class DeepResearchEngine:
         for prefix in prefixes:
             if cleaned.lower().startswith(prefix.lower()):
                 cleaned = cleaned[len(prefix) :].strip()
+
         cleaned = re.sub(
             (
                 r"\busing\s+https?://[^\s<>()]+"
@@ -3230,9 +5268,14 @@ class DeepResearchEngine:
             flags=re.IGNORECASE,
         )
         boilerplate_patterns = (
-            r"\bbased on\b",
             r"\bperform(?:ing)? deep research on\b",
             r"\bperform research on\b",
+            r"\busing all available [^.;]+",
+            r"\bbrowser or pc evidence [^.;]+",
+            r"\bdurable artifacts\b",
+            r"\bproduce (?:a|an) [^.;]+ report\b",
+            r"\bdo not use (?:a|an) fixed template\b",
+            r"\badapt depth and effort [^.;]+",
             r"\baccepted literature\b",
             r"\bplausible proof strategies\b",
             r"\bfocusing on\b",
@@ -3240,36 +5283,101 @@ class DeepResearchEngine:
             r"\bas anchor sources\b",
             r"\bthen expand outward to\b",
             r"\bcorroborat\w*\b",
-            r"^how to build (?:a|an|the)\b",
-            r"^how to\b",
-            r"^build (?:a|an|the)\b",
         )
         for pattern in boilerplate_patterns:
             cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-")
-        if DeepResearchEngine._looks_like_math_query(cleaned):
-            focus_terms = DeepResearchEngine._math_focus_terms(cleaned)
-            if focus_terms:
-                return " ".join(term.lower() for term in focus_terms[:4])[:70].strip()
-        if DeepResearchEngine._looks_like_software_agent_query(cleaned):
-            software_focus: list[str] = []
-            lower = cleaned.lower()
-            if "deep research" in lower:
-                software_focus.append("deep research agent")
-            elif "research" in lower and "agent" in lower:
-                software_focus.append("research agent")
-            if software_focus:
-                return " ".join(software_focus[:2])[:70].strip()
-        # If still long, take the first sentence or first 60 chars of words.
-        if len(cleaned) > 70:
-            first_sentence = re.split(r"[.!?;]", cleaned)[0].strip()
-            if 10 <= len(first_sentence) <= 70:
-                cleaned = first_sentence
-            else:
-                # Take the first 10 words.
-                words = cleaned.split()
-                cleaned = " ".join(words[:8])
-        return cleaned[:70].strip()
+        if not cleaned:
+            return ""
+
+        if len(cleaned) > 140:
+            stop = {
+                "what",
+                "which",
+                "when",
+                "where",
+                "why",
+                "how",
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "for",
+                "to",
+                "with",
+                "from",
+                "into",
+                "about",
+                "using",
+                "need",
+                "please",
+                "make",
+                "build",
+                "create",
+                "do",
+                "does",
+                "did",
+                "can",
+                "could",
+                "should",
+                "would",
+                "have",
+                "has",
+                "had",
+                "being",
+                "been",
+            }
+            words = [
+                token.strip("?.,!:;")
+                for token in cleaned.split()
+                if token.strip("?.,!:;") and token.strip("?.,!:;").lower() not in stop
+            ]
+            if words:
+                cleaned = " ".join(words)
+
+        return cleaned[:240].strip().lower()
+
+    @staticmethod
+    def _looks_like_current_evidence_query(query: str) -> bool:
+        lower = query.lower()
+        return any(
+            cue in lower
+            for cue in (
+                "as of now",
+                "right now",
+                "current",
+                "currently",
+                "latest",
+                "today",
+                "recent",
+                "near-term",
+                "newest",
+                "this week",
+                "this month",
+                "this year",
+                "market",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_academic_query(query: str) -> bool:
+        lower = query.lower()
+        return any(
+            cue in lower
+            for cue in (
+                "scientific literature",
+                "literature review",
+                "systematic review",
+                "meta-analysis",
+                "peer-reviewed",
+                "scholarly",
+                "paper",
+                "papers",
+                "pubmed",
+                "openalex",
+            )
+        )
 
     @staticmethod
     def _openalex_abstract(inverted_index: dict[str, list[int]]) -> str:
@@ -3357,7 +5465,16 @@ class DeepResearchEngine:
         return (0 if generic else 1, len(cleaned))
 
     # Maximum proportion of final selected sources from any single provider.
+    # Maximum proportion of final selected sources from any single provider.
     _MAX_PROVIDER_FRACTION = 0.5
+
+    # Scoring weights for scholarly sources (openalex/semantic-scholar/crossref).
+    # Named so they can be understood and adjusted without hunting for magic numbers.
+    _SCORE_W_RELEVANCE: float = 54.0
+    _SCORE_W_CITATION: float = 26.0
+    _SCORE_W_RECENCY: float = 8.0
+    _SCORE_W_CREDIBILITY: float = 18.0
+    _SCORE_W_CONTRADICTION: float = 6.0
 
     @classmethod
     def _rank_sources(
@@ -3416,12 +5533,60 @@ class DeepResearchEngine:
         entity_terms: set[str],
         query: str,
     ) -> float:
-        haystack = f"{source.title} {source.abstract}".lower()
+        combined = cls._strip_dom_noise_tokens(f"{source.title} {source.abstract}")
+        if source.provider == "web-search":
+            lower_combined = combined.lower()
+            if any(
+                marker in lower_combined
+                for marker in (
+                    "javascript is disabled",
+                    "verify that you're not a robot",
+                    "verify you are not a robot",
+                    "captcha",
+                    "access denied",
+                    "pardon our interruption",
+                    "--wp--preset--aspect-ratio",
+                    "@charset",
+                )
+            ):
+                source.quality_flags = [*(source.quality_flags or []), "bot-wall"]
+                source.score = 0.0
+                return 0.0
+            unavailable = "snippet-unavailable" in (source.quality_flags or [])
+            ticker_hits = len(
+                _extract_ticker_candidates(f"{source.title} {source.abstract}")
+            )
+            if unavailable and ticker_hits == 0:
+                source.quality_flags = [*(source.quality_flags or []), "low-signal-web"]
+                source.score = 0.0
+                return 0.0
+        if cls._has_dom_noise_pattern(source.title) and cls._has_dom_noise_pattern(
+            source.abstract
+        ):
+            source.quality_flags = [*(source.quality_flags or []), "dom-noise"]
+            source.score = 0.0
+            return 0.0
+        # Allow sources that directly contain an entity term even when the
+        # deterministic anchor-overlap gate would reject them (e.g. a repo
+        # that is named after one of the queried systems but whose abstract
+        # doesn't also contain a second anchor word).
+        entity_terms_pre = cls._entity_terms_from_query(query)
+        haystack_pre = combined.lower()
+        entity_hits_pre = sum(1 for t in entity_terms_pre if t in haystack_pre)
+        gate_allowed = cls._passes_deterministic_semantic_gate(combined, query) or (
+            entity_hits_pre >= 1
+        )
+        if not gate_allowed:
+            source.quality_flags = [*(source.quality_flags or []), "off-topic"]
+            source.score = 0.0
+            return 0.0
+        haystack = combined.lower()
+        objective_alignment = cls._objective_alignment_score(haystack, query)
         entity_hits = sum(1 for t in entity_terms if t in haystack)
         entity_relevance = entity_hits / max(len(entity_terms), 1)
         distinctive_hits = sum(1 for t in distinctive_terms if t in haystack)
         term_relevance = distinctive_hits / max(len(distinctive_terms), 1)
-        relevance = max(entity_relevance, term_relevance)
+        relevance = max(entity_relevance, term_relevance, objective_alignment)
         recency = cls._recency_score(source.year)
         citation_strength = min(source.citation_count, 1000) / 1000
         credibility_score, credibility_penalty, quality_flags = cls._source_credibility(
@@ -3436,6 +5601,8 @@ class DeepResearchEngine:
         source.credibility_score = credibility_score
         source.contradiction_risk = contradiction
         source.quality_flags = quality_flags
+        if objective_alignment < 0.22:
+            source.quality_flags.append("off-topic")
         if source.provider == "gemini-flash":
             source.relevance = max(relevance, 0.65)
             source.credibility_score = max(credibility_score, 0.7)
@@ -3443,6 +5610,28 @@ class DeepResearchEngine:
             base = 80.0 + recency * 6.0 - contradiction * 4.0
             source.score = base
             return base
+        if source.provider == "web-search":
+            # Web sources: relevance + recency are the primary quality signals.
+            # Citation count is meaningless for news / market / general-web
+            # pages, so we exclude it from the formula.  Recency weight is
+            # doubled relative to the scholarly formula because timeliness is
+            # web-search's unique contribution that academic sources cannot
+            # provide.  The resulting score range is competitive with scholarly
+            # so that a highly relevant news article is not automatically
+            # outranked by a tangentially related academic paper.
+            if relevance <= 0.0 and objective_alignment < 0.15:
+                source.score = 0.0
+                return 0.0
+            base = (
+                relevance * cls._SCORE_W_RELEVANCE
+                + recency * cls._SCORE_W_RECENCY * 2.0
+                + credibility_score * cls._SCORE_W_CREDIBILITY
+                - contradiction * cls._SCORE_W_CONTRADICTION
+                - credibility_penalty
+            )
+            source.score = max(base, 0.0)
+            source.evidence_grade = cls._evidence_grade(source)
+            return source.score
         if source.provider in {"openalex", "semantic-scholar", "crossref"}:
             # Scholarly sources: citation strength counts heavily; relevance
             # is softened so a partially relevant paper isn't ejected.
@@ -3457,13 +5646,16 @@ class DeepResearchEngine:
                 if hits < 2:
                     source.score = 0.0
                     return 0.0
+            if objective_alignment < 0.22 and entity_hits == 0:
+                source.score = 0.0
+                return 0.0
             effective_relevance = max(relevance, 0.1 if entity_hits else 0.0)
             base = (
-                effective_relevance * 54.0
-                + citation_strength * 26.0
-                + recency * 8.0
-                + credibility_score * 18.0
-                - contradiction * 6.0
+                effective_relevance * cls._SCORE_W_RELEVANCE
+                + citation_strength * cls._SCORE_W_CITATION
+                + recency * cls._SCORE_W_RECENCY
+                + credibility_score * cls._SCORE_W_CREDIBILITY
+                - contradiction * cls._SCORE_W_CONTRADICTION
                 - credibility_penalty
             )
             if source.provider == "semantic-scholar":
@@ -3487,6 +5679,9 @@ class DeepResearchEngine:
             if entity_terms and entity_hits == 0 and benchmark_hits == 0:
                 source.score = 0.0
                 return 0.0
+            if objective_alignment < 0.2 and entity_hits == 0:
+                source.score = 0.0
+                return 0.0
             # Repos get a lower base ceiling than scholarly sources so they
             # don't crowd out papers; they still win when they are directly
             # about the queried entity.
@@ -3507,6 +5702,8 @@ class DeepResearchEngine:
         # software-reference and other providers
         source.evidence_grade = cls._evidence_grade(source)
         base = 20.0 + relevance * 20.0 + credibility_score * 6.0
+        if objective_alignment < 0.12:
+            base = max(base - 12.0, 0.0)
         source.score = base
         return base
 
@@ -3551,6 +5748,7 @@ class DeepResearchEngine:
             source.year is not None
             and source.year >= current_year - 1
             and source.citation_count == 0
+            and source.provider not in {"web-search", "gemini-flash"}
         ):
             penalty += 4.0
             flags.append("recent-uncited")
@@ -3608,67 +5806,27 @@ class DeepResearchEngine:
             penalty += 8.0
             flags.append("package-like-source")
 
-        if cls._looks_like_math_query(query):
-            accepted_markers = (
-                "almost all",
-                "bounded values",
-                "stopping time",
-                "stopping times",
-                "2-adic",
-                "p-adic",
-                "de bruijn",
-                "verification limit",
-                "finite verification",
-                "density",
-                "orbits",
-                "conjugacy",
-            )
-            if any(
-                marker in title or marker in abstract for marker in accepted_markers
-            ):
-                credibility += 0.12
-            speculative_markers = (
-                "is true for all positive integers",
-                "complete resolution",
-                "conquered by",
-                "complete hand-verification",
-                "proof-completion",
-                "final gate",
-                "active-route",
-                "blur-knob",
-                "settles the collatz conjecture",
-                "we prove the collatz conjecture",
-                "proof of the collatz conjecture",
-                "complete proof of the collatz conjecture",
-                "human-llm collaboration",
-            )
-            unsupported_proof_title_markers = (
-                "proof of the collatz conjecture",
-                "solution to the collatz conjecture",
-                "solves the collatz conjecture",
-                "collatz conjecture is true",
-                "resolution of the collatz conjecture",
-                "block format solves the collatz conjecture",
-                "human-llm collaboration",
-            )
-            if (
-                "collatz" in query.lower()
-                and any(marker in title for marker in unsupported_proof_title_markers)
-                and source.citation_count <= 2
-            ):
-                penalty += 22.0
-                flags.append("unsupported-proof-title")
-            if (
-                source.citation_count == 0
-                and source.year is not None
-                and source.year >= current_year - 1
-                and any(
-                    marker in title or marker in abstract
-                    for marker in speculative_markers
-                )
-            ):
-                penalty += 26.0
-                flags.append("speculative-proof-claim")
+        # Detect speculative proof claims: zero-citation recent papers whose
+        # title or abstract claims a complete proof of a known open problem.
+        speculative_proof_patterns = (
+            "proof of the",
+            "proves the",
+            "proves that",
+            "conjecture is true",
+            "conjecture is solved",
+            "conjecture is proved",
+            "conjecture is proven",
+            "we prove the conjecture",
+            "we have proved",
+            "has been proved completely",
+            "completely for all positive integers",
+            "completely for all integers",
+        )
+        if source.citation_count == 0 and any(
+            p in title or p in abstract for p in speculative_proof_patterns
+        ):
+            penalty += 10.0
+            flags.append("speculative-proof-claim")
 
         credibility = max(0.0, min(credibility, 1.0))
         return credibility, penalty, flags
@@ -3709,8 +5867,33 @@ class DeepResearchEngine:
         by_provider: dict[str, list[ResearchSource]] = {}
         for source in capped:
             by_provider.setdefault(source.provider, []).append(source)
+        for provider_sources in by_provider.values():
+            provider_sources.sort(key=lambda source: source.score, reverse=True)
 
         selected: list[ResearchSource] = []
+        provider_minimum = 3 if max_sources >= 18 else 2
+
+        # Stabilize provider diversity early with a round-robin pass.
+        provider_order = sorted(
+            by_provider,
+            key=lambda provider: (-(by_provider[provider][0].score), provider),
+        )
+        while len(selected) < max_sources:
+            progressed = False
+            represented = {item.provider for item in selected}
+            for provider in provider_order:
+                bucket = by_provider.get(provider) or []
+                if not bucket:
+                    continue
+                if len(represented) >= provider_minimum and provider not in represented:
+                    continue
+                selected.append(bucket.pop(0))
+                represented.add(provider)
+                progressed = True
+                if len(selected) >= max_sources:
+                    break
+            if not progressed:
+                break
 
         def append_preferred(
             provider: str,
@@ -3743,12 +5926,41 @@ class DeepResearchEngine:
         if DeepResearchEngine._looks_like_software_agent_query(query):
             append_preferred("github-repositories")
 
+        # For current-evidence tasks, preserve at least one tool observation
+        # when available so runs do not collapse into a single-provider web
+        # monoculture.
+        if DeepResearchEngine._looks_like_current_evidence_query(
+            query
+        ) and not DeepResearchEngine._looks_like_academic_query(query):
+            append_preferred(
+                "gemini-flash",
+                lambda source: (
+                    DeepResearchEngine._objective_alignment_score(
+                        f"{source.title} {source.abstract}",
+                        query,
+                    )
+                    >= 0.22
+                ),
+            )
+
         # Fill remaining slots by global ranking while avoiding duplicates.
         selected_urls = {s.url for s in selected}
         for source in capped:
             if len(selected) >= max_sources:
                 break
             if source.url in selected_urls:
+                continue
+            if "off-topic" in (source.quality_flags or []):
+                continue
+            if (
+                DeepResearchEngine._objective_alignment_score(
+                    f"{source.title} {source.abstract}",
+                    query,
+                )
+                < 0.22
+            ):
+                continue
+            if source.relevance < 0.1 and source.credibility_score < 0.3:
                 continue
             selected.append(source)
             selected_urls.add(source.url)
@@ -3893,14 +6105,81 @@ class DeepResearchEngine:
             and source.citation_strength >= 0.02
         ):
             return "moderate"
+        # For web-search sources on current-evidence queries the primary
+        # signal is relevance alone (no citation count).  Lower the threshold
+        # so that on-topic news / market pages are not universally "weak".
+        if (
+            source.provider == "web-search"
+            and source.relevance >= 0.35
+            and source.credibility_score >= 0.35
+        ):
+            return "moderate"
         return "weak"
+
+    @staticmethod
+    def _objective_anchor_terms(query: str) -> set[str]:
+        stopwords = {
+            "about",
+            "across",
+            "after",
+            "also",
+            "analysis",
+            "and",
+            "best",
+            "current",
+            "for",
+            "from",
+            "highest",
+            "latest",
+            "now",
+            "potential",
+            "research",
+            "review",
+            "soar",
+            "that",
+            "the",
+            "their",
+            "these",
+            "this",
+            "through",
+            "today",
+            "using",
+            "what",
+            "with",
+        }
+        return {
+            token
+            for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower())
+            if token not in stopwords
+        }
+
+    @classmethod
+    def _objective_alignment_score(cls, text: str, query: str) -> float:
+        anchors = cls._objective_anchor_terms(query)
+        if not anchors:
+            return 1.0
+        words = {token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", text.lower())}
+        if not words:
+            return 0.0
+        overlap = len(anchors & words)
+        # Reward overlap but stay conservative unless there are multiple matches.
+        return min(overlap / max(min(len(anchors), 4), 1), 1.0)
 
     @classmethod
     def _is_low_signal_query_variant(cls, variant: str, query: str = "") -> bool:
         lower = variant.lower().strip()
         if not lower:
             return True
+        if cls._has_dom_noise_pattern(variant):
+            return True
         if "http://" in lower or "https://" in lower or "www." in lower:
+            return True
+        # Reject malformed search-operator fragments produced by AI hallucination
+        # e.g. "stocks right site- first content", "best undervalued site- first"
+        if re.search(r"\bsite[-:]\s", lower):
+            return True
+        # Reject scraped navigation/UI noise suffixes
+        if re.search(r"\b(before content|first content|site-first)\b", lower):
             return True
         if cls._looks_like_math_query(query):
             if any(
@@ -3935,38 +6214,140 @@ class DeepResearchEngine:
             "knob",
             "aux",
             "demo",
+            # JS/browser error page tokens
+            "javascript",
+            "function",
+            "pardon",
+            "captcha",
+            "cloudflare",
+            "cookies",
+            "forbidden",
+            "interruption",
+            "redirect",
+            # CSS layout/style tokens observed in scraped page noise
+            "wrapper",
+            "nreum",
+            "prototype",
+            "exports",
+            "font-weight",
+            "font-size",
+            "overflow",
+            "margin",
         }
         words = re.findall(r"\b[a-z0-9.-]+\b", lower)
         if len(words) < 2:
             return True
+        if query and cls._objective_alignment_score(lower, query) < 0.2:
+            return True
         noise_hits = sum(1 for word in words if word in noise_tokens)
         return noise_hits >= 2 and noise_hits >= max(2, len(words) // 2)
+
+    @classmethod
+    def _is_noisy_query_variant(cls, variant: str, query: str = "") -> bool:
+        lower = variant.lower().strip()
+        if cls._has_dom_noise_pattern(variant):
+            return True
+        words = re.findall(r"\b[a-z][a-z0-9-]{1,}\b", lower)
+        if len(words) < 2:
+            return True
+
+        software_mode = cls._looks_like_software_agent_query(query)
+        if not software_mode:
+            code_noise_tokens = {
+                "const",
+                "navigator",
+                "document",
+                "window",
+                "javascript",
+                "typescript",
+                "react",
+                "css",
+                "html",
+                "webpack",
+                "npm",
+                "node",
+                "function",
+                "pardon",
+                "captcha",
+                "cloudflare",
+                "forbidden",
+                "browser",
+                # CSS layout/style tokens seen in scraped page noise
+                "wrapper",
+                "font-weight",
+                "font-size",
+                "display",
+                "height",
+                "width",
+                "padding",
+                "margin",
+                "overflow",
+                # JS analytics / error page tokens
+                "nreum",
+                "prototype",
+                "exports",
+                "molluscum",  # medical spam that appeared in scraped content
+                "lesions",
+                "optomechanics",  # irrelevant physics from scraped abstracts
+                # Yahoo Finance / CMS layout artifacts seen in runtime contamination
+                "storywithleadvideo",
+                "storywith",
+                "leadvideo",
+                "flexi",
+                "nimbus",
+                "calendar",
+            }
+            if sum(1 for word in words if word in code_noise_tokens) >= 1:
+                return True
+
+        query_tokens = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower()))
+        rare_letters = set("qxzjkvwy")
+        for word in words:
+            if len(word) < 6 or word in query_tokens:
+                continue
+            rare_ratio = sum(1 for ch in word if ch in rare_letters) / len(word)
+            if rare_ratio >= 0.5:
+                return True
+
+        anchors = cls._objective_anchor_terms(query)
+        if anchors and not any(anchor in lower for anchor in anchors):
+            return True
+        return False
 
     @staticmethod
     def _looks_like_software_agent_query(query: str) -> bool:
         lower = query.lower()
-        markers = (
+        explicit_markers = (
             "agentos",
-            "analyst system",
-            "browser research",
             "computer use",
             "desktop agent",
-            "deep research",
             "github",
-            "literature review agent",
             "local pc",
-            "market intelligence",
             "openclaw",
             "opencode",
             "openhands",
             "orchestrator",
             "pc agent",
             "research agent",
-            "safety-critical",
             "software agent",
-            "technical due diligence",
+            "deep research agent",
         )
-        return any(marker in lower for marker in markers)
+        if any(marker in lower for marker in explicit_markers):
+            return True
+        return bool(
+            re.search(
+                (
+                    r"\b(build|implement|implementation|architecture|runtime|"
+                    r"framework|sdk|api|repository|repositories|open[- ]source|"
+                    r"code|package|library)\b"
+                ),
+                lower,
+            )
+            and re.search(
+                r"\b(agent|orchestrator|desktop|browser|workflow|tool)\b",
+                lower,
+            )
+        )
 
     @staticmethod
     def _looks_like_math_query(query: str) -> bool:
@@ -3989,37 +6370,39 @@ class DeepResearchEngine:
 
     @staticmethod
     def _math_focus_terms(query: str) -> list[str]:
-        lower = query.lower()
-        focus_map = (
-            ("collatz conjecture", "Collatz conjecture"),
-            ("collatz bridge", "Collatz bridge"),
-            ("collatz", "Collatz conjecture"),
-            ("almost-all", "almost all"),
-            ("almost all", "almost all"),
-            ("finite verification", "finite verification"),
-            ("universal theorem", "universal theorem"),
-            ("lemma ub", "Lemma UB"),
-            ("2-adic conjugacy", "2-adic conjugacy"),
-            ("2-adic", "2-adic"),
-            ("deterministic pointwise transfer", "pointwise transfer"),
-            ("mechanical carry forcing", "mechanical carry forcing"),
-            ("peel-chain no-crossing", "peel-chain no-crossing"),
-            ("ostrowski return-block cocycles", "Ostrowski return-block cocycles"),
-            ("ostrowski", "Ostrowski"),
-            ("critical-density boundary", "critical density"),
-            ("critical density", "critical density"),
-            ("lopez-stoll", "Lopez-Stoll"),
-            ("infinity-to-finite", "infinity-to-finite transfer"),
-            ("hard theorems", "hard theorems"),
+        """Extract high-signal mathematical focus terms from the objective text."""
+        tokens = re.findall(r"\b[a-zA-Z0-9-]{3,}\b", query.lower())
+        keepers: list[str] = []
+        for token in tokens:
+            if token in {
+                "collatz",
+                "conjecture",
+                "theorem",
+                "lemma",
+                "proof",
+                "bridge",
+                "density",
+                "verification",
+                "transfer",
+                "ostrowski",
+                "residue",
+                "2-adic",
+            }:
+                if token not in keepers:
+                    keepers.append(token)
+        compounds = (
+            "2-adic conjugacy",
+            "critical density",
+            "pointwise transfer",
+            "finite verification",
+            "almost all",
+            "return-block cocycles",
         )
-        focused: list[str] = []
-        seen: set[str] = set()
-        for marker, label in focus_map:
-            if marker not in lower or label in seen:
-                continue
-            focused.append(label)
-            seen.add(label)
-        return focused
+        lower = query.lower()
+        for phrase in compounds:
+            if phrase in lower and phrase not in keepers:
+                keepers.append(phrase)
+        return keepers[:12]
 
     @staticmethod
     def _software_reference_sources(query: str) -> list[ResearchSource]:
@@ -4084,10 +6467,35 @@ class DeepResearchEngine:
         provider_count = len({source.provider for source in sources})
         citation_total = sum(source.citation_count for source in sources)
         citation_bonus = min(citation_total, 500)
-        confidence = 0.55 + min(len(sources), 10) * 0.025
-        confidence += provider_count * 0.05
-        confidence += citation_bonus / 5000
-        return min(confidence, 0.92)
+        weak_ratio = sum(
+            1 for source in sources if source.evidence_grade == "weak"
+        ) / max(
+            len(sources),
+            1,
+        )
+        off_topic_ratio = sum(
+            1 for source in sources if "off-topic" in (source.quality_flags or [])
+        ) / max(len(sources), 1)
+        avg_credibility = sum(source.credibility_score for source in sources) / max(
+            len(sources),
+            1,
+        )
+        avg_relevance = sum(source.relevance for source in sources) / max(
+            len(sources),
+            1,
+        )
+        contradiction = max(
+            (source.contradiction_risk for source in sources), default=0.0
+        )
+        confidence = 0.44 + min(len(sources), 12) * 0.018
+        confidence += min(provider_count, 6) * 0.035
+        confidence += citation_bonus / 7000
+        confidence += max(avg_credibility - 0.45, 0.0) * 0.16
+        confidence += max(avg_relevance - 0.4, 0.0) * 0.12
+        confidence -= weak_ratio * 0.28
+        confidence -= off_topic_ratio * 0.24
+        confidence -= contradiction * 0.1
+        return max(0.2, min(confidence, 0.89))
 
 
 def _sentences(text: str) -> list[str]:

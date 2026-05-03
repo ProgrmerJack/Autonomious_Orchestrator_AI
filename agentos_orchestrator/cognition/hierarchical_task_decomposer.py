@@ -205,106 +205,141 @@ class HierarchicalTaskDecomposer:
         state: AbstractUIState | None,
     ) -> TaskHierarchy | None:
         """Match objective against known high-level patterns."""
+        research_cues = {"research", "compare", "find the best", "evaluate", "choose"}
+        signup_cues = {"sign up", "register", "create account", "join"}
+        form_cues = {"fill", "input", "enter", "map", "import", "upload"}
+        open_cues = {"open", "launch", "start"}
+        open_use_cues = {"use", "with", "and then"}
+        tool_cues = {
+            "run",
+            "execute",
+            "script",
+            "code",
+            "terminal",
+            "command",
+            "automate",
+            "batch",
+            "pipeline",
+            "compute",
+            "calculate",
+        }
+        quant_cues = {
+            "analyse",
+            "analyze",
+            "analysis",
+            "stock",
+            "market",
+            "quant",
+            "quantitative",
+            "data",
+            "statistics",
+            "forecast",
+            "volatility",
+            "portfolio",
+            "trading",
+            "price",
+            "chart",
+            "regression",
+            "correlation",
+            "backtest",
+            "var",
+            "sharpe",
+            "financial",
+        }
+        file_cues = {"save", "export", "download", "move", "copy", "delete", "rename"}
+        content_cues = {"write", "create", "draw", "make", "generate", "compose"}
+        search_cues = {"search", "find", "look up", "query"}
+        extract_cues = {"extract", "get", "retrieve", "copy"}
 
-        # Pattern: Research + Compare + Select
-        if any(
-            kw in lower
-            for kw in {"research", "compare", "find the best", "evaluate", "choose"}
+        candidates: list[tuple[float, str]] = []
+
+        research_score = self._signal_ratio(lower, research_cues)
+        if research_score > 0:
+            candidates.append((0.65 + 0.35 * research_score, "research"))
+
+        signup_score = self._signal_ratio(lower, signup_cues)
+        if signup_score > 0:
+            candidates.append((0.66 + 0.34 * signup_score, "signup"))
+
+        form_score = self._signal_ratio(lower, form_cues)
+        if form_score > 0:
+            candidates.append((0.6 + 0.3 * form_score, "form"))
+
+        if (
+            self._signal_ratio(lower, open_cues) > 0
+            and self._signal_ratio(lower, open_use_cues) > 0
         ):
+            combo = min(
+                1.0,
+                self._signal_ratio(lower, open_cues)
+                + self._signal_ratio(lower, open_use_cues),
+            )
+            candidates.append((0.68 + 0.26 * combo, "open_use"))
+
+        tool_score = self._signal_ratio(lower, tool_cues)
+        quant_score = self._signal_ratio(lower, quant_cues)
+        explicit_command_cues = {"run", "execute", "command", "script", "pipeline"}
+        explicit_command_score = self._signal_ratio(lower, explicit_command_cues)
+        if tool_score > 0:
+            tool_priority = 0.64 + 0.26 * tool_score + 0.2 * explicit_command_score
+            candidates.append((min(0.96, tool_priority), "tool"))
+
+        file_score = self._signal_ratio(lower, file_cues)
+        if file_score > 0:
+            candidates.append((0.62 + 0.25 * file_score, "file"))
+
+        content_score = self._signal_ratio(lower, content_cues)
+        if content_score > 0:
+            candidates.append((0.6 + 0.25 * content_score, "content"))
+
+        if (
+            self._signal_ratio(lower, search_cues) > 0
+            and self._signal_ratio(lower, extract_cues) > 0
+        ):
+            combo = min(
+                1.0,
+                self._signal_ratio(lower, search_cues)
+                + self._signal_ratio(lower, extract_cues),
+            )
+            candidates.append((0.67 + 0.27 * combo, "search_extract"))
+
+        if quant_score > 0:
+            analysis_penalty = 0.18 * explicit_command_score
+            candidates.append(
+                (max(0.5, 0.7 + 0.25 * quant_score - analysis_penalty), "analysis")
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        winner = candidates[0][1]
+        if winner == "research":
             return self._build_research_hierarchy(objective)
-
-        # Pattern: Sign Up / Register
-        if any(kw in lower for kw in {"sign up", "register", "create account", "join"}):
+        if winner == "signup":
             return self._build_signup_hierarchy(objective)
-
-        # Pattern: Fill Form / Input Data
-        if any(
-            kw in lower for kw in {"fill", "input", "enter", "map", "import", "upload"}
-        ):
+        if winner == "form":
             return self._build_form_hierarchy(objective)
-
-        # Pattern: Open + Use + Close
-        if any(kw in lower for kw in {"open", "launch", "start"}) and any(
-            kw in lower for kw in {"use", "with", "and then"}
-        ):
+        if winner == "open_use":
             return self._build_open_use_hierarchy(objective)
-
-        # Pattern: Tool Use / Script Execution  (checked BEFORE file_op so that
-        # "run a batch rename script" or "execute pipeline" wins over file-op)
-        if any(
-            kw in lower
-            for kw in {
-                "run",
-                "execute",
-                "script",
-                "code",
-                "terminal",
-                "command",
-                "automate",
-                "batch",
-                "pipeline",
-                "compute",
-                "calculate",
-            }
-        ) and not any(
-            # Don't intercept when the context is clearly data/quant-only
-            kw in lower
-            for kw in {"stock", "market", "portfolio", "financial", "trading"}
-        ):
+        if winner == "tool":
             return self._build_tool_use_hierarchy(objective)
-
-        # Pattern: File Operations
-        if any(
-            kw in lower
-            for kw in {"save", "export", "download", "move", "copy", "delete", "rename"}
-        ):
+        if winner == "file":
             return self._build_file_op_hierarchy(objective)
-
-        # Pattern: Content Creation
-        if any(
-            kw in lower
-            for kw in {"write", "create", "draw", "make", "generate", "compose"}
-        ):
+        if winner == "content":
             return self._build_content_hierarchy(objective)
-
-        # Pattern: Search + Extract
-        if any(kw in lower for kw in {"search", "find", "look up", "query"}) and any(
-            kw in lower for kw in {"extract", "get", "retrieve", "copy"}
-        ):
+        if winner == "search_extract":
             return self._build_search_extract_hierarchy(objective)
-
-        # Pattern: Quantitative / Data Analysis
-        # This is THE most important new pattern: recognising when the agent should
-        # write code rather than click a UI.
-        if any(
-            kw in lower
-            for kw in {
-                "analyse",
-                "analyze",
-                "analysis",
-                "stock",
-                "market",
-                "quant",
-                "quantitative",
-                "data",
-                "statistics",
-                "forecast",
-                "volatility",
-                "portfolio",
-                "trading",
-                "price",
-                "chart",
-                "regression",
-                "correlation",
-                "backtest",
-                "var",
-                "sharpe",
-                "financial",
-            }
-        ):
+        if winner == "analysis":
             return self._build_analysis_hierarchy(objective)
-
         return None
+
+    @staticmethod
+    def _signal_ratio(text: str, cues: set[str]) -> float:
+        if not cues:
+            return 0.0
+        hits = sum(1 for cue in cues if cue in text)
+        return hits / max(len(cues), 1)
 
     def _build_research_hierarchy(self, objective: str) -> TaskHierarchy:
         """Decompose research objectives: Research X, compare, select best."""

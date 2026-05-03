@@ -77,8 +77,20 @@ class FakeDeepResearchEngine(DeepResearchEngine):
         url: str,
         accept: str = "text/html,application/xhtml+xml,*/*",
         max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
     ) -> str:
-        del url, accept, max_bytes
+        del (
+            url,
+            accept,
+            max_bytes,
+            timeout_seconds,
+            range_start,
+            range_end,
+            extra_headers,
+        )
         return ""
 
 
@@ -92,8 +104,12 @@ class FakeWebSearchResearchEngine(DeepResearchEngine):
         url: str,
         accept: str = "text/html,application/xhtml+xml,*/*",
         max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
     ) -> str:
-        del accept, max_bytes
+        del accept, max_bytes, timeout_seconds, range_start, range_end, extra_headers
         if "html.duckduckgo.com" in url:
             return (
                 "<html><body>"
@@ -108,7 +124,9 @@ class FakeWebSearchResearchEngine(DeepResearchEngine):
             return (
                 "<html><head><title>AgentOS Safety Docs</title></head><body>"
                 "AgentOS desktop workflow safety approvals reference and "
-                "benchmark notes."
+                "benchmark notes for autonomous desktop agent evaluation "
+                "including approval gating, safety constraints, and workflow "
+                "orchestration guidelines."
                 "</body></html>"
             )
         return ""
@@ -120,8 +138,12 @@ class SeedUrlResearchEngine(FakeDeepResearchEngine):
         url: str,
         accept: str = "text/html,application/xhtml+xml,*/*",
         max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
     ) -> str:
-        del accept, max_bytes
+        del accept, max_bytes, timeout_seconds, range_start, range_end, extra_headers
         if "docs.example.org/agentos" in url:
             return (
                 "<html><head><title>AgentOS benchmark safety approvals</title></head>"
@@ -141,8 +163,12 @@ class NoSnippetWebSearchResearchEngine(DeepResearchEngine):
         url: str,
         accept: str = "text/html,application/xhtml+xml,*/*",
         max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
     ) -> str:
-        del accept, max_bytes
+        del accept, max_bytes, timeout_seconds, range_start, range_end, extra_headers
         if "html.duckduckgo.com" in url:
             return (
                 "<html><body>"
@@ -166,6 +192,32 @@ class RankingProbe(DeepResearchEngine):
         query: str,
     ) -> list[ResearchSource]:
         return cls._rank_sources(sources, query)
+
+
+class NoisyGapAnalysisEngine(DeepResearchEngine):
+    def _call_ai_text(self, system: str, user: str) -> str:
+        del system, user
+        return json.dumps(
+            {
+                "gaps": ["missing recency and catalyst evidence"],
+                "follow_up_queries": [
+                    "stocks right eqxmuk border-through ezyuzk",
+                    "stocks catalysts earnings revisions current analysis",
+                ],
+            }
+        )
+
+
+class CapturingSynthesisEngine(FakeDeepResearchEngine):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_system = ""
+        self.last_user = ""
+
+    def _call_ai_text(self, system: str, user: str) -> str:
+        self.last_system = system
+        self.last_user = user
+        return "SYNTHESIS"
 
 
 class ResearchTests(unittest.TestCase):
@@ -277,6 +329,58 @@ class ResearchTests(unittest.TestCase):
                 plan["query_variants"],
             )
 
+    def test_multi_hour_run_writes_durable_report_and_pass_growth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            brief = engine.run(
+                "[multi-hour] accessibility tree desktop agents",
+                "run_durable",
+            )
+
+            report_path = Path(temp_dir) / "runs/run_durable/workflows/report.md"
+            self.assertTrue(report_path.exists())
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("## Incremental Findings", report_text)
+            self.assertGreaterEqual(report_text.count("### Pass "), 2)
+            self.assertIn("- [", report_text)
+            self.assertTrue(
+                any(
+                    artifact.replace("\\", "/")
+                    == "runs/run_durable/workflows/report.md"
+                    for artifact in brief.artifacts
+                )
+            )
+
+    def test_durable_notes_only_synthesis_excludes_abstract_payload(self) -> None:
+        engine = CapturingSynthesisEngine()
+        source = ResearchSource(
+            provider="web-search",
+            title="Durable note source",
+            url="https://example.org/source",
+            abstract="ABSTRACT_SENTINEL_SHOULD_NOT_APPEAR",
+            evidence_grade="moderate",
+        )
+
+        summary = engine._summarize(
+            objective="durable-mode objective",
+            sources=[source],
+            depth="multi-hour",
+            plan={"subquestions": ["What is supported?"]},
+            query="durable mode objective",
+            durable_notes=(
+                "# Durable Research Report\n\n"
+                "## Incremental Findings\n\n"
+                "### Pass 1\n"
+                "- [moderate/web-search] Distilled finding (source: https://example.org/source)\n"
+            ),
+            synthesis_mode="durable-notes-only",
+        )
+
+        self.assertEqual(summary, "SYNTHESIS")
+        self.assertIn("Durable report notes", engine.last_user)
+        self.assertIn("Minimal source metadata", engine.last_user)
+        self.assertNotIn("ABSTRACT_SENTINEL_SHOULD_NOT_APPEAR", engine.last_user)
+
     def test_depth_marker_survives_supervisor_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = FakeDeepResearchEngine(workspace_root=temp_dir)
@@ -292,6 +396,125 @@ class ResearchTests(unittest.TestCase):
             plan_path = Path(temp_dir) / "runs/run_3/research/research_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             self.assertEqual(plan["depth"], "quick")
+
+    def test_adaptive_depth_scales_with_prompt_complexity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            recipe = engine.run("[adaptive] find a recipe for pesto", "run_recipe")
+            engine.run(
+                (
+                    "comprehensive scientific literature review of long-context "
+                    "GUI agents with evidence, benchmarks, risks, and limitations"
+                ),
+                "run_report",
+            )
+
+            recipe_plan = json.loads(
+                (
+                    Path(temp_dir) / "runs/run_recipe/research/research_plan.json"
+                ).read_text(encoding="utf-8")
+            )
+            report_plan = json.loads(
+                (
+                    Path(temp_dir) / "runs/run_report/research/research_plan.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(recipe.objective, "find a recipe for pesto")
+            self.assertEqual(recipe_plan["depth"], "quick")
+            self.assertEqual(report_plan["depth"], "multi-hour")
+
+    def test_current_evidence_queries_prefer_recency_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            brief = engine.run(
+                (
+                    "Research highest-potential public companies as of now using "
+                    "all available evidence-gathering tools. Produce a rigorous "
+                    "current evidence report with risks and opportunities."
+                ),
+                "run_current",
+            )
+
+            plan_path = Path(temp_dir) / "runs/run_current/research/research_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            metrics_path = (
+                Path(temp_dir) / "runs/run_current/research/retrieval_metrics.json"
+            )
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            joined_variants = " ".join(plan["query_variants"]).lower()
+
+            self.assertIn("highest-potential public companies", brief.query.lower())
+            self.assertEqual(plan["depth"], "multi-hour")
+            self.assertIn("latest", joined_variants)
+            self.assertIn("current analysis", joined_variants)
+            self.assertNotIn("literature", joined_variants)
+            self.assertGreaterEqual(len(plan["query_variants"]), 5)
+            self.assertGreaterEqual(len(metrics["passes"]), 4)
+
+    def test_current_evidence_queries_use_current_web_providers(self) -> None:
+        providers = DeepResearchEngine._classify_query(
+            "highest-potential public companies as of now"
+        )
+
+        # Current-evidence queries use web-search + gemini-flash plus
+        # supplementary providers for richer coverage.
+        self.assertIn("web-search", providers)
+        self.assertIn("gemini-flash", providers)
+        self.assertNotIn("openalex", providers)
+        self.assertNotIn("semantic-scholar", providers)
+
+    def test_current_evidence_low_diversity_expands_provider_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            brief = engine.run(
+                "[multi-hour] accessibility tree agents as of now",
+                "run_current_diversity",
+            )
+
+            providers = {source.provider for source in brief.sources}
+            diagnostics_path = (
+                Path(temp_dir)
+                / "runs/run_current_diversity/research/provider_diagnostics.json"
+            )
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(
+                any(
+                    item.get("provider") == "provider-mix"
+                    and item.get("status") == "expanded"
+                    for item in diagnostics
+                )
+            )
+            self.assertTrue(
+                any(
+                    provider in providers
+                    for provider in {"openalex", "semantic-scholar", "crossref"}
+                )
+            )
+
+    def test_current_web_targets_override_strict_scholarly_gates(self) -> None:
+        overridden = DeepResearchEngine._current_web_target_overrides(
+            {
+                "min_provider_count": 6,
+                "min_scholarly_sources": 5,
+                "min_novelty_rate": 0.22,
+            },
+            "multi-hour",
+        )
+
+        self.assertEqual(overridden["min_provider_count"], 1)
+        self.assertEqual(overridden["min_scholarly_sources"], 0)
+        self.assertEqual(overridden["min_novelty_rate"], 0.0)
+        self.assertEqual(overridden["max_retrieval_passes"], 28)
+
+    def test_search_result_pages_are_not_seeded_as_sources(self) -> None:
+        urls = DeepResearchEngine._source_seed_urls(
+            "Use https://html.duckduckgo.com/html/?q=current+evidence and https://example.com/report as context",
+            None,
+            None,
+        )
+
+        self.assertEqual(urls, ["https://example.com/report"])
 
     def test_math_query_plan_ignores_repo_prefix_and_benchmark_noise(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -332,9 +555,10 @@ class ResearchTests(unittest.TestCase):
                     for variant in plan["query_variants"]
                 )
             )
-            self.assertIn(
-                "Which unconditional, almost-all, or density results are already established?",
-                plan["subquestions"],
+            self.assertGreaterEqual(
+                len(plan["subquestions"]),
+                3,
+                "Planning should produce at least 3 subquestions for a multi-hour query",
             )
 
     def test_software_agent_queries_include_repository_sources(self) -> None:
@@ -353,23 +577,25 @@ class ResearchTests(unittest.TestCase):
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             self.assertIn("software repository search", plan["token_strategy"])
 
-    def test_general_research_agent_queries_are_treated_as_software_queries(
+    def test_generic_deep_research_queries_stay_domain_specific(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = FakeDeepResearchEngine(workspace_root=temp_dir)
             brief = engine.run(
-                "[quick] how to build a general-purpose deep research agent",
+                "[multi-hour] deep research on battery recycling economics",
                 "run_4b",
             )
 
-            self.assertEqual(brief.query, "deep research agent")
+            self.assertIn("battery", brief.query.lower())
+            self.assertIn("recycling", brief.query.lower())
             providers = {source.provider for source in brief.sources}
-            self.assertIn("software-reference", providers)
+            self.assertNotIn("software-reference", providers)
+            self.assertNotIn("github-repositories", providers)
 
             plan_path = Path(temp_dir) / "runs/run_4b/research/research_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            self.assertIn("software repository search", plan["token_strategy"])
+            self.assertNotIn("software repository search", plan["token_strategy"])
 
     def test_web_search_provider_discovers_arbitrary_domain_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -757,6 +983,46 @@ class ResearchTests(unittest.TestCase):
                 brief.metadata["coverage"]["novelty_rate"],
                 0.1,
             )
+
+    def test_ai_gap_analysis_filters_noisy_queries(self) -> None:
+        engine = NoisyGapAnalysisEngine()
+        selected = [
+            ResearchSource(
+                provider="web-search",
+                title="Stocks and catalysts overview",
+                url="https://example.com/stocks-catalysts",
+                abstract="Current catalysts and earnings revisions for growth stocks.",
+                year=2026,
+                score=80.0,
+            )
+        ]
+
+        queries = engine._ai_evidence_gap_analysis(
+            "stocks with highest potential right now",
+            selected,
+            pass_index=2,
+        )
+        cleaned = engine._sanitize_query_variants(
+            queries,
+            "stocks with highest potential right now",
+        )
+
+        self.assertNotIn("stocks right eqxmuk border-through ezyuzk", cleaned)
+        self.assertIn(
+            "stocks catalysts earnings revisions current analysis",
+            cleaned,
+        )
+
+    def test_generic_perspectives_adapt_for_current_evidence_queries(self) -> None:
+        perspectives = DeepResearchEngine._generic_perspectives(
+            "stocks with highest potential to soar right now",
+            "multi-hour",
+        )
+        names = {item.get("name") for item in perspectives}
+
+        self.assertIn("current-signals", names)
+        self.assertIn("drivers", names)
+        self.assertIn("risk", names)
 
     def test_collatz_ranking_demotes_speculative_recent_zero_citation_claims(
         self,

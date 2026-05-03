@@ -290,7 +290,7 @@ class AdaptivePerceptionEngine:
         Full OCR (tesseract) is too heavy. We use:
         - Detect text-like regions by aspect ratio and edge density
         - Simple connected-component analysis for character blobs
-        - Template matching for common UI text patterns
+        - Pattern matching for common UI text shapes
         """
         for elem in elements:
             x, y, w, h = elem["x"], elem["y"], elem["w"], elem["h"]
