@@ -1,4 +1,5 @@
 """Final end-to-end smoke test: verify all three real data sources work."""
+
 from agentos_orchestrator.research.deep_research import DeepResearchEngine
 
 e = DeepResearchEngine()

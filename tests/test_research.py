@@ -294,7 +294,9 @@ class ResearchTests(unittest.TestCase):
                     }
                     for index in range(6)
                 ],
-                "direct_urls": [f"https://direct.com/page-{index}" for index in range(12)],
+                "direct_urls": [
+                    f"https://direct.com/page-{index}" for index in range(12)
+                ],
                 "candidate_urls": [
                     f"https://candidate.com/doc-{index}" for index in range(18)
                 ],

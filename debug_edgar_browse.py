@@ -1,8 +1,10 @@
 """Test browse-edgar Atom XML parsing for filing list."""
+
 import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 
 SEC_UA = "agentos/1.0 (research@example.com)"
+
 
 def get_sec(url):
     req = urllib.request.Request(url, headers={"User-Agent": SEC_UA, "Accept": "*/*"})
@@ -13,6 +15,7 @@ def get_sec(url):
         return e.code, e.read().decode("utf-8", errors="replace")[:400]
     except Exception as ex:
         return -1, str(ex)
+
 
 # Test 1: browse-edgar Atom for NVDA (CIK known = 1045810)
 url1 = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=1045810&type=10-K&dateb=&owner=include&count=10&output=atom"
@@ -65,6 +68,7 @@ print()
 
 # Test 3: data.sec.gov submissions for NVDA with proper throttle
 import time, json
+
 time.sleep(1.0)
 url3 = "https://data.sec.gov/submissions/CIK0001045810.json"
 code3, body3 = get_sec(url3)
@@ -96,9 +100,14 @@ if code4 == 200:
     for rev_key in ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"]:
         if rev_key in gaap:
             entries = gaap[rev_key].get("units", {}).get("USD", [])
-            annual = sorted([e for e in entries if e.get("form") == "10-K" and e.get("val")],
-                           key=lambda e: e.get("end",""), reverse=True)[:3]
-            print(f"  {rev_key} (10-K, latest 3): {[(e['end'], e['val']) for e in annual]}")
+            annual = sorted(
+                [e for e in entries if e.get("form") == "10-K" and e.get("val")],
+                key=lambda e: e.get("end", ""),
+                reverse=True,
+            )[:3]
+            print(
+                f"  {rev_key} (10-K, latest 3): {[(e['end'], e['val']) for e in annual]}"
+            )
             break
 else:
     print("  Error:", body4[:200])

@@ -287,7 +287,10 @@ class OrchestratorTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            any("deepest possible analyst and scientist report" in query for query in queries)
+            any(
+                "deepest possible analyst and scientist report" in query
+                for query in queries
+            )
         )
 
     def test_supervisor_data_task_adapts_to_research_domain(self) -> None:
@@ -353,11 +356,11 @@ class OrchestratorTests(unittest.TestCase):
         worker._deep_page_read = lambda url: "signal " * 300
         worker._content_block_quality = lambda content: {"quality_score": 0.8}
         worker._browser_preview_is_blocked = lambda preview: False
-        worker._extract_page_evidence = (
-            lambda content, title, query: ["revenue growth acceleration"]
-        )
-        worker._ai_page_judgment = (
-            lambda source, content, objective, core_query: "high signal"
+        worker._extract_page_evidence = lambda content, title, query: [
+            "revenue growth acceleration"
+        ]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: (
+            "high signal"
         )
 
         findings = worker._reasoned_browser_findings(
@@ -365,9 +368,7 @@ class OrchestratorTests(unittest.TestCase):
             [],
         )
 
-        example_hits = sum(
-            1 for url in findings["direct_urls"] if "example.com" in url
-        )
+        example_hits = sum(1 for url in findings["direct_urls"] if "example.com" in url)
         self.assertEqual(findings["frontier"]["mode"], "expansive")
         self.assertGreaterEqual(findings["frontier"]["candidate_urls"], 5)
         self.assertGreaterEqual(example_hits, 2)
@@ -426,8 +427,12 @@ class OrchestratorTests(unittest.TestCase):
         worker._deep_page_read = lambda url: "signal " * 300
         worker._content_block_quality = lambda content: {"quality_score": 0.8}
         worker._browser_preview_is_blocked = lambda preview: False
-        worker._extract_page_evidence = lambda content, title, query: ["candidate claim"]
-        worker._ai_page_judgment = lambda source, content, objective, core_query: "raw fallback admitted"
+        worker._extract_page_evidence = lambda content, title, query: [
+            "candidate claim"
+        ]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: (
+            "raw fallback admitted"
+        )
 
         findings = worker._reasoned_browser_findings(
             "[multi-hour] Research broad opportunity landscape",

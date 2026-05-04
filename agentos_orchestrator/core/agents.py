@@ -1094,7 +1094,9 @@ class WorkerAgent:
         exploration_sources = list(ranked)
         minimum_frontier = 4 if int(budget["max_direct_urls"]) >= 40 else 2
         if len(exploration_sources) < minimum_frontier and deduped_results:
-            ranked_urls = {str(source.url or "").strip() for source in exploration_sources}
+            ranked_urls = {
+                str(source.url or "").strip() for source in exploration_sources
+            }
             raw_fallback = sorted(
                 deduped_results,
                 key=lambda source: float(source.score or 0.0),
@@ -1207,7 +1209,9 @@ class WorkerAgent:
                 if clean_url in seen_direct_urls:
                     continue
                 domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
-                if domain and domain_usage.get(domain, 0) >= int(budget["max_per_domain"]):
+                if domain and domain_usage.get(domain, 0) >= int(
+                    budget["max_per_domain"]
+                ):
                     continue
                 preview = self._browser_page_preview(clean_url)
                 excerpt = str(preview.get("page_excerpt") or "")
@@ -1622,10 +1626,7 @@ class WorkerAgent:
             }
         )
         should_retry_with_browser = (
-            needs_browser
-            or not text
-            or blocked_preview
-            or quality_score < 0.18
+            needs_browser or not text or blocked_preview or quality_score < 0.18
         )
         if should_retry_with_browser:
             browser_reader = getattr(self.research_engine, "_get_text_browser", None)

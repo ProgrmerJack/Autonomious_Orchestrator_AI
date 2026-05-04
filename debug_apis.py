@@ -30,12 +30,14 @@ else:
 print()
 
 # --- Debug SEC EDGAR EFTS ---
-params = urllib.parse.urlencode({
-    "q": "NVIDIA",
-    "forms": "10-K,10-Q,8-K",
-    "dateRange": "custom",
-    "startdt": "2023-01-01",
-})
+params = urllib.parse.urlencode(
+    {
+        "q": "NVIDIA",
+        "forms": "10-K,10-Q,8-K",
+        "dateRange": "custom",
+        "startdt": "2023-01-01",
+    }
+)
 payload = e._get_sec_json(f"https://efts.sec.gov/LATEST/search-index?{params}")
 hits = (payload.get("hits") or {}).get("hits") or []
 print("EDGAR hits:", len(hits))
@@ -52,9 +54,7 @@ p2 = e._get_sec_json(
 print("EDGAR v2 hits:", len(((p2.get("hits") or {}).get("hits")) or []))
 
 # Try the regular EDGAR search
-p3 = e._get_json(
-    "https://efts.sec.gov/LATEST/search-index?q=NVIDIA&forms=10-K"
-)
+p3 = e._get_json("https://efts.sec.gov/LATEST/search-index?q=NVIDIA&forms=10-K")
 print("EDGAR v3 (via _get_json):", list(p3.keys()) if p3 else "empty")
 hits3 = (p3.get("hits") or {}).get("hits") or []
 print("EDGAR v3 hits:", len(hits3))
