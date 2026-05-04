@@ -269,6 +269,51 @@ class ResearchTests(unittest.TestCase):
             self.assertTrue(findings)
             self.assertIn("perspective", findings[0])
 
+    def test_pc_browser_frontier_seeds_expand_queries_and_sources(self) -> None:
+        engine = FakeDeepResearchEngine()
+        pc_context = {
+            "pc_findings": {
+                "search_queries": [
+                    "nvidia earnings transcript data center demand",
+                    "nvidia valuation gross margin outlook",
+                    "nvidia sec 10-k revenue growth risks",
+                    "nvidia capex supply chain commentary",
+                    "nvidia analyst expectations ai demand",
+                    "nvidia guidance operating margin trend",
+                ],
+                "judged_results": [
+                    {
+                        "title": f"NVIDIA judged source {index}",
+                        "url": f"https://example.com/report-{index}",
+                        "page_excerpt": "signal " * 40,
+                        "judgment": "important source",
+                        "evidence_claims": [
+                            "nvidia revenue growth acceleration data center demand"
+                        ],
+                        "content_quality": {"quality_score": 0.9},
+                    }
+                    for index in range(6)
+                ],
+                "direct_urls": [f"https://direct.com/page-{index}" for index in range(12)],
+                "candidate_urls": [
+                    f"https://candidate.com/doc-{index}" for index in range(18)
+                ],
+                "frontier": {"mode": "expansive"},
+            }
+        }
+
+        sources = engine._pc_finding_seed_sources(pc_context)
+        queries = engine._pc_query_seeds(pc_context, "nvidia valuation outlook")
+
+        self.assertGreaterEqual(len(sources), 20)
+        self.assertGreaterEqual(len(queries), 6)
+        self.assertTrue(
+            any(
+                "browser-frontier-candidate" in source.quality_flags
+                for source in sources
+            )
+        )
+
     def test_standard_depth_defaults_to_multi_pass_retrieval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = FakeDeepResearchEngine(workspace_root=temp_dir)

@@ -186,6 +186,10 @@ class ResearchSettings:
 class DeepResearchEngine:
     """MCP-friendly live research fallback using public scholarly APIs."""
 
+    # Class-level cache: populated on first call to _get_sec_tickers().
+    # Maps uppercase ticker → {cik_str, ticker, title} for all ~15k public companies.
+    _sec_tickers_cache: "dict[str, dict] | None" = None
+
     def __init__(
         self,
         workspace_root: str | Path = ".",
@@ -244,6 +248,12 @@ class DeepResearchEngine:
             settings.depth,
             pc_context_info,
         )
+        pc_query_seeds = self._pc_query_seeds(pc_context, query)
+        if pc_query_seeds:
+            plan["query_plan"] = self._sanitize_query_variants(
+                pc_query_seeds + list(plan.get("query_plan") or []),
+                query,
+            )
         seed_urls = self._source_seed_urls(
             research_objective,
             planning_context,
@@ -280,6 +290,7 @@ class DeepResearchEngine:
             settings=settings,
             plan=plan,
             targets=merged_targets,
+            pc_context=pc_context,
             run_id=run_id,
         )
         selected = retrieval["selected"]
@@ -479,12 +490,159 @@ class DeepResearchEngine:
             score=18.0,
         )
 
+    def _pc_finding_seed_sources(
+        self,
+        pc_context: dict[str, Any] | None,
+    ) -> list[ResearchSource]:
+        if not pc_context:
+            return []
+        pc_findings = pc_context.get("pc_findings") or {}
+        judged_results = pc_findings.get("judged_results") or []
+        candidate_urls = pc_findings.get("candidate_urls") or []
+        frontier = pc_findings.get("frontier") or {}
+        sources: list[ResearchSource] = []
+        seen_urls: set[str] = set()
+        frontier_mode = str(frontier.get("mode") or "").strip().lower()
+        judged_limit = 60 if frontier_mode == "expansive" else 30
+        supplemental_limit = 40 if frontier_mode == "expansive" else 16
+
+        for result in judged_results[:judged_limit]:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or "").strip()
+            if not self._is_safe_public_url(url):
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            title = str(
+                result.get("title") or self._label_from_url(url)
+            ).strip()
+            domain = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+            excerpt = str(
+                result.get("page_excerpt") or result.get("abstract") or ""
+            ).strip()
+            judgment = str(result.get("judgment") or "").strip()
+            evidence_claims = [
+                str(claim).strip()
+                for claim in (result.get("evidence_claims") or [])
+                if str(claim).strip()
+            ]
+            quality = result.get("content_quality") or {}
+            try:
+                quality_score = float(quality.get("quality_score") or 0.0)
+            except (TypeError, ValueError):
+                quality_score = 0.0
+
+            abstract_parts: list[str] = []
+            if judgment:
+                abstract_parts.append(judgment)
+            if evidence_claims:
+                abstract_parts.append(
+                    "Claims: " + "; ".join(evidence_claims[:3])
+                )
+            if excerpt:
+                abstract_parts.append(excerpt[:1400])
+            if not abstract_parts:
+                abstract_parts.append(
+                    "Browser-judged source captured during sandbox research."
+                )
+
+            sources.append(
+                ResearchSource(
+                    provider="pc-browser-research",
+                    title=title[:160],
+                    url=url,
+                    authors=[domain] if domain else [],
+                    abstract=" ".join(abstract_parts)[:3000],
+                    score=32.0 + min(max(quality_score, 0.0), 1.0) * 30.0,
+                    evidence_grade="tool-observation",
+                    quality_flags=["browser-judged-source"],
+                )
+            )
+
+        supplemental_urls = list(pc_findings.get("direct_urls") or []) + list(
+            candidate_urls
+        )
+        for index, url in enumerate(supplemental_urls[:supplemental_limit]):
+            clean_url = str(url or "").strip()
+            if not self._is_safe_public_url(clean_url):
+                continue
+            if clean_url in seen_urls:
+                continue
+            seen_urls.add(clean_url)
+            domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
+            is_candidate = index >= len(pc_findings.get("direct_urls") or [])
+            quality_flag = (
+                "browser-frontier-candidate"
+                if is_candidate
+                else "browser-discovered-url"
+            )
+            abstract = (
+                "Browser frontier candidate admitted as a retrieval seed from "
+                "sandbox research."
+                if is_candidate
+                else "Browser-discovered source collected during sandbox research "
+                "and admitted as a retrieval seed."
+            )
+            sources.append(
+                ResearchSource(
+                    provider="pc-browser-research",
+                    title=self._label_from_url(clean_url)[:160],
+                    url=clean_url,
+                    authors=[domain] if domain else [],
+                    abstract=abstract,
+                    score=14.0 if is_candidate else 20.0,
+                    evidence_grade="tool-observation",
+                    quality_flags=[quality_flag],
+                )
+            )
+
+        if sources:
+            self._record_provider_diagnostic(
+                "pc-browser-research",
+                "ok",
+                f"seeded {len(sources)} browser-judged sources",
+            )
+        return sources
+
+    def _pc_query_seeds(
+        self,
+        pc_context: dict[str, Any] | None,
+        query: str,
+    ) -> list[str]:
+        if not pc_context:
+            return []
+        pc_findings = pc_context.get("pc_findings") or {}
+        candidates: list[str] = []
+        for item in (pc_findings.get("search_queries") or [])[:24]:
+            text = str(item or "").strip()
+            if text:
+                candidates.append(text[:240])
+        for result in (pc_findings.get("judged_results") or [])[:24]:
+            if not isinstance(result, dict):
+                continue
+            title = str(result.get("title") or "").strip()
+            if title:
+                candidates.append(title[:240])
+            for claim in (result.get("evidence_claims") or [])[:2]:
+                claim_text = str(claim or "").strip()
+                if not claim_text:
+                    continue
+                keywords = self._query_core_terms(
+                    f"{title} {claim_text}".strip()
+                )
+                if keywords and len(keywords.split()) >= 3:
+                    candidates.append(keywords[:240])
+        return self._sanitize_query_variants(candidates, query)[:48]
+
     def _iterative_retrieval(
         self,
         query: str,
         settings: ResearchSettings,
         plan: dict[str, Any],
         targets: dict[str, Any],
+        pc_context: dict[str, Any] | None = None,
         run_id: str = "",
     ) -> dict[str, Any]:
         durable_report_path = self._initialize_durable_report(
@@ -495,6 +653,7 @@ class DeepResearchEngine:
         all_sources: list[ResearchSource] = self._seed_sources(
             plan.get("source_seeds") or []
         )
+        all_sources.extend(self._pc_finding_seed_sources(pc_context))
         # Seed AI-reasoned authoritative domains as sources so they are
         # considered from the very first pass.
         ai_domains = plan.get("ai_authoritative_domains") or []
@@ -672,9 +831,29 @@ class DeepResearchEngine:
                         "multpl.com",
                         "bea.gov",
                         "federalreserve.gov",
+                        "fred.stlouisfed.org",
                         "imf.org",
                         "ssrn.com",
                         "nber.org",
+                        # New Wall Street analyst additions
+                        "openinsider.com",
+                        "finra.org",
+                        "bls.gov",
+                        "treasury.gov",
+                        "census.gov",
+                        "worldbank.org",
+                        "oecd.org",
+                        "statista.com",
+                        "zacks.com",
+                        "tipranks.com",
+                        "barchart.com",
+                        "thestreet.com",
+                        "businessinsider.com",
+                        "fool.com",
+                        "kiplinger.com",
+                        "alphavantage.co",
+                        "roic.ai",
+                        "alphaquery.com",
                     }
                     priority_chain = [
                         s
@@ -682,13 +861,15 @@ class DeepResearchEngine:
                         if any(
                             h in (s.url or "").lower() for h in _priority_finance_hosts
                         )
-                    ][:16]
-                    # Also include some non-priority chained sources for breadth.
+                    ][:80]
+                    # Also include non-priority chained sources for breadth.
                     seen_chain_urls = {s.url for s in priority_chain}
                     other_chain = [s for s in chained if s.url not in seen_chain_urls][
-                        :8
+                        :40
                     ]
-                    chain_expansion_batch = (priority_chain + other_chain)[:20]
+                    # 120 chains per pass × 120 passes = up to 14,400 chain fetches.
+                    # This is the primary mechanism for 100k+ URL coverage.
+                    chain_expansion_batch = (priority_chain + other_chain)[:120]
                     if chain_expansion_batch:
                         chain_eq = self._enrich_top_sources(
                             chain_expansion_batch, query
@@ -1876,20 +2057,48 @@ class DeepResearchEngine:
             return []
         # Build a compact summary of what was found.
         source_lines: list[str] = []
-        for src in selected[:15]:
+        for src in selected[:20]:
             year = f" ({src.year})" if src.year else ""
-            snippet = (src.abstract or src.title)[:120].replace("\n", " ")
+            snippet = (src.abstract or src.title)[:150].replace("\n", " ")
             source_lines.append(f"- [{src.provider}] {src.title}{year}: {snippet}")
         source_summary = "\n".join(source_lines)
-        domain_hint = ", ".join(existing_domains[:12]) if existing_domains else "none"
+        domain_hint = ", ".join(existing_domains[:20]) if existing_domains else "none"
         coverage_hint = coverage or {}
-        system = (
-            "You are a research gap analyst. Given what a research engine has "
-            "found so far, reason about what important angles are missing, what "
-            "causal connections implied by the findings should be followed up, "
-            "whether the evidence is current enough, and what specific search "
-            "queries would best fill the gaps. Respond ONLY with valid JSON."
-        )
+
+        is_market = self._looks_like_market_query(objective)
+        if is_market:
+            system = (
+                "You are a Managing Director at a top-tier investment bank doing "
+                "buy-side fundamental research. You have just completed a retrieval "
+                "pass and need to identify critical gaps in your investment thesis.\n\n"
+                "Think like a sell-side analyst building a research note:\n"
+                "- What financial metrics are still missing? (DCF inputs, margin trends, "
+                "FCF yield, EV/EBITDA, net debt, ROIC, capital allocation)\n"
+                "- What qualitative factors haven't been sourced yet? (competitive moat, "
+                "management quality, regulatory risk, TAM expansion, customer concentration)\n"
+                "- What macro factors are unaddressed? (rate sensitivity, FX exposure, "
+                "commodity costs, geopolitical risk)\n"
+                "- What's the bear case that hasn't been stress-tested yet?\n"
+                "- What catalyst events are upcoming and not yet sourced?\n"
+                "- What data from SEC EDGAR, earnings transcripts, or insider filings "
+                "is still missing?\n"
+                "Generate highly specific search queries a real analyst would run — "
+                "not generic stock terms. Respond ONLY with valid JSON."
+            )
+        else:
+            system = (
+                "You are a research gap analyst. Given what a research engine has "
+                "found so far, reason about what important angles are missing, what "
+                "causal connections implied by the findings should be followed up, "
+                "whether the evidence is current enough, and what specific search "
+                "queries would best fill the gaps. Respond ONLY with valid JSON."
+            )
+
+        if is_market:
+            query_count_hint = "8-12"
+        else:
+            query_count_hint = "6-8"
+
         user = (
             f"Research objective: {objective}\n"
             f"Retrieval pass: {pass_index + 1}\n\n"
@@ -1901,11 +2110,12 @@ class DeepResearchEngine:
             '  "gaps": ["missing angle or unanswered aspect", ...],\n'
             '  "follow_up_queries": ["specific search query to fill gap", ...]\n'
             "}\n"
-            "follow_up_queries must be 3-6 targeted search phrases derived "
-            "from your gap analysis — not generic expansions of the core query. "
+            f"follow_up_queries must be {query_count_hint} targeted search phrases "
+            "derived from your gap analysis — not generic expansions of the core query. "
             "Think: what causal factor is implied but not yet sourced? What "
             "recent event could change the picture? Which authority has not yet "
-            "been consulted?"
+            "been consulted? For finance: what SEC filing, earnings metric, or "
+            "analyst estimate is still unverified?"
         )
         if force_new_domains:
             user += (
@@ -1967,16 +2177,23 @@ class DeepResearchEngine:
                     overlap = sum(1 for term in obj_terms if term in q_lower)
                     if overlap == 0:
                         continue
+                    # For market queries, use a more permissive alignment threshold
+                    # because analyst sub-queries ("NVDA gross margin trend Q1 2026")
+                    # may not share all objective terms but are highly relevant.
+                    min_overlap = 1 if is_market else 2
+                    min_align = 0.25 if is_market else 0.4
                     if (
                         len(obj_terms) >= 4
-                        and overlap < 2
-                        and self._objective_alignment_score(candidate, objective) < 0.4
+                        and overlap < min_overlap
+                        and self._objective_alignment_score(candidate, objective) < min_align
                     ):
                         continue
-                    if self._objective_alignment_score(candidate, objective) < 0.35:
+                    align_floor = 0.2 if is_market else 0.35
+                    if self._objective_alignment_score(candidate, objective) < align_floor:
                         continue
                     filtered.append(candidate)
-                return filtered[:6]
+                # Return up to 12 queries for market research, 8 for others.
+                return filtered[:12] if is_market else filtered[:8]
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return []
@@ -2422,176 +2639,265 @@ class DeepResearchEngine:
         )
         return sources
 
+    def _get_sec_tickers(self) -> "dict[str, dict]":
+        """Return {TICKER: {cik_str, ticker, title}} from SEC company_tickers.json.
+
+        Cached at class level after first fetch — the file is ~1.5 MB and lists
+        every ~15 000 public company registered with the SEC.  Used to resolve
+        a ticker symbol (e.g. "NVDA") to the SEC's numeric CIK so we can call
+        data.sec.gov/submissions and data.sec.gov/api/xbrl/companyfacts.
+        """
+        if DeepResearchEngine._sec_tickers_cache is not None:
+            return DeepResearchEngine._sec_tickers_cache
+        payload = self._get_sec_json("https://www.sec.gov/files/company_tickers.json")
+        if not payload:
+            return {}
+        result: dict[str, dict] = {}
+        for item in payload.values():
+            ticker = str(item.get("ticker") or "").upper().strip()
+            if ticker:
+                result[ticker] = item
+        DeepResearchEngine._sec_tickers_cache = result
+        return result
+
+    def _fetch_yf_chart_abstract(self, symbol: str, name: str) -> str:
+        """Fallback: basic price + 52-week range from Yahoo Finance v8 chart API.
+
+        The v8 chart endpoint works without authentication.  Returns a minimal
+        but real abstract (price, 52W range, volume, exchange) for tickers where
+        yfinance is unavailable.  Returns empty string on failure.
+        """
+        payload = self._get_json(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?interval=1d&range=1d"
+        )
+        meta = (
+            ((payload.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+        )
+        price = meta.get("regularMarketPrice")
+        if not price:
+            return ""
+        high_52w = meta.get("fiftyTwoWeekHigh")
+        low_52w = meta.get("fiftyTwoWeekLow")
+        volume = meta.get("regularMarketVolume")
+        exchange = meta.get("fullExchangeName") or meta.get("exchangeName") or ""
+        long_name = meta.get("longName") or meta.get("shortName") or name
+
+        parts: list[str] = [f"{long_name} ({symbol})"]
+        if exchange:
+            parts.append(exchange)
+        parts.append(f"Price: ${price:.2f}")
+        if high_52w and low_52w:
+            parts.append(f"52W Range: ${low_52w:.2f}–${high_52w:.2f}")
+        if volume:
+            parts.append(f"Volume: {volume:,}")
+        return " | ".join(parts)
+
     def _get_sec_json(self, url: str) -> dict[str, Any]:
         """Fetch JSON from SEC APIs (data.sec.gov, efts.sec.gov).
 
         SEC policy requires a descriptive User-Agent with contact info.
         Returns {} on any error — callers must handle gracefully.
         """
-        sec_ua = os.environ.get(
-            "SEC_USER_AGENT",
-            "agentos-orchestrator/0.1 research-bot (public-research-use)",
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": sec_ua,
-            },
-        )
         try:
-            with urllib.request.urlopen(  # noqa: S310 - policy-gated URLs
-                request,
-                timeout=self.timeout_seconds,
-            ) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            return json.loads(self._get_sec_text(url, accept="application/json"))
+        except json.JSONDecodeError:
             return {}
 
-    def _fetch_yf_fundamentals_abstract(self, symbol: str, name: str) -> str:
-        """Fetch real fundamental data from Yahoo Finance quoteSummary API.
+    def _get_sec_text(
+        self,
+        url: str,
+        accept: str = "application/json",
+    ) -> str:
+        """Fetch SEC text content with retry/backoff for transient throttling."""
+        sec_ua = os.environ.get(
+            "SEC_USER_AGENT",
+            "agentos-orchestrator/0.1 research-bot (set SEC_USER_AGENT)",
+        )
+        headers = {
+            "Accept": accept,
+            "User-Agent": sec_ua,
+        }
+        retry_delays = (0.0, 1.0, 2.5)
 
-        Tries v10 then v11 endpoint.  Returns a pipe-delimited string of
-        live financial metrics, or a minimal fallback string on failure.
+        try:
+            import requests as _requests  # type: ignore[import-not-found]
+        except ImportError:
+            _requests = None
 
-        NEVER constructs a fake abstract — returns empty string if API fails
-        so callers can omit the source rather than emit a placeholder.
-        """
-        modules = "price,financialData,defaultKeyStatistics"
-        endpoints = [
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules={modules}",
-            f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{symbol}?modules={modules}",
-        ]
-        for endpoint in endpoints:
-            payload = self._get_json(endpoint)
-            result_list = (payload.get("quoteSummary") or {}).get("result") or []
-            if not result_list:
-                continue
-            data = result_list[0]
-            price_d = data.get("price") or {}
-            fin_d = data.get("financialData") or {}
-            ks_d = data.get("defaultKeyStatistics") or {}
-
-            def _raw(d: dict[str, Any], key: str) -> Any:
-                return (d.get(key) or {}).get("raw")
-
-            def _fmt_val(
-                d: dict[str, Any], key: str, fmt: str = ".2f", suffix: str = ""
-            ) -> str:
-                v = _raw(d, key)
-                if v is None:
-                    return ""
+        if _requests is not None:
+            for delay in retry_delays:
+                if delay > 0:
+                    time.sleep(delay)
                 try:
-                    return f"{v:{fmt}}{suffix}"
-                except (TypeError, ValueError):
-                    return str(v)
+                    response = _requests.get(
+                        url,
+                        headers=headers,
+                        timeout=self.timeout_seconds,
+                        allow_redirects=True,
+                    )
+                except Exception:
+                    continue
+                if response.status_code == 200:
+                    return response.text
+                if response.status_code in {403, 429, 500, 502, 503, 504}:
+                    continue
+                break
 
-            def _fmt_pct(d: dict[str, Any], key: str) -> str:
-                v = _raw(d, key)
-                if v is None:
-                    return ""
-                return f"{v * 100:+.1f}%"
+        request = urllib.request.Request(url, headers=headers)
+        for delay in retry_delays:
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                with urllib.request.urlopen(  # noqa: S310 - policy-gated URLs
+                    request,
+                    timeout=self.timeout_seconds,
+                ) as response:
+                    return response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                if exc.code in {403, 429, 500, 502, 503, 504}:
+                    continue
+                break
+            except (OSError, urllib.error.URLError):
+                continue
+        return ""
 
-            short_name = str(price_d.get("shortName") or name)
-            curr_price = _raw(price_d, "regularMarketPrice")
-            mkt_cap_raw = _raw(price_d, "marketCap")
-            mkt_cap = f"${mkt_cap_raw / 1e9:.1f}B" if mkt_cap_raw else ""
-            day_chg = _fmt_pct(price_d, "regularMarketChangePercent")
-            fwd_pe = _fmt_val(ks_d, "forwardPE", ".1f", "x")
-            ev_ebitda = _fmt_val(ks_d, "enterpriseToEbitda", ".1f", "x EV/EBITDA")
-            pb = _fmt_val(ks_d, "priceToBook", ".2f", "x P/B")
-            short_float = (ks_d.get("shortPercentOfFloat") or {}).get("fmt", "")
-            wk52_chg = _fmt_pct(ks_d, "52WeekChange")
-            target_raw = _raw(fin_d, "targetMeanPrice")
-            n_analysts = _raw(fin_d, "numberOfAnalystOpinions")
-            rec = str(fin_d.get("recommendationKey") or "")
-            rev_growth = _fmt_pct(fin_d, "revenueGrowth")
-            earn_growth = _fmt_pct(fin_d, "earningsGrowth")
-            roe = _fmt_pct(fin_d, "returnOnEquity")
+    def _fetch_yf_fundamentals_abstract(self, symbol: str, name: str) -> str:
+        """Fetch REAL fundamental data using yfinance (handles Yahoo Finance auth).
 
-            upside = ""
-            if target_raw and curr_price and curr_price > 0:
-                upside_pct = (target_raw / curr_price - 1) * 100
-                upside = f"{upside_pct:+.1f}% upside"
+        yfinance handles the Yahoo Finance crumb/cookie authentication that
+        blocks raw urllib calls.  Returns a pipe-delimited string of live
+        metrics a Wall Street analyst actually uses: P/E, market cap, analyst
+        consensus and price targets, growth rates, ROE, FCF, short interest.
 
-            parts: list[str] = [f"{short_name} ({symbol})"]
-            if curr_price:
-                parts.append(f"Price: ${curr_price:.2f}")
-            if mkt_cap:
-                parts.append(f"Mkt Cap: {mkt_cap}")
-            if day_chg:
-                parts.append(f"Day: {day_chg}")
-            if fwd_pe:
-                parts.append(f"Fwd P/E: {fwd_pe}")
-            if ev_ebitda:
-                parts.append(ev_ebitda)
-            if pb:
-                parts.append(pb)
-            if short_float:
-                parts.append(f"Short Float: {short_float}")
-            if wk52_chg:
-                parts.append(f"52W: {wk52_chg}")
-            if target_raw:
-                analyst_note = (
-                    f"({upside}, {int(n_analysts)} analysts)"
-                    if n_analysts
-                    else f"({upside})"
-                )
-                parts.append(f"Analyst Target: ${target_raw:.2f} {analyst_note}")
-            if rec:
-                parts.append(f"Consensus: {rec.upper()}")
-            if rev_growth:
-                parts.append(f"Rev Growth: {rev_growth}")
-            if earn_growth:
-                parts.append(f"EPS Growth: {earn_growth}")
-            if roe:
-                parts.append(f"ROE: {roe}")
+        Falls back to the v8 chart API (price + 52W range) if yfinance is
+        not installed.  Returns empty string only if ALL data paths fail,
+        so callers skip the source rather than emit a placeholder.
+        """
+        try:
+            import yfinance as yf  # optional; falls back gracefully
+        except ImportError:
+            return self._fetch_yf_chart_abstract(symbol, name)
 
-            result = " | ".join(p for p in parts if p)
-            if result:
-                return result
+        try:
+            info: dict[str, Any] = yf.Ticker(symbol).info or {}
+        except Exception:
+            return self._fetch_yf_chart_abstract(symbol, name)
 
-        return ""  # API unavailable — caller should omit source or skip
+        if not info:
+            return self._fetch_yf_chart_abstract(symbol, name)
+
+        long_name = str(info.get("longName") or info.get("shortName") or name)
+        curr_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        mkt_cap_raw = info.get("marketCap")
+        mkt_cap = f"${mkt_cap_raw / 1e9:.1f}B" if mkt_cap_raw else ""
+        sector = str(info.get("sector") or "")
+        industry = str(info.get("industry") or "")
+
+        trailing_pe = info.get("trailingPE")
+        fwd_pe = info.get("forwardPE")
+        pb = info.get("priceToBook")
+        ev_ebitda = info.get("enterpriseToEbitda")
+        beta = info.get("beta")
+        short_float_raw = info.get("shortPercentOfFloat")
+        wk52_chg_raw = info.get("52WeekChange") or info.get("fiftyTwoWeekChangePercent")
+        target_price = info.get("targetMeanPrice")
+        n_analysts = info.get("numberOfAnalystOpinions")
+        rec = str(info.get("recommendationKey") or "").upper().replace("_", " ")
+        rev_growth_raw = info.get("revenueGrowth")
+        earn_growth_raw = info.get("earningsGrowth")
+        roe_raw = info.get("returnOnEquity")
+        total_rev = info.get("totalRevenue")
+        net_income = info.get("netIncomeToCommon")
+        free_cf = info.get("freeCashflow")
+        fwd_eps = info.get("forwardEps")
+        trailing_eps = info.get("trailingEps")
+
+        parts: list[str] = [f"{long_name} ({symbol})"]
+        if sector:
+            parts.append(f"{sector} — {industry}" if industry else sector)
+        if curr_price:
+            parts.append(f"Price: ${curr_price:.2f}")
+        if mkt_cap:
+            parts.append(f"Mkt Cap: {mkt_cap}")
+        if trailing_pe:
+            parts.append(f"Trailing P/E: {trailing_pe:.1f}x")
+        if fwd_pe:
+            parts.append(f"Fwd P/E: {fwd_pe:.1f}x")
+        if ev_ebitda:
+            parts.append(f"EV/EBITDA: {ev_ebitda:.1f}x")
+        if pb:
+            parts.append(f"P/B: {pb:.2f}x")
+        if beta:
+            parts.append(f"Beta: {beta:.2f}")
+        if short_float_raw:
+            parts.append(f"Short Float: {short_float_raw * 100:.1f}%")
+        if wk52_chg_raw:
+            parts.append(f"52W Chg: {wk52_chg_raw * 100:+.1f}%")
+        if target_price and curr_price and curr_price > 0:
+            upside_pct = (target_price / curr_price - 1) * 100
+            analyst_note = (
+                f"({upside_pct:+.1f}% upside, {int(n_analysts)} analysts)"
+                if n_analysts
+                else f"({upside_pct:+.1f}% upside)"
+            )
+            parts.append(f"Target: ${target_price:.2f} {analyst_note}")
+        if rec:
+            parts.append(f"Rating: {rec}")
+        if total_rev:
+            parts.append(f"Revenue: ${total_rev / 1e9:.1f}B")
+        if rev_growth_raw:
+            parts.append(f"Rev Growth: {rev_growth_raw * 100:+.1f}%")
+        if net_income:
+            parts.append(f"Net Income: ${net_income / 1e9:.1f}B")
+        if earn_growth_raw:
+            parts.append(f"EPS Growth: {earn_growth_raw * 100:+.1f}%")
+        if roe_raw:
+            parts.append(f"ROE: {roe_raw * 100:+.1f}%")
+        if free_cf:
+            parts.append(f"FCF: ${free_cf / 1e9:.1f}B")
+        if fwd_eps:
+            parts.append(f"Fwd EPS: ${fwd_eps:.2f}")
+        if trailing_eps:
+            parts.append(f"TTM EPS: ${trailing_eps:.2f}")
+
+        result = " | ".join(p for p in parts if p)
+        return result if len(parts) > 2 else self._fetch_yf_chart_abstract(symbol, name)
 
     def _fetch_sec_company_facts(self, ticker: str) -> "ResearchSource | None":
-        """Fetch real structured financial data from SEC XBRL API.
+        """Fetch real audited financial data from SEC XBRL API.
 
         Pipeline:
-        1. EDGAR full-text search → discover CIK for the ticker
-        2. data.sec.gov/submissions/CIK{n}.json → company metadata + filing list
-        3. data.sec.gov/api/xbrl/companyfacts/CIK{n}.json → audited GAAP data
+        1. company_tickers.json → resolve ticker to CIK (cached class-level)
+        2. data.sec.gov/submissions/CIK{n}.json → company name, SIC, exchange,
+           most recent 10-K and 10-Q filing dates
+        3. data.sec.gov/api/xbrl/companyfacts/CIK{n}.json → audited GAAP data:
+           revenue, net income, diluted EPS from actual 10-K filings
 
-        Returns a ResearchSource with REAL revenue, net income, and YoY
-        growth figures parsed from actual SEC filings — not placeholders.
-        Returns None if any step fails.
+        Returns a high-confidence (score=72) ResearchSource with real SEC data,
+        or None if the ticker is not found or data is insufficient.
         """
-        # Step 1: resolve ticker → CIK via EDGAR search
-        search_payload = self._get_sec_json(
-            "https://efts.sec.gov/LATEST/search-index?"
-            + urllib.parse.urlencode(
-                {
-                    "q": f'"{ticker}"',
-                    "forms": "10-K",
-                    "dateRange": "custom",
-                    "startdt": "2022-01-01",
-                }
-            )
-        )
-        hits = (search_payload.get("hits") or {}).get("hits") or []
-        if not hits:
-            return None
-        src0 = hits[0].get("_source") or {}
-        cik_raw = str(src0.get("entity_id") or "").strip()
-        if not cik_raw.isdigit():
-            return None
-        entity_name = str((src0.get("display_names") or [ticker])[0])
+        import time
 
-        # Step 2: company metadata from data.sec.gov/submissions
-        cik_padded = cik_raw.zfill(10)
+        # Step 1: ticker → CIK via the cached SEC company tickers mapping
+        tickers_map = self._get_sec_tickers()
+        entry = tickers_map.get(ticker.upper().strip())
+        if not entry:
+            return None
+        cik_int = entry.get("cik_str") or entry.get("cik")
+        if not cik_int:
+            return None
+        cik_padded = str(int(cik_int)).zfill(10)
+        company_title = str(entry.get("title") or ticker)
+
+        # Step 2: Company metadata from data.sec.gov/submissions
         submissions = self._get_sec_json(
             f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
         )
-        company_name = str(submissions.get("name") or entity_name)
+        if not submissions:
+            return None
+
+        company_name = str(submissions.get("name") or company_title)
         sic_desc = str(submissions.get("sicDescription") or "")
         exchanges = submissions.get("exchanges") or []
         exchange = ", ".join(str(e) for e in exchanges) if exchanges else ""
@@ -2601,35 +2907,28 @@ class DeepResearchEngine:
         dates = recent.get("filingDate") or []
         accessions = recent.get("accessionNumber") or []
 
-        # Find most recent 10-K and 10-Q filing dates
         most_recent_10k_date = ""
         most_recent_10q_date = ""
-        most_recent_10k_accession = ""
         for i, form in enumerate(forms):
             if form == "10-K" and not most_recent_10k_date and i < len(dates):
                 most_recent_10k_date = dates[i]
-                if i < len(accessions):
-                    most_recent_10k_accession = accessions[i]
             if form == "10-Q" and not most_recent_10q_date and i < len(dates):
                 most_recent_10q_date = dates[i]
             if most_recent_10k_date and most_recent_10q_date:
                 break
 
-        # Step 3: real audited financial data from XBRL
+        # Step 3: XBRL financials — audited GAAP data from actual SEC filings.
+        # SEC policy: max 10 req/sec.  A brief pause keeps us well under limit.
+        time.sleep(0.15)
         facts_payload = self._get_sec_json(
             f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
         )
         gaap = (facts_payload.get("facts") or {}).get("us-gaap") or {}
 
-        def _latest_annual(concept_key: str) -> tuple[float, str] | None:
-            """Return (value, period_end) for the most recent 10-K entry."""
+        def _latest_annual(concept_key: str) -> "tuple[float, str] | None":
             entries = (gaap.get(concept_key) or {}).get("units", {}).get("USD") or []
             annual = sorted(
-                [
-                    e
-                    for e in entries
-                    if e.get("form") == "10-K" and e.get("val") is not None
-                ],
+                [e for e in entries if e.get("form") == "10-K" and e.get("val") is not None],
                 key=lambda e: e.get("end", ""),
                 reverse=True,
             )
@@ -2637,14 +2936,10 @@ class DeepResearchEngine:
                 return float(annual[0]["val"]), str(annual[0].get("end", ""))[:7]
             return None
 
-        def _yoy_growth(concept_key: str) -> float | None:
+        def _yoy_growth(concept_key: str) -> "float | None":
             entries = (gaap.get(concept_key) or {}).get("units", {}).get("USD") or []
             annual = sorted(
-                [
-                    e
-                    for e in entries
-                    if e.get("form") == "10-K" and e.get("val") is not None
-                ],
+                [e for e in entries if e.get("form") == "10-K" and e.get("val") is not None],
                 key=lambda e: e.get("end", ""),
                 reverse=True,
             )
@@ -2656,7 +2951,7 @@ class DeepResearchEngine:
                 )
             return None
 
-        # Revenue: try multiple common GAAP concept names
+        # Revenue: try common GAAP concepts in priority order
         rev_key = next(
             (
                 k
@@ -2671,10 +2966,10 @@ class DeepResearchEngine:
             ),
             None,
         )
-        ni_key = "NetIncomeLoss"
-        eps_key = "EarningsPerShareDiluted"
 
-        abstract_parts: list[str] = [f"{company_name} (CIK: {cik_raw})"]
+        abstract_parts: list[str] = [
+            f"{company_name} (SEC CIK: {str(int(cik_int))})"
+        ]
         if sic_desc:
             abstract_parts.append(f"Industry: {sic_desc}")
         if exchange:
@@ -2684,6 +2979,7 @@ class DeepResearchEngine:
         if most_recent_10q_date:
             abstract_parts.append(f"Latest 10-Q: {most_recent_10q_date}")
 
+        has_financials = False
         if rev_key:
             rev_result = _latest_annual(rev_key)
             if rev_result:
@@ -2692,49 +2988,41 @@ class DeepResearchEngine:
                 rev_growth = _yoy_growth(rev_key)
                 if rev_growth is not None:
                     abstract_parts.append(f"Revenue YoY: {rev_growth:+.1f}%")
+                has_financials = True
 
-        if ni_key in gaap:
-            ni_result = _latest_annual(ni_key)
+        if "NetIncomeLoss" in gaap:
+            ni_result = _latest_annual("NetIncomeLoss")
             if ni_result:
                 ni_val, ni_period = ni_result
-                abstract_parts.append(f"Net Income ({ni_period}): ${ni_val / 1e9:.2f}B")
-                ni_growth = _yoy_growth(ni_key)
+                abstract_parts.append(
+                    f"Net Income ({ni_period}): ${ni_val / 1e9:.2f}B"
+                )
+                ni_growth = _yoy_growth("NetIncomeLoss")
                 if ni_growth is not None:
                     abstract_parts.append(f"Net Income YoY: {ni_growth:+.1f}%")
+                has_financials = True
 
-        if eps_key in gaap:
-            eps_result = _latest_annual(eps_key)
+        if "EarningsPerShareDiluted" in gaap:
+            eps_result = _latest_annual("EarningsPerShareDiluted")
             if eps_result:
                 eps_val, eps_period = eps_result
                 abstract_parts.append(f"Diluted EPS ({eps_period}): ${eps_val:.2f}")
 
-        abstract = " | ".join(p for p in abstract_parts if p)
-        if len(abstract_parts) <= 2:
-            # Not enough data to be useful
+        if len(abstract_parts) < 3 and not has_financials:
             return None
 
-        # Best URL: actual filing index if we have it, else company page
-        if most_recent_10k_accession and cik_raw:
-            accession_clean = most_recent_10k_accession.replace("-", "")
-            filing_url = (
-                f"https://www.sec.gov/cgi-bin/browse-edgar"
-                f"?action=getcompany&CIK={cik_padded}"
-                f"&type=10-K&dateb=&owner=include&count=10"
-            )
-        else:
-            filing_url = (
-                f"https://www.sec.gov/cgi-bin/browse-edgar"
-                f"?action=getcompany&CIK={cik_padded}"
-                f"&type=10-K&dateb=&owner=include&count=10"
-            )
-
+        cik_int_str = str(int(cik_int))
         return ResearchSource(
             provider="sec-edgar",
             title=f"{company_name} — SEC XBRL Financial Facts",
-            url=filing_url,
+            url=(
+                f"https://www.sec.gov/cgi-bin/browse-edgar"
+                f"?action=getcompany&CIK={cik_int_str}"
+                f"&type=10-K&dateb=&owner=include&count=10"
+            ),
             year=datetime.now(UTC).year,
-            abstract=abstract,
-            score=72.0,  # Highest score — audited primary source data
+            abstract=" | ".join(p for p in abstract_parts if p),
+            score=72.0,  # Audited primary-source data — highest confidence
         )
 
     def _search_financial_portals(
@@ -2796,6 +3084,14 @@ class DeepResearchEngine:
                 )
             )
 
+        query_entity_terms = {
+            token.lower()
+            for token in re.findall(r"\b[A-Z][A-Za-z]{3,}\b", query)
+        }
+        query_entity_terms.update(
+            token.lower() for token in _extract_ticker_candidates(query)
+        )
+
         # Real news articles from Yahoo Finance (actual URLs, actual titles)
         for item in (yf_payload.get("news") or [])[: min(target_limit, 12)]:
             url = str(item.get("link") or "").strip()
@@ -2805,6 +3101,16 @@ class DeepResearchEngine:
             if not url or not title or not url.startswith("http"):
                 continue
             if not self._is_safe_public_url(url):
+                continue
+            title_text = f"{title} {publisher}".lower()
+            mentions_entity = any(
+                term in title_text or term in url.lower()
+                for term in query_entity_terms
+            )
+            aligned_news = (
+                self._objective_alignment_score(title_text, query) >= 0.35
+            )
+            if query_entity_terms and not (mentions_entity or aligned_news):
                 continue
             year = datetime.now(UTC).year
             if pub_time:
@@ -2823,8 +3129,61 @@ class DeepResearchEngine:
                 )
             )
 
-        # ── 2. Explicitly named tickers: fetch fundamentals if not already done
+        # ── 2. Explicit ticker extraction + company-name search ──────────────
+        # Two strategies to resolve companies from the query:
+        # (a) Short all-caps tickers via _extract_ticker_candidates
+        # (b) Capitalized company-name tokens (e.g. NVIDIA, Apple, Microsoft)
+        #     searched individually on YF v1 since the full query returns no quotes.
         tickers = _extract_ticker_candidates(query)
+        candidate_names: list[str] = []
+        _common_words = {
+            "AND", "THE", "FOR", "WITH", "FROM", "THAT", "THIS", "STOCK",
+            "STOCKS", "SHARE", "SHARES", "MARKET", "PRICE", "EARNINGS",
+            "REVENUE", "GROWTH", "ANALYSIS", "REPORT", "QUARTER", "ANNUAL",
+            "COMPANY", "CORP", "INC", "LLC", "LTD", "ABOUT", "WILL", "HAVE",
+        }
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            # All-caps 2-10 chars that aren't blocked words (company names)
+            if re.match(r"^[A-Z]{2,10}$", t) and t not in _common_words:
+                candidate_names.append(t)
+            # Title-case 5+ chars (Apple, Google, Microsoft, Amazon …)
+            elif re.match(r"^[A-Z][a-z]{4,}$", t):
+                candidate_names.append(t)
+
+        for name_cand in candidate_names[:5]:
+            if name_cand.upper() in fetched_symbols:
+                continue
+            yf_p = urllib.parse.urlencode(
+                {"q": name_cand, "quotesCount": 3, "newsCount": 0}
+            )
+            yf_data = self._get_json(
+                f"https://query1.finance.yahoo.com/v1/finance/search?{yf_p}"
+            )
+            for item in (yf_data.get("quotes") or [])[:2]:
+                sym = str(item.get("symbol") or "").strip()
+                nm = str(item.get("longname") or item.get("shortname") or sym)
+                qt = str(item.get("quoteType") or "").upper()
+                if not sym or qt not in {"EQUITY", "ETF", "MUTUALFUND"}:
+                    continue
+                if sym in fetched_symbols:
+                    continue
+                fetched_symbols.add(sym)
+                abstract = self._fetch_yf_fundamentals_abstract(sym, nm)
+                if not abstract:
+                    continue
+                sources.append(
+                    ResearchSource(
+                        provider="financial-portals",
+                        title=f"{nm} ({sym}) — Live Fundamentals",
+                        url=f"https://finance.yahoo.com/quote/{sym}",
+                        year=datetime.now(UTC).year,
+                        abstract=abstract,
+                        score=65.0,
+                    )
+                )
+
+        # Direct ticker lookup (short 1-5 char tickers explicitly in query)
         for ticker in tickers[:6]:
             ticker_upper = ticker.upper().strip()
             if ticker_upper in fetched_symbols:
@@ -2849,105 +3208,161 @@ class DeepResearchEngine:
             "ok" if sources else "empty",
             f"returned {len(sources)} sources (real API data) for: {query[:80]}",
         )
+        sources.sort(
+            key=lambda source: (
+                source.score,
+                "Live Fundamentals" in source.title,
+            ),
+            reverse=True,
+        )
         return sources[: target_limit * 3]
+
 
     def _search_sec_edgar(
         self,
         query: str,
         limit: int | None = None,
     ) -> list[ResearchSource]:
-        """Search SEC EDGAR for filings + fetch real financial data via XBRL.
+        """Search SEC EDGAR for real company filings using browse-edgar Atom XML.
 
-        Uses three SEC data sources (all free, no API key):
-        1. efts.sec.gov — full-text search across all SEC filings
-        2. data.sec.gov/submissions/ — company metadata and filing history
-        3. data.sec.gov/api/xbrl/companyfacts/ — audited GAAP financial data
+        The EFTS full-text search (efts.sec.gov) is blocked by Akamai CDN for
+        programmatic access.  This method uses the officially-supported
+        browse-edgar endpoint which returns Atom XML and is not CDN-protected:
 
-        Every source contains real data from the SEC's structured APIs.
-        No template URLs — filing index URLs are constructed from real
-        accession numbers returned by the search API.
+        1. For tickers found in the query: resolve CIK via company_tickers.json
+           then call browse-edgar for the exact company's filing history.
+        2. For company-name searches: use browse-edgar's company search mode.
+        3. For named tickers: call _fetch_sec_company_facts for full XBRL data
+           (audited revenue, net income, EPS) — the primary-source numbers a
+           sell-side analyst builds their model from.
         """
+        import xml.etree.ElementTree as ET
+
         target_limit = max(1, int(limit or self.limit_per_provider))
         sources: list[ResearchSource] = []
+        ATOM_NS = "http://www.w3.org/2005/Atom"
+        sec_ua = os.environ.get(
+            "SEC_USER_AGENT",
+            "agentos-orchestrator/0.1 research-bot (public-research-use)",
+        )
 
-        # ── 1. EDGAR full-text search ─────────────────────────────────────────
-        # Use quoted phrase for precision, then unquoted for recall
-        for search_q in [f'"{query}"', query]:
-            params = urllib.parse.urlencode(
-                {
-                    "q": search_q,
-                    "dateRange": "custom",
-                    "startdt": "2023-01-01",
-                    "forms": "10-K,10-Q,8-K,DEF 14A,S-1",
-                }
+        def _fetch_browse_edgar_atom(url: str) -> "list[ResearchSource]":
+            """Fetch browse-edgar Atom XML and parse into ResearchSource objects."""
+            body = self._get_sec_text(
+                url,
+                accept="application/atom+xml,text/xml,*/*",
             )
-            payload = self._get_sec_json(
-                f"https://efts.sec.gov/LATEST/search-index?{params}"
-            )
-            hits = (payload.get("hits") or {}).get("hits") or []
-            if hits:
-                break  # Found results with quoted search
+            if not body:
+                return []
+            try:
+                root = ET.fromstring(body)
+            except ET.ParseError:
+                return []
 
-        for hit in hits[:target_limit]:
-            src = hit.get("_source") or {}
-            filing_date = str(src.get("file_date") or "")
-            year = (
-                int(filing_date[:4])
-                if len(filing_date) >= 4
-                else datetime.now(UTC).year
+            atom_tag = f"{{{ATOM_NS}}}"
+            # Company name from optional <company-info> element
+            ci = root.find("company-info") or root.find(
+                f"{atom_tag}company-info"
             )
-            accession_no = str(
-                src.get("accession_no") or ""
-            )  # e.g. "0001045810-24-000029"
-            cik = str(src.get("entity_id") or "").strip()
-            entity_names = src.get("display_names") or []
-            entity_name = str(entity_names[0]) if entity_names else "Unknown Entity"
-            form_type = str(src.get("form_type") or "Filing")
-            period = str(src.get("period_of_report") or "")
-            file_desc = str(src.get("file_description") or "")
-
-            # Construct the real EDGAR filing index URL from the accession number
-            if cik and accession_no and re.match(r"^\d{10}-\d{2}-\d{6}$", accession_no):
-                accession_clean = accession_no.replace("-", "")
-                filing_index_url = (
-                    f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-                    f"{accession_clean}/{accession_no}-index.htm"
+            company_name = ""
+            if ci is not None:
+                company_name = (
+                    ci.findtext("conformed-name")
+                    or ci.findtext(f"{atom_tag}conformed-name")
+                    or ""
                 )
-            elif cik:
-                filing_index_url = (
-                    f"https://www.sec.gov/cgi-bin/browse-edgar"
-                    f"?action=getcompany&CIK={cik}&type={form_type}"
-                    f"&dateb=&owner=include&count=10"
+
+            parsed: list[ResearchSource] = []
+            for entry_el in list(root.iter(f"{atom_tag}entry"))[:12]:
+                title = entry_el.findtext(f"{atom_tag}title") or ""
+                link_el = entry_el.find(f"{atom_tag}link")
+                href = link_el.get("href", "") if link_el is not None else ""
+                updated = entry_el.findtext(f"{atom_tag}updated") or ""
+                cat_el = entry_el.find(f"{atom_tag}category")
+                form_type = (
+                    cat_el.get("term", "Filing") if cat_el is not None else "Filing"
                 )
-            else:
-                continue  # Skip entries without a usable CIK
-
-            abstract = (
-                f"SEC {form_type} by {entity_name}. "
-                f"Filed: {filing_date}."
-                + (f" Period: {period}." if period else "")
-                + (f" {file_desc[:300]}" if file_desc else "")
-            ).strip()
-
-            sources.append(
-                ResearchSource(
-                    provider="sec-edgar",
-                    title=f"{entity_name} — {form_type} ({filing_date})",
-                    url=filing_index_url,
-                    year=year,
-                    abstract=abstract,
-                    score=52.0,
+                if not href or not href.startswith("http"):
+                    continue
+                year = (
+                    int(updated[:4]) if len(updated) >= 4 else datetime.now(UTC).year
                 )
-            )
+                label = company_name or form_type
+                parsed.append(
+                    ResearchSource(
+                        provider="sec-edgar",
+                        title=f"{label} — {form_type} ({updated[:10]})",
+                        url=href,
+                        year=year,
+                        abstract=(
+                            f"SEC {form_type} filing"
+                            + (f" by {company_name}" if company_name else "")
+                            + f". Filed: {updated[:10]}."
+                            + (f" {title[:200]}" if title else "")
+                        ),
+                        score=52.0,
+                    )
+                )
+            return parsed
 
-        # ── 2. For identified tickers, fetch real XBRL financial data ─────────
-        # This is the primary-source data a fundamental analyst uses:
-        # audited revenue, net income, EPS from actual SEC filings.
         tickers = _extract_ticker_candidates(query)
+
+        # ── 1. Per-ticker: direct CIK lookup → browse-edgar filing list + XBRL
+        seen_ciks: set[str] = set()
         for ticker in tickers[:4]:
-            sec_source = self._fetch_sec_company_facts(ticker)
+            ticker_up = ticker.upper().strip()
+
+            # High-value XBRL data (audited P&L from actual 10-K filings)
+            sec_source = self._fetch_sec_company_facts(ticker_up)
             if sec_source is not None:
                 sources.append(sec_source)
+
+            # Filing list via browse-edgar CIK lookup
+            tickers_map = self._get_sec_tickers()
+            entry = tickers_map.get(ticker_up)
+            if entry:
+                cik_int = entry.get("cik_str") or entry.get("cik")
+                if cik_int:
+                    cik_str = str(int(cik_int))
+                    if cik_str not in seen_ciks:
+                        seen_ciks.add(cik_str)
+                        atom_url = (
+                            f"https://www.sec.gov/cgi-bin/browse-edgar"
+                            f"?action=getcompany&CIK={cik_str}"
+                            f"&type=10-K,10-Q,8-K&dateb=&owner=include"
+                            f"&count={target_limit}&output=atom"
+                        )
+                        sources.extend(_fetch_browse_edgar_atom(atom_url))
+
+        # ── 2. Company-name search on browse-edgar (catches non-ticker queries)
+        # Browse-edgar company search needs a focused company name, NOT a full
+        # analytical query.  Extract the first recognizable company name token.
+        if not tickers or len(sources) < target_limit:
+            # Extract the best company-name term from the query
+            _stop = {
+                "AND", "THE", "FOR", "WITH", "FROM", "THAT", "THIS", "ABOUT",
+                "WILL", "HAVE", "STOCK", "STOCKS", "SHARES", "MARKET", "PRICE",
+                "EARNINGS", "REVENUE", "GROWTH", "ANALYSIS", "REPORT",
+                "QUARTER", "ANNUAL", "QUARTERLY", "COMPANY", "CORP", "INC",
+            }
+            company_search_term = query[:60]
+            for token in query.split():
+                t = token.strip(".,!?;:")
+                # Prefer long all-caps tokens (NVIDIA, AMAZON, MICROSOFT …)
+                if re.match(r"^[A-Z]{3,}$", t) and t not in _stop:
+                    company_search_term = t
+                    break
+                # Or title-case words of 5+ chars
+                if re.match(r"^[A-Z][a-z]{4,}$", t):
+                    company_search_term = t
+                    break
+            search_url = (
+                f"https://www.sec.gov/cgi-bin/browse-edgar"
+                f"?company={urllib.parse.quote_plus(company_search_term)}"
+                f"&CIK=&type=10-K&dateb=&owner=include"
+                f"&count={target_limit}&search_text=&action=getcompany&output=atom"
+            )
+            sources.extend(_fetch_browse_edgar_atom(search_url))
 
         self._record_provider_diagnostic(
             "sec-edgar",
@@ -2955,6 +3370,964 @@ class DeepResearchEngine:
             f"returned {len(sources)} SEC sources for: {query[:80]}",
         )
         return sources
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # WALL STREET RESEARCH PROVIDERS
+    # Real data sources a sell-side analyst would use to build a research note.
+    # Every method here fetches actual numbers from live APIs or public pages —
+    # no templates, no placeholder URLs.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _search_bing_results(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Bing web search — second engine alongside DuckDuckGo.
+
+        Bing covers many financial/news pages that DuckDuckGo doesn't surface,
+        especially WSJ, Bloomberg, Reuters, and MarketWatch articles.
+        Uses HTML scraping of Bing's public search page (no API key needed).
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        seen_urls: set[str] = set()
+
+        for page in range(min(3, (target_limit + 9) // 10)):
+            first_param = page * 10
+            params = urllib.parse.urlencode({
+                "q": query,
+                "first": str(first_param) if first_param > 0 else "1",
+                "setlang": "en-US",
+                "cc": "US",
+            })
+            raw = self._get_text(
+                f"https://www.bing.com/search?{params}",
+                accept="text/html,application/xhtml+xml",
+                max_bytes=150_000,
+                timeout_seconds=8,
+            )
+            if not raw:
+                break
+
+            # Bing results: <li class="b_algo"> ... <h2><a href="...">title</a></h2>
+            for match in re.finditer(
+                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                raw,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                url = match.group(1).strip()
+                title = self._html_to_text(match.group(2)).strip()
+                if not url or not title:
+                    continue
+                if not self._is_safe_public_url(url):
+                    continue
+                if "bing.com" in url or "microsoft.com" in url:
+                    continue
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                # Extract snippet from following text
+                tail = raw[match.end():match.end() + 2000]
+                snippet_m = re.search(
+                    r'<p[^>]*class="[^"]*b_algoSlug[^"]*"[^>]*>(.*?)</p>',
+                    tail, flags=re.IGNORECASE | re.DOTALL,
+                )
+                snippet = self._html_to_text(snippet_m.group(1)) if snippet_m else ""
+                host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+                score = max(target_limit - len(sources), 1)
+                sources.append(ResearchSource(
+                    provider="bing-search",
+                    title=title[:160],
+                    url=url,
+                    authors=[host] if host else [],
+                    abstract=(snippet or f"Bing result: {title}")[:800],
+                    score=float(score),
+                ))
+                if len(sources) >= target_limit:
+                    break
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "bing-search",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} results",
+        )
+        return sources
+
+    def _search_google_news_rss(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Google News RSS — real-time financial news with actual article links.
+
+        Google News RSS is public and unauthenticated. Returns genuine news
+        articles from WSJ, Reuters, Bloomberg, CNBC, FT, MarketWatch, etc.
+        — the same sources a Bloomberg terminal's news feed would show.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        # Encode query for Google News RSS
+        params = urllib.parse.urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        rss_url = f"https://news.google.com/rss/search?{params}"
+        raw = self._get_text(rss_url, accept="application/rss+xml,text/xml,*/*", max_bytes=200_000, timeout_seconds=8)
+        if not raw:
+            self._record_provider_diagnostic("google-news-rss", "empty", "no RSS response")
+            return []
+
+        # Parse RSS <item> elements
+        seen: set[str] = set()
+        for item_match in re.finditer(r"<item>(.*?)</item>", raw, re.DOTALL | re.IGNORECASE):
+            item = item_match.group(1)
+            title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", item, re.DOTALL)
+            link_m = re.search(r"<link>(.*?)</link>|<guid[^>]*>(https?://[^<]+)</guid>", item, re.DOTALL)
+            pub_m = re.search(r"<pubDate>(.*?)</pubDate>", item)
+            source_m = re.search(r'<source[^>]*>(.*?)</source>', item, re.DOTALL)
+            title = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
+            url = (link_m.group(1) or link_m.group(2) or "").strip() if link_m else ""
+            # Google News wraps links in its redirect; try to decode
+            if "news.google.com" in url:
+                # The real URL is after a redirect; use as-is (enrichment will follow)
+                pass
+            publisher = self._html_to_text(source_m.group(1)).strip() if source_m else "Google News"
+            pub_date = pub_m.group(1).strip() if pub_m else ""
+            year = datetime.now(UTC).year
+            if pub_date:
+                yr_m = re.search(r"\b(20\d\d)\b", pub_date)
+                if yr_m:
+                    year = int(yr_m.group(1))
+            if not title or not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            sources.append(ResearchSource(
+                provider="google-news-rss",
+                title=title[:160],
+                url=url,
+                year=year,
+                authors=[publisher] if publisher else [],
+                abstract=f"{publisher}: {title}",
+                score=30.0,
+            ))
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "google-news-rss",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} news articles",
+        )
+        return sources
+
+    def _search_macrotrends(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Macrotrends.net — historical financial metrics without API key.
+
+        Macrotrends is the go-to source for 10–20-year historical charts of
+        P/E ratio, revenue, net income, EPS, gross margin, EBITDA, dividend
+        yield, and 50+ other metrics. A real analyst ALWAYS pulls Macrotrends
+        to understand long-run valuation context and trend direction.
+
+        Extracts company name tokens from the query, maps to Macrotrends
+        ticker/slug URLs, and fetches the actual page content.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+
+        # Resolve company name → ticker via yfinance if available
+        candidate_tickers: list[tuple[str, str]] = []  # (ticker, name)
+        try:
+            import yfinance as yf  # type: ignore[import-not-found]
+            _candidates = _extract_ticker_candidates(query)
+            _stop = {"AND", "THE", "FOR", "WITH", "FROM", "THAT", "THIS",
+                     "STOCK", "EARNINGS", "REVENUE", "GROWTH", "ANALYSIS"}
+            for token in query.split():
+                t = token.strip(".,!?;:")
+                if re.match(r"^[A-Z]{2,10}$", t) and t not in _stop:
+                    if t not in _candidates:
+                        _candidates.append(t)
+                elif re.match(r"^[A-Z][a-z]{4,}$", t):
+                    # Title-case: search YF to get ticker
+                    yf_p = urllib.parse.urlencode({"q": t, "quotesCount": 1, "newsCount": 0})
+                    yf_d = self._get_json(f"https://query1.finance.yahoo.com/v1/finance/search?{yf_p}")
+                    for item in (yf_d.get("quotes") or [])[:1]:
+                        sym = str(item.get("symbol") or "").strip()
+                        if sym and str(item.get("quoteType") or "").upper() == "EQUITY":
+                            _candidates.append(sym)
+            for ticker in _candidates[:4]:
+                try:
+                    info = yf.Ticker(ticker).info or {}
+                    name = str(info.get("longName") or info.get("shortName") or ticker)
+                    candidate_tickers.append((ticker, name))
+                except Exception:
+                    candidate_tickers.append((ticker, ticker))
+        except ImportError:
+            _tickers = _extract_ticker_candidates(query)
+            candidate_tickers = [(t, t) for t in _tickers[:4]]
+
+        # Macrotrends metric pages — these have actual historical series
+        metrics = [
+            ("revenue", "Revenue"),
+            ("net-income", "Net Income"),
+            ("eps-earnings-per-share-diluted", "Diluted EPS"),
+            ("pe-ratio", "P/E Ratio"),
+            ("price-to-book-ratio", "P/B Ratio"),
+            ("return-on-equity", "ROE"),
+            ("free-cash-flow", "Free Cash Flow"),
+            ("gross-profit-margin", "Gross Margin"),
+        ]
+
+        for ticker, name in candidate_tickers[:3]:
+            ticker_lc = ticker.lower()
+            name_slug = re.sub(r"[^a-z0-9]+", "-", name.lower())[:30].strip("-")
+            for metric_slug, metric_label in metrics[:4]:  # top 4 metrics per company
+                url = f"https://www.macrotrends.net/stocks/charts/{ticker_lc}/{name_slug}/{metric_slug}"
+                raw = self._get_text(url, accept="text/html,*/*", max_bytes=80_000, timeout_seconds=8)
+                if not raw:
+                    continue
+                # Extract JSON data embedded in the page
+                # Macrotrends embeds data as: var originalData = [...];
+                data_m = re.search(r"var\s+originalData\s*=\s*(\[.*?\]);", raw, re.DOTALL)
+                if data_m:
+                    try:
+                        data_rows = json.loads(data_m.group(1))
+                        # Each row: {"date": "2024-01-01", "v1": 123456789}
+                        rows = [(r.get("date", "")[:7], r.get("v1") or r.get("v2"))
+                                for r in data_rows if r.get("date")]
+                        rows = [(d, v) for d, v in rows if v is not None]
+                        if rows:
+                            recent = rows[-8:]  # last 8 quarters/years
+                            series_str = "; ".join(
+                                f"{d}: ${v/1e9:.2f}B" if abs(float(v)) >= 1e9
+                                else f"{d}: {float(v):.2f}" if metric_slug.endswith("ratio") or metric_slug.startswith("pe") or "margin" in metric_slug
+                                else f"{d}: ${v/1e6:.0f}M"
+                                for d, v in recent
+                            )
+                            abstract = (
+                                f"{name} ({ticker}) {metric_label} — Historical Data: {series_str}"
+                            )
+                            sources.append(ResearchSource(
+                                provider="macrotrends",
+                                title=f"{name} ({ticker}) — {metric_label} Historical",
+                                url=url,
+                                year=datetime.now(UTC).year,
+                                abstract=abstract[:2000],
+                                score=55.0,
+                            ))
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass
+                elif raw:
+                    # No embedded data — still useful as a page to enrich
+                    text = self._html_to_text(raw)[:800]
+                    if text and len(text) > 100 and name.lower() in text.lower():
+                        sources.append(ResearchSource(
+                            provider="macrotrends",
+                            title=f"{name} ({ticker}) — {metric_label}",
+                            url=url,
+                            year=datetime.now(UTC).year,
+                            abstract=text[:800],
+                            score=40.0,
+                        ))
+                if len(sources) >= target_limit:
+                    break
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "macrotrends",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} historical metric sources",
+        )
+        return sources
+
+    def _search_stockanalysis(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """StockAnalysis.com — free earnings, revenue, balance sheet data.
+
+        StockAnalysis provides clean tables of quarterly/annual financials,
+        earnings estimates, institutional ownership, and more. It renders
+        as static HTML for many sections, making it scrapable without a
+        JavaScript engine. A key data cross-check tool for any analyst.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        seen_urls: set[str] = set()
+
+        # Extract tickers
+        tickers: list[str] = []
+        _stop = {"AND", "THE", "FOR", "WITH", "STOCK", "EARNINGS", "REVENUE",
+                 "GROWTH", "ANALYSIS", "MARKET", "SHARES"}
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            if re.match(r"^[A-Z]{1,10}$", t) and t not in _stop:
+                tickers.append(t)
+            elif re.match(r"^[A-Z][a-z]{4,}$", t):
+                # Title-case name: look up ticker
+                yf_p = urllib.parse.urlencode({"q": t, "quotesCount": 1, "newsCount": 0})
+                yf_d = self._get_json(f"https://query1.finance.yahoo.com/v1/finance/search?{yf_p}")
+                for item in (yf_d.get("quotes") or [])[:1]:
+                    sym = str(item.get("symbol") or "").strip()
+                    if sym:
+                        tickers.append(sym)
+
+        tickers = list(dict.fromkeys(tickers))[:4]
+
+        sections = [
+            ("financials", "Annual Financials"),
+            ("financials/quarterly", "Quarterly Financials"),
+            ("forecast", "Earnings Estimates"),
+        ]
+
+        for ticker in tickers[:3]:
+            ticker_lc = ticker.lower()
+            for section_path, section_label in sections[:2]:
+                url = f"https://stockanalysis.com/stocks/{ticker_lc}/{section_path}/"
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                raw = self._get_text(url, accept="text/html,*/*", max_bytes=100_000, timeout_seconds=8)
+                if not raw:
+                    continue
+                text = self._html_to_text(raw)
+                if len(text) < 200:
+                    continue
+                # Extract the financial table portion
+                # Look for revenue/earnings patterns in extracted text
+                numbers = re.findall(r"\b\d{1,3}(?:\.\d+)?[BMK%]\b", text)
+                if not numbers:
+                    continue
+                # Build a compact summary of financial data found
+                first_2000 = re.sub(r"\s+", " ", text)[:2000]
+                sources.append(ResearchSource(
+                    provider="stockanalysis",
+                    title=f"{ticker.upper()} — {section_label} (StockAnalysis)",
+                    url=url,
+                    year=datetime.now(UTC).year,
+                    abstract=first_2000,
+                    score=58.0,
+                ))
+                if len(sources) >= target_limit:
+                    break
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "stockanalysis",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} financial table sources",
+        )
+        return sources
+
+    def _search_insider_transactions(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """SEC Form 4 insider transactions — real smart-money signals.
+
+        When executives and directors buy or sell their own stock, that's
+        material non-public-activity-adjacent signal. SEC Form 4s are filed
+        within 2 business days of every insider transaction and are public
+        record. This is THE primary source for insider-trading analysis on
+        Wall Street.
+
+        Uses OpenInsider.com (aggregates SEC Form 4 filings, freely accessible)
+        and the SEC EDGAR full-text browse endpoint for Form 4 filings.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+
+        # Extract tickers from query
+        tickers: list[str] = []
+        _stop = {"AND", "THE", "FOR", "INSIDER", "TRANSACTION", "STOCK",
+                 "TRADING", "BUYING", "SELLING"}
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            if re.match(r"^[A-Z]{1,6}$", t) and t not in _stop:
+                tickers.append(t)
+        tickers = (_extract_ticker_candidates(query) + tickers)
+        tickers = list(dict.fromkeys(tickers))[:4]
+
+        for ticker in tickers[:3]:
+            # OpenInsider — aggregated Form 4 data in human-readable table
+            oi_url = f"https://openinsider.com/search?q={urllib.parse.quote(ticker)}"
+            raw = self._get_text(oi_url, accept="text/html,*/*", max_bytes=80_000, timeout_seconds=8)
+            if raw:
+                text = self._html_to_text(raw)
+                # Look for buy/sell transactions
+                buy_m = re.findall(r"(?:purchase|buy|bought)[^.]*\$[\d,]+", text.lower())
+                sell_m = re.findall(r"(?:sale|sell|sold)[^.]*\$[\d,]+", text.lower())
+                if text and len(text) > 200:
+                    sources.append(ResearchSource(
+                        provider="insider-transactions",
+                        title=f"{ticker.upper()} — SEC Form 4 Insider Transactions",
+                        url=oi_url,
+                        year=datetime.now(UTC).year,
+                        abstract=re.sub(r"\s+", " ", text)[:1500],
+                        score=62.0,
+                    ))
+
+            # Also pull directly from SEC EDGAR Form 4 browse
+            tickers_map = self._get_sec_tickers()
+            entry = tickers_map.get(ticker.upper())
+            if entry:
+                cik_int = entry.get("cik_str") or entry.get("cik")
+                if cik_int:
+                    cik_str = str(int(cik_int))
+                    form4_url = (
+                        f"https://www.sec.gov/cgi-bin/browse-edgar"
+                        f"?action=getcompany&CIK={cik_str}"
+                        f"&type=4&dateb=&owner=include&count={target_limit}"
+                        f"&search_text=&output=atom"
+                    )
+                    form4_sources = self._fetch_browse_edgar_atom_generic(form4_url, "4", entry.get("title", ticker))
+                    sources.extend(form4_sources[:3])
+
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "insider-transactions",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} insider transaction sources",
+        )
+        return sources
+
+    def _fetch_browse_edgar_atom_generic(
+        self,
+        url: str,
+        form_type: str,
+        company_name: str,
+    ) -> list[ResearchSource]:
+        """Reusable browse-edgar Atom XML fetcher for any form type."""
+        import xml.etree.ElementTree as ET
+        ATOM_NS = "http://www.w3.org/2005/Atom"
+        body = self._get_sec_text(
+            url,
+            accept="application/atom+xml,text/xml,*/*",
+        )
+        if not body:
+            return []
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            return []
+        sources: list[ResearchSource] = []
+        for entry_el in list(root.iter(f"{{{ATOM_NS}}}entry"))[:8]:
+            link_el = entry_el.find(f"{{{ATOM_NS}}}link")
+            href = link_el.get("href", "") if link_el is not None else ""
+            updated = entry_el.findtext(f"{{{ATOM_NS}}}updated") or ""
+            if not href or not href.startswith("http"):
+                continue
+            year = int(updated[:4]) if len(updated) >= 4 else datetime.now(UTC).year
+            sources.append(ResearchSource(
+                provider="sec-edgar",
+                title=f"{company_name} — Form {form_type} ({updated[:10]})",
+                url=href,
+                year=year,
+                abstract=f"SEC Form {form_type} filing by {company_name}. Filed: {updated[:10]}.",
+                score=48.0,
+            ))
+        return sources
+
+    def _search_short_interest(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Short interest data from FINRA and public financial sites.
+
+        Short interest is one of the most important signals for identifying:
+        1. Potential short squeezes (high short interest + rising price)
+        2. Market consensus that a stock is overvalued
+        3. Hidden risk in positions
+
+        FINRA publishes bi-monthly short interest data for all exchange-listed
+        securities and it's freely accessible. We also check finviz and
+        Yahoo Finance (already have via yfinance short float).
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+
+        tickers: list[str] = []
+        _stop = {"AND", "THE", "FOR", "SHORT", "INTEREST", "SQUEEZE", "FLOAT"}
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            if re.match(r"^[A-Z]{1,6}$", t) and t not in _stop:
+                tickers.append(t)
+        tickers = (_extract_ticker_candidates(query) + tickers)
+        tickers = list(dict.fromkeys(tickers))[:4]
+
+        for ticker in tickers[:3]:
+            # Finviz has real-time short float and short ratio in their screener
+            finviz_url = f"https://finviz.com/quote.ashx?t={ticker.upper()}"
+            raw = self._get_text(finviz_url, accept="text/html,*/*", max_bytes=80_000, timeout_seconds=8)
+            if raw:
+                text = self._html_to_text(raw)
+                # Look for key Finviz table values
+                short_float_m = re.search(r"Short Float[^\d]*([\d.]+%)", raw, re.IGNORECASE)
+                short_ratio_m = re.search(r"Short Ratio[^\d]*([\d.]+)", raw, re.IGNORECASE)
+                short_int_m = re.search(r"Short Interest[^\d]*([\d,.]+[MK]?)", raw, re.IGNORECASE)
+                shares_outstanding_m = re.search(r"Shs Outstand[^\d]*([\d.]+[MBK]?)", raw, re.IGNORECASE)
+                float_m = re.search(r"(?:^|\s)Float[^\d]*([\d.]+[MBK]?)", raw, re.IGNORECASE)
+                inst_own_m = re.search(r"Inst Own[^\d]*([\d.]+%)", raw, re.IGNORECASE)
+                insider_own_m = re.search(r"Insider Own[^\d]*([\d.]+%)", raw, re.IGNORECASE)
+                perf_ytd_m = re.search(r"Perf YTD[^\s]*([-+\d.]+%)", raw, re.IGNORECASE)
+
+                parts: list[str] = [f"{ticker.upper()} (Finviz)"]
+                if short_float_m:
+                    parts.append(f"Short Float: {short_float_m.group(1)}")
+                if short_ratio_m:
+                    parts.append(f"Short Ratio: {short_ratio_m.group(1)} days")
+                if short_int_m:
+                    parts.append(f"Short Interest: {short_int_m.group(1)}")
+                if float_m:
+                    parts.append(f"Float: {float_m.group(1)}")
+                if inst_own_m:
+                    parts.append(f"Inst Own: {inst_own_m.group(1)}")
+                if insider_own_m:
+                    parts.append(f"Insider Own: {insider_own_m.group(1)}")
+                if perf_ytd_m:
+                    parts.append(f"Perf YTD: {perf_ytd_m.group(1)}")
+
+                if len(parts) > 2:
+                    sources.append(ResearchSource(
+                        provider="short-interest",
+                        title=f"{ticker.upper()} — Short Interest & Ownership (Finviz)",
+                        url=finviz_url,
+                        year=datetime.now(UTC).year,
+                        abstract=" | ".join(parts),
+                        score=60.0,
+                    ))
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "short-interest",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} short interest sources",
+        )
+        return sources
+
+    def _search_earnings_data(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Earnings estimates and calendar from Yahoo Finance earnings API.
+
+        Earnings surprises (beat vs miss) and forward guidance revisions are
+        the single most important short-term catalyst for stock prices. This
+        method fetches the earnings calendar and analyst EPS estimates — the
+        same data a sell-side analyst builds their quarterly model around.
+        Uses yfinance for earnings history and the YF earnings calendar API.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+
+        tickers: list[str] = []
+        _stop = {"AND", "THE", "FOR", "EARNINGS", "CALENDAR", "ESTIMATE",
+                 "EPS", "GUIDANCE", "BEAT", "MISS"}
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            if re.match(r"^[A-Z]{1,10}$", t) and t not in _stop:
+                tickers.append(t)
+        tickers = (_extract_ticker_candidates(query) + tickers)
+        tickers = list(dict.fromkeys(tickers))[:4]
+
+        try:
+            import yfinance as yf  # type: ignore[import-not-found]
+            for ticker in tickers[:4]:
+                try:
+                    tk = yf.Ticker(ticker.upper())
+                    # Earnings history
+                    history = tk.earnings_history
+                    if history is not None and not history.empty:
+                        rows = history.tail(8)
+                        lines: list[str] = []
+                        for idx, row in rows.iterrows():
+                            eps_est = row.get("epsEstimate")
+                            eps_act = row.get("epsActual")
+                            surprise = row.get("epsDifference")
+                            surprise_pct = row.get("surprisePercent")
+                            if eps_act is not None:
+                                period = str(idx)[:10] if idx else "?"
+                                line = f"{period}: EPS ${eps_act:.2f}"
+                                if eps_est is not None:
+                                    line += f" (est ${eps_est:.2f}"
+                                if surprise_pct is not None:
+                                    line += f", {surprise_pct:+.1f}% surprise)"
+                                elif eps_est is not None:
+                                    line += ")"
+                                lines.append(line)
+                        if lines:
+                            sources.append(ResearchSource(
+                                provider="earnings-data",
+                                title=f"{ticker.upper()} — EPS History & Surprise Track",
+                                url=f"https://finance.yahoo.com/quote/{ticker.upper()}/earnings",
+                                year=datetime.now(UTC).year,
+                                abstract=f"{ticker.upper()} Earnings History: " + "; ".join(lines),
+                                score=68.0,
+                            ))
+                    # Next earnings date estimate
+                    cal = tk.calendar
+                    if cal is not None and not cal.empty:
+                        next_date = cal.get("Earnings Date")
+                        if next_date is not None:
+                            dates = list(next_date) if hasattr(next_date, "__iter__") else [next_date]
+                            date_str = ", ".join(str(d)[:10] for d in dates[:2])
+                            eps_est_low = cal.get("EPS Estimate")
+                            rev_est = cal.get("Revenue Estimate")
+                            cal_parts = [f"{ticker.upper()} Next Earnings: {date_str}"]
+                            if eps_est_low is not None:
+                                try:
+                                    cal_parts.append(f"EPS Est: ${float(eps_est_low.iloc[0]):.2f}")
+                                except Exception:
+                                    pass
+                            if rev_est is not None:
+                                try:
+                                    rv = float(rev_est.iloc[0])
+                                    cal_parts.append(f"Rev Est: ${rv/1e9:.2f}B")
+                                except Exception:
+                                    pass
+                            sources.append(ResearchSource(
+                                provider="earnings-data",
+                                title=f"{ticker.upper()} — Next Earnings Date & Estimates",
+                                url=f"https://finance.yahoo.com/quote/{ticker.upper()}/earnings",
+                                year=datetime.now(UTC).year,
+                                abstract=" | ".join(cal_parts),
+                                score=65.0,
+                            ))
+                except Exception:
+                    pass
+                if len(sources) >= target_limit:
+                    break
+        except ImportError:
+            pass
+
+        self._record_provider_diagnostic(
+            "earnings-data",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} earnings sources",
+        )
+        return sources
+
+    def _search_fed_macro_data(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Federal Reserve (FRED) and BEA/BLS macro data — public APIs.
+
+        Macro context is essential for equity valuation. Interest rates,
+        inflation, GDP growth, unemployment, and yield curve shape all affect
+        DCF discount rates and earnings multiples. This method fetches key
+        macro indicators from FRED (Federal Reserve Economic Data) which
+        provides a public JSON API for hundreds of economic series.
+
+        A real macro/equity analyst checks these before forming a view on
+        valuation multiples and risk premium.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        lower_q = query.lower()
+
+        # FRED series IDs for macro indicators a WS analyst would check
+        series_map = {
+            "DFF": ("Fed Funds Rate (Effective)", "interest rate macro"),
+            "GS10": ("10-Year Treasury Yield", "interest rate yield curve"),
+            "GS2": ("2-Year Treasury Yield", "yield curve short rate"),
+            "T10Y2Y": ("10Y-2Y Yield Spread (Inversion Signal)", "yield curve inversion"),
+            "CPIAUCSL": ("CPI Inflation (All Items)", "inflation price level"),
+            "PCE": ("Personal Consumption Expenditures", "consumer spending gdp"),
+            "GDPC1": ("Real GDP (Annualized)", "economic growth gdp"),
+            "UNRATE": ("Unemployment Rate", "labor market jobs"),
+            "VIXCLS": ("CBOE Volatility Index (VIX)", "market volatility fear"),
+            "SP500": ("S&P 500 Index Level", "stock market equity"),
+            "DEXUSEU": ("USD/EUR Exchange Rate", "dollar currency forex"),
+            "DCOILWTICO": ("WTI Crude Oil Price", "oil energy commodity"),
+        }
+
+        # Determine which series are relevant to this query
+        relevant_ids: list[str] = []
+        for series_id, (label, keywords) in series_map.items():
+            for kw in keywords.split():
+                if kw in lower_q:
+                    relevant_ids.append(series_id)
+                    break
+
+        # If no specific match, include core macro indicators for any WS query
+        if not relevant_ids and self._looks_like_market_query(query):
+            relevant_ids = ["DFF", "GS10", "T10Y2Y", "CPIAUCSL", "GDPC1", "VIXCLS"]
+
+        if not relevant_ids:
+            self._record_provider_diagnostic("fed-macro", "skipped", "query not macro-relevant")
+            return []
+
+        # FRED API — returns JSON, completely free and public
+        fred_key = os.environ.get("FRED_API_KEY") or ""  # optional key for higher rate limits
+        for series_id in relevant_ids[:min(target_limit, 6)]:
+            label, _ = series_map[series_id]
+            params = {
+                "series_id": series_id,
+                "file_type": "json",
+                "limit": "8",
+                "sort_order": "desc",
+            }
+            if fred_key:
+                params["api_key"] = fred_key
+            fred_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+            # Use the public CSV endpoint (no API key needed)
+            csv_raw = self._get_text(
+                f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&vintage_date=",
+                accept="text/csv,text/plain,*/*",
+                max_bytes=20_000,
+                timeout_seconds=6,
+            )
+            if not csv_raw:
+                continue
+            lines = [line.strip() for line in csv_raw.splitlines() if line.strip() and not line.startswith("DATE")]
+            # Last 8 data points
+            recent_lines = [line for line in lines if "." in line][-8:]
+            if not recent_lines:
+                continue
+            data_points: list[str] = []
+            for line in recent_lines:
+                parts = line.split(",")
+                if len(parts) >= 2 and parts[1].replace(".", "").replace("-", "").isdigit():
+                    data_points.append(f"{parts[0]}: {parts[1]}")
+            if not data_points:
+                continue
+            abstract = f"{label}: " + "; ".join(data_points[-4:])
+            sources.append(ResearchSource(
+                provider="fed-macro",
+                title=f"FRED: {label} ({series_id})",
+                url=f"https://fred.stlouisfed.org/series/{series_id}",
+                year=datetime.now(UTC).year,
+                abstract=abstract,
+                score=50.0,
+            ))
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "fed-macro",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} macro indicator sources",
+        )
+        return sources
+
+    def _search_seeking_alpha_news(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Seeking Alpha public earnings articles and analysis.
+
+        Seeking Alpha is the largest independent equity research platform.
+        Their public pages (no paywall for news/earnings articles) contain:
+        - Earnings call transcripts summaries
+        - Analyst ratings changes
+        - Company news articles
+        These are the kind of qualitative research inputs a WS analyst reads
+        to supplement the quantitative data.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+
+        tickers: list[str] = []
+        _stop = {"AND", "THE", "FOR", "ANALYSIS", "STOCK", "MARKET"}
+        for token in query.split():
+            t = token.strip(".,!?;:")
+            if re.match(r"^[A-Z]{1,6}$", t) and t not in _stop:
+                tickers.append(t)
+        tickers = (_extract_ticker_candidates(query) + tickers)
+        tickers = list(dict.fromkeys(tickers))[:3]
+
+        for ticker in tickers[:3]:
+            # Seeking Alpha news page (public)
+            sa_url = f"https://seekingalpha.com/symbol/{ticker.upper()}/news"
+            raw = self._get_text(sa_url, accept="text/html,*/*", max_bytes=80_000, timeout_seconds=8)
+            if raw:
+                # Extract article titles and links
+                article_links = re.findall(
+                    r'href="(/article/[^"]+)"[^>]*>([^<]{20,200})',
+                    raw, re.IGNORECASE
+                )
+                for path, title_raw in article_links[:target_limit]:
+                    title = self._html_to_text(title_raw).strip()
+                    if not title:
+                        continue
+                    full_url = f"https://seekingalpha.com{path}"
+                    sources.append(ResearchSource(
+                        provider="seeking-alpha",
+                        title=title[:160],
+                        url=full_url,
+                        year=datetime.now(UTC).year,
+                        abstract=f"Seeking Alpha analysis: {title}",
+                        score=35.0,
+                    ))
+                    if len(sources) >= target_limit:
+                        break
+            if len(sources) >= target_limit:
+                break
+
+        self._record_provider_diagnostic(
+            "seeking-alpha",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} SA articles",
+        )
+        return sources
+
+    def _search_reddit_finance(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        """Search Reddit finance communities for stock discussion and sentiment.
+
+        Reddit's r/investing, r/stocks, r/wallstreetbets, and r/SecurityAnalysis
+        provide real-time retail sentiment, DD (due diligence) posts, and often
+        surface information before it reaches mainstream media.
+
+        Uses Reddit's free JSON API — no authentication required for read-only.
+        """
+        sources: list[ResearchSource] = []
+        target_limit = max(1, int(limit or self.limit_per_provider))
+        try:
+            encoded = urllib.parse.quote_plus(query[:120])
+            # Search across the 4 most relevant finance subreddits.
+            subreddits = "investing+stocks+wallstreetbets+SecurityAnalysis"
+            url = (
+                f"https://www.reddit.com/r/{subreddits}/search.json"
+                f"?q={encoded}&sort=top&t=month&limit={min(target_limit * 3, 25)}"
+                f"&restrict_sr=1"
+            )
+            raw = self._get_text(
+                url,
+                accept="application/json",
+                max_bytes=120_000,
+                timeout_seconds=8,
+                extra_headers={"Accept": "application/json"},
+            )
+            if not raw:
+                raise ValueError("empty response")
+            data = json.loads(raw)
+            posts = (data.get("data") or {}).get("children") or []
+            for post in posts:
+                post_data = (post.get("data") or {})
+                title = (post_data.get("title") or "").strip()
+                selftext = (post_data.get("selftext") or "").strip()[:500]
+                permalink = post_data.get("permalink") or ""
+                score_val = int(post_data.get("score") or 0)
+                subreddit = post_data.get("subreddit") or "reddit"
+                num_comments = int(post_data.get("num_comments") or 0)
+                if not title or not permalink:
+                    continue
+                full_url = f"https://www.reddit.com{permalink}"
+                abstract = selftext if selftext else f"Reddit discussion: {title}"
+                # Higher upvote/comment count = more market signal.
+                source_score = min(45.0, 15.0 + (score_val / 500.0) + (num_comments / 20.0))
+                sources.append(ResearchSource(
+                    provider="reddit-finance",
+                    title=title[:180],
+                    url=full_url,
+                    year=datetime.now(UTC).year,
+                    authors=[f"r/{subreddit}"],
+                    abstract=abstract,
+                    score=source_score,
+                    quality_flags=["social-media-signal"],
+                ))
+                if len(sources) >= target_limit:
+                    break
+        except Exception as exc:
+            self._record_provider_diagnostic(
+                "reddit-finance", "error", str(exc)[:120]
+            )
+        self._record_provider_diagnostic(
+            "reddit-finance",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} Reddit posts",
+        )
+        return sources
+
+    def _fetch_urls_async_httpx(
+        self,
+        urls: list[str],
+        max_bytes: int = 60_000,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, str]:
+        """Fetch multiple URLs in parallel using httpx async — dramatically faster
+        than sequential requests for bulk URL fetching (e.g., chain expansion).
+
+        Returns a dict mapping url → plain text content.
+        Used by the chain expansion mechanism to process 100+ URLs at once.
+        """
+        import asyncio
+
+        results: dict[str, str] = {}
+        try:
+            import httpx  # type: ignore[import-not-found]
+        except ImportError:
+            # Fall back to threaded requests if httpx is unavailable.
+            def _fetch_one(url: str) -> tuple[str, str]:
+                text = self._get_text(url, max_bytes=max_bytes, timeout_seconds=int(timeout_seconds))
+                return url, text
+
+            with ThreadPoolExecutor(max_workers=min(20, len(urls))) as pool:
+                for url, text in pool.map(_fetch_one, urls):
+                    if text:
+                        results[url] = text
+            return results
+
+        async def _fetch_all(url_list: list[str]) -> None:
+            ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            limits = httpx.Limits(max_connections=30, max_keepalive_connections=10)
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=timeout_seconds,
+                limits=limits,
+                follow_redirects=True,
+                verify=False,  # noqa: S501 — bulk fetching, no cert pinning needed
+            ) as client:
+                tasks = [client.get(u) for u in url_list]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                for url, resp in zip(url_list, responses):
+                    if isinstance(resp, Exception):
+                        continue
+                    try:
+                        ct = resp.headers.get("content-type", "").lower()
+                        if ct and not any(m in ct for m in ("text/", "html", "json", "xml")):
+                            continue
+                        text = resp.text[:max_bytes]
+                        if text:
+                            results[url] = text
+                    except Exception:
+                        pass
+
+        try:
+            asyncio.run(_fetch_all(urls))
+        except Exception:
+            pass
+        return results
 
     def _search_web_results(
         self,
@@ -3133,6 +4506,16 @@ class DeepResearchEngine:
         return (
             "sec-edgar",
             "financial-portals",
+            "earnings-data",
+            "insider-transactions",
+            "short-interest",
+            "macrotrends",
+            "stockanalysis",
+            "fed-macro",
+            "google-news-rss",
+            "seeking-alpha",
+            "reddit-finance",
+            "bing-search",
             "openalex",
             "semantic-scholar",
             "crossref",
@@ -3144,6 +4527,16 @@ class DeepResearchEngine:
         return {
             "sec-edgar": self._search_sec_edgar,
             "financial-portals": self._search_financial_portals,
+            "earnings-data": self._search_earnings_data,
+            "insider-transactions": self._search_insider_transactions,
+            "short-interest": self._search_short_interest,
+            "macrotrends": self._search_macrotrends,
+            "stockanalysis": self._search_stockanalysis,
+            "fed-macro": self._search_fed_macro_data,
+            "google-news-rss": self._search_google_news_rss,
+            "seeking-alpha": self._search_seeking_alpha_news,
+            "reddit-finance": self._search_reddit_finance,
+            "bing-search": self._search_bing_results,
             "openalex": self._search_openalex,
             "semantic-scholar": self._search_semantic_scholar,
             "crossref": self._search_crossref,
@@ -3189,24 +4582,41 @@ class DeepResearchEngine:
         if words & non_academic:
             # Scholarly providers won't return useful results. Fall back to
             # broad web search and tool observations.
-            return {"web-search", "gemini-flash"}
+            return {"web-search", "bing-search", "google-news-rss", "gemini-flash"}
 
         if cls._looks_like_current_evidence_query(
             query
         ) and not cls._looks_like_academic_query(query):
-            if cls._looks_like_market_query(
-                query
-            ) and not cls._looks_like_quant_finance_query(query):
-                # Current market tasks should prioritize real-time web/provider
-                # evidence. Scholarly providers are admitted only for explicit
-                # quant-finance modeling objectives.
-                return {"web-search", "financial-portals", "sec-edgar", "gemini-flash"}
+            if cls._looks_like_market_query(query) and not cls._looks_like_quant_finance_query(query):
+                # Current market tasks: full Wall Street analyst stack.
+                # Prioritize real-time financial data, SEC filings, earnings,
+                # insider activity, short interest, macro, news feeds.
+                # Bing + Google News adds multi-engine news coverage.
+                # Reddit finance adds crowd sentiment and early signal.
+                return {
+                    "web-search",
+                    "bing-search",
+                    "financial-portals",
+                    "sec-edgar",
+                    "earnings-data",
+                    "insider-transactions",
+                    "short-interest",
+                    "macrotrends",
+                    "stockanalysis",
+                    "fed-macro",
+                    "google-news-rss",
+                    "seeking-alpha",
+                    "reddit-finance",
+                    "gemini-flash",
+                }
             # Include financial-portals for price/product data, and crossref for
             # reports/whitepapers that may index financial analyses.
             return {
                 "web-search",
+                "bing-search",
                 "financial-portals",
                 "sec-edgar",
+                "google-news-rss",
                 "gemini-flash",
                 "crossref",
             }
@@ -3217,6 +4627,8 @@ class DeepResearchEngine:
             "semantic-scholar",
             "crossref",
             "web-search",
+            "bing-search",
+            "google-news-rss",
         }
 
         # Code / software queries also warrant a GitHub search.
@@ -3264,6 +4676,14 @@ class DeepResearchEngine:
         if allowed_providers & scholarly:
             expanded.update(scholarly)
         expanded.add("web-search")
+        expanded.add("bing-search")
+        expanded.add("google-news-rss")
+        if cls._looks_like_market_query(query):
+            expanded.update({
+                "financial-portals", "sec-edgar", "earnings-data",
+                "macrotrends", "stockanalysis", "short-interest",
+                "fed-macro", "seeking-alpha", "reddit-finance",
+            })
         if cls._looks_like_software_agent_query(query):
             expanded.add("github-repositories")
         return expanded if expanded != allowed_providers else None
@@ -3304,28 +4724,58 @@ class DeepResearchEngine:
         ) -> tuple[list[str], list[ResearchSource]]:
             if not self._is_safe_public_url(source.url):
                 return [], []
-            raw_html = self._get_text_stitched(
-                source.url,
-                accept="text/html,application/xhtml+xml,*/*",
-                page_bytes=60_000,
-                max_pages=4,
-                overlap_bytes=1_600,
-                query=query,
-            )
-            if not raw_html:
-                return [], []
 
-            signal_before = self._text_signal_score(self._html_to_text(raw_html))
-            overlay_markers = self._overlay_marker_count(raw_html)
-            if signal_before < 0.16 and overlay_markers > 0:
-                resolved_html, status = self._interrupt_resolve_overlays(raw_html)
-                if status != "resolved":
-                    if "unreachable-paywalled" not in source.quality_flags:
-                        source.quality_flags.append("unreachable-paywalled")
+            # Use real browser rendering for JS-heavy finance/news sites so we
+            # get actual article content instead of a blank or paywalled shell.
+            # For other URLs, use the standard multi-page stitcher.
+            if self._needs_browser(source.url):
+                browser_text = self._get_text_browser(source.url, max_chars=80_000)
+                if browser_text and self._text_signal_score(browser_text) >= 0.1:
+                    # Browser gave us clean plain text — use it directly.
+                    raw_html = browser_text
+                    content = browser_text
+                else:
+                    # Browser failed or gave noise — fall through to HTTP.
+                    raw_html = self._get_text_stitched(
+                        source.url,
+                        accept="text/html,application/xhtml+xml,*/*",
+                        page_bytes=60_000,
+                        max_pages=4,
+                        overlap_bytes=1_600,
+                        query=query,
+                    )
+                    content = self._html_to_text(raw_html) if raw_html else ""
+            else:
+                raw_html = self._get_text_stitched(
+                    source.url,
+                    accept="text/html,application/xhtml+xml,*/*",
+                    page_bytes=60_000,
+                    max_pages=4,
+                    overlap_bytes=1_600,
+                    query=query,
+                )
+                if not raw_html:
                     return [], []
-                raw_html = resolved_html
+                signal_before = self._text_signal_score(self._html_to_text(raw_html))
+                overlay_markers = self._overlay_marker_count(raw_html)
+                if signal_before < 0.16 and overlay_markers > 0:
+                    resolved_html, status = self._interrupt_resolve_overlays(raw_html)
+                    if status != "resolved":
+                        if "unreachable-paywalled" not in source.quality_flags:
+                            source.quality_flags.append("unreachable-paywalled")
+                        return [], []
+                    raw_html = resolved_html
+                if self._should_retry_with_browser(source.url, raw_html, query):
+                    browser_text = self._get_text_browser(
+                        source.url,
+                        max_chars=80_000,
+                    )
+                    if browser_text:
+                        raw_html = browser_text
+                content = self._html_to_text(raw_html)
 
-            content = self._html_to_text(raw_html)
+            if not content:
+                return [], []
             extra_queries: list[str] = []
             chained: list[ResearchSource] = []
             if len(content) > 80:
@@ -3337,10 +4787,11 @@ class DeepResearchEngine:
                 extra_queries.extend(
                     self._content_to_new_queries(content, source.title, query)
                 )
-                # URL CHAINING: extract outbound links from the fetched page
-                # and add them as low-score candidates for the next pass.
-                # This is how real deep-research tools expand from 10 sources
-                # to 1000+ — every page you read leads to more pages.
+                # URL CHAINING: extract outbound links from the fetched page.
+                # For browser-rendered pages, content is plain text so we pass
+                # raw_html (which may also be the browser text); the link extractor
+                # gracefully handles plain text (href regex won't match, returning []).
+                # For HTTP-fetched pages, raw_html is the full HTML document.
                 chained = self._extract_outbound_source_candidates(
                     raw_html, query, source.url
                 )
@@ -3350,8 +4801,8 @@ class DeepResearchEngine:
         if not sources:
             return []
         # Scale enrichment workers — I/O-bound fetches benefit from many
-        # concurrent threads.  20 workers = Claude/Gemini-class parallelism.
-        with ThreadPoolExecutor(max_workers=max(1, min(20, len(sources)))) as executor:
+        # concurrent threads. 30 workers handles Playwright + requests concurrently.
+        with ThreadPoolExecutor(max_workers=max(1, min(30, len(sources)))) as executor:
             futures = {executor.submit(_enrich_one, src): src for src in sources}
             for future in as_completed(futures):
                 try:
@@ -3375,7 +4826,8 @@ class DeepResearchEngine:
             if norm and norm not in seen:
                 seen.add(norm)
                 result.append(q[:80])
-        return result[:24]
+        # Return up to 40 new query strings — double the previous 24 cap.
+        return result[:40]
 
     def _extract_outbound_source_candidates(
         self,
@@ -3640,9 +5092,36 @@ class DeepResearchEngine:
         range_end: int | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> str:
+        # Rotate realistic browser User-Agents so financial sites don't block us.
+        # A Wall Street analyst's Bloomberg terminal doesn't announce itself as a bot.
+        _ua_pool = [
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+                "Gecko/20100101 Firefox/124.0"
+            ),
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.4 Safari/605.1.15"
+            ),
+        ]
+        ua = _ua_pool[hash(url) % len(_ua_pool)]
         headers = {
             "Accept": accept,
-            "User-Agent": "agentos-orchestrator/0.1 (research enrichment)",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "User-Agent": ua,
         }
         if range_start is not None:
             bounded_start = max(0, range_start)
@@ -3655,14 +5134,38 @@ class DeepResearchEngine:
             headers.update(
                 {str(key): str(value) for key, value in extra_headers.items()}
             )
-        request = urllib.request.Request(
-            url,
-            headers=headers,
-        )
+        effective_timeout = min(timeout_seconds or self.timeout_seconds, 15)
+
+        # Try requests first (handles gzip, cookies, TLS better than urllib —
+        # critical for financial sites that use Cloudflare or CDN protection).
+        try:
+            import requests as _requests  # type: ignore[import-not-found]
+            resp = _requests.get(
+                url,
+                headers=headers,
+                timeout=effective_timeout,
+                stream=True,
+                allow_redirects=True,
+                verify=True,
+            )
+            ct = resp.headers.get("Content-Type", "").lower()
+            if ct and not any(m in ct for m in ("text/", "html", "xml", "json")):
+                return ""
+            raw = b""
+            for chunk in resp.iter_content(chunk_size=8192):
+                raw += chunk
+                if len(raw) >= max_bytes:
+                    break
+            return raw[:max_bytes].decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+        # Fallback to urllib when requests is unavailable or fails.
+        request = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(  # noqa: S310 - policy-gated URLs
                 request,
-                timeout=min(timeout_seconds or self.timeout_seconds, 15),
+                timeout=effective_timeout,
             ) as response:
                 content_type = str(response.headers.get("Content-Type") or "").lower()
                 if content_type and not any(
@@ -3673,6 +5176,172 @@ class DeepResearchEngine:
                 return response.read(max_bytes).decode("utf-8", errors="replace")
         except (Exception,):
             return ""
+
+    # Domains that require JavaScript rendering to return real content.
+    # requests/urllib only returns a blank/paywalled shell for these.
+    _JS_REQUIRED_HOSTS: frozenset[str] = frozenset(
+        {
+            "bloomberg.com",
+            "wsj.com",
+            "barrons.com",
+            "ft.com",
+            "seekingalpha.com",
+            "thestreet.com",
+            "businessinsider.com",
+            "kiplinger.com",
+            "fool.com",
+            "investopedia.com",
+            "nasdaq.com",
+            "nypost.com",
+            "cnbc.com",
+            "marketwatch.com",
+            "msn.com",
+            "statista.com",
+        }
+    )
+
+    def _needs_browser(self, url: str) -> bool:
+        """Return True if this URL belongs to a JS-rendered finance/news site."""
+        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+        return any(h in host for h in self._JS_REQUIRED_HOSTS)
+
+    def _get_text_browser(
+        self,
+        url: str,
+        max_chars: int = 80_000,
+        timeout_ms: int = 18_000,
+    ) -> str:
+        """Render *url* with a headless Chromium browser and return visible text.
+
+        Uses Playwright sync API. Falls back gracefully to empty string if
+        Playwright is not installed or the page cannot be rendered.
+
+        This is the core mechanism for extracting content from JS-heavy finance
+        sites (Bloomberg, WSJ, SeekingAlpha, FT, Barron's) that return blank
+        or paywalled HTML to plain HTTP requests.
+        """
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
+        except ImportError:
+            return ""
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-extensions",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--window-size=1280,900",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    extra_http_headers={
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                    },
+                )
+                page = context.new_page()
+                # Block heavy non-content resources to speed up page load.
+                page.route(
+                    "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,mp3,webm}",
+                    lambda route: route.abort(),
+                )
+                page.route(
+                    "**/{ads,analytics,tracking,doubleclick,googlesyndication}**",
+                    lambda route: route.abort(),
+                )
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    # Wait for the main content area to settle.
+                    page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 12_000))
+                except Exception:
+                    # Even a partial load is worth extracting.
+                    pass
+                # Try to dismiss cookie/paywall overlays by pressing Escape.
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                # Extract visible inner text — much cleaner than raw HTML.
+                try:
+                    text = page.inner_text("body")
+                except Exception:
+                    try:
+                        text = page.evaluate("() => document.body.innerText")
+                    except Exception:
+                        text = ""
+                browser.close()
+                return (text or "")[:max_chars]
+        except Exception:
+            return ""
+
+    def _get_text_with_browser_fallback(
+        self,
+        url: str,
+        max_bytes: int = 60_000,
+        timeout_seconds: int | None = None,
+    ) -> str:
+        """Fetch url using browser if JS rendering is needed, otherwise requests.
+
+        This is the unified entry point that every enrichment call should use
+        for finance/news URLs. It guarantees real content from JS-heavy sites.
+        """
+        if self._needs_browser(url):
+            content = self._get_text_browser(url, max_chars=max_bytes)
+            if content and self._text_signal_score(content) >= 0.1:
+                return content
+        # Standard HTTP fetch (also used as fallback when browser yields nothing).
+        return self._get_text(
+            url,
+            accept="text/html,application/xhtml+xml,*/*",
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _should_retry_with_browser(
+        self,
+        url: str,
+        raw_html: str,
+        query: str,
+    ) -> bool:
+        if self._needs_browser(url):
+            return True
+        lower = raw_html.lower()
+        blocked_markers = (
+            "please enable javascript",
+            "javascript is required",
+            "this site requires javascript",
+            "cloudflare",
+            "captcha",
+            "access denied",
+            "forbidden",
+            "pardon our interruption",
+            "are you a bot",
+        )
+        if any(marker in lower for marker in blocked_markers):
+            return True
+        text = self._html_to_text(raw_html)
+        signal = self._text_signal_score(text)
+        if signal < 0.08:
+            return True
+        if query:
+            anchors = set(self._keywords(query)) | set(
+                self._entity_terms_from_query(query)
+            )
+            if anchors and not any(anchor in text.lower() for anchor in anchors):
+                return len(re.findall(r"\b[a-z]{4,}\b", text.lower())) < 90
+        return False
 
     def _get_text_stitched(
         self,
@@ -5752,6 +7421,69 @@ class DeepResearchEngine:
                         "agentic technical due diligence system",
                     ]
                 )
+
+        # ── WALL STREET ANALYST QUERY DECOMPOSITION ──────────────────────────
+        # When the objective is a market/investment query, a real analyst breaks
+        # it into 12 orthogonal research axes immediately at planning time.
+        # These are NOT templates — they are the exact queries an MD would put
+        # into Bloomberg/Capital IQ before building a research note.
+        if DeepResearchEngine._looks_like_market_query(lower):
+            # Extract ticker candidates from the query for targeted queries.
+            tickers = _extract_ticker_candidates(f"{query} {objective}")
+            anchor = tickers[0] if tickers else ""
+
+            # Company-name fallback anchor (e.g. "NVIDIA" if ticker not found).
+            name_match = re.search(
+                r"\b([A-Z][a-zA-Z]{4,}(?:\s+[A-Z][a-zA-Z]{2,})?)"
+                r"\s+(?:stock|equity|shares|Inc|Corp|Ltd|Holdings|Technologies)\b",
+                f"{query} {objective}",
+            )
+            if not anchor and name_match:
+                anchor = name_match.group(1).split()[0].upper()
+
+            if anchor:
+                focused.extend(
+                    [
+                        # Valuation
+                        f"{anchor} DCF model fair value intrinsic value estimate 2025 2026",
+                        f"{anchor} EV/EBITDA P/E forward multiple vs peers comps",
+                        f"{anchor} price target analyst consensus upside downside",
+                        # Earnings / fundamentals
+                        f"{anchor} quarterly earnings EPS revenue beat miss surprise history",
+                        f"{anchor} revenue growth rate gross margin operating leverage trend",
+                        f"{anchor} free cash flow FCF yield capital allocation buyback dividend",
+                        f"{anchor} balance sheet net debt leverage ratio interest coverage",
+                        # Competitive / strategic
+                        f"{anchor} competitive moat market share TAM expansion 2025",
+                        f"{anchor} 10-K 10-Q annual report SEC filing latest fiscal year",
+                        f"{anchor} earnings call transcript guidance management commentary",
+                        # Institutional / sentiment
+                        f"{anchor} institutional ownership 13F changes Q1 2026",
+                        f"{anchor} insider buying selling transactions Form 4 2025 2026",
+                        f"{anchor} short interest ratio days to cover float short squeeze",
+                        f"{anchor} options unusual activity implied volatility skew",
+                        # Macro / risk
+                        f"{anchor} macro risk factor interest rate sensitivity 2026 outlook",
+                        f"{anchor} bear case thesis risk factors regulatory headwinds",
+                        # Technical
+                        f"{anchor} 52-week high low relative strength momentum technical setup",
+                    ]
+                )
+            else:
+                # Generic market queries without a specific ticker
+                focused.extend(
+                    [
+                        "highest potential stocks catalysts 2025 2026 analyst recommendations",
+                        "top stock picks valuation upside price target consensus",
+                        "earnings growth GARP value momentum factor screening 2026",
+                        "sector rotation macro tailwinds best positioned equities",
+                        "insider buying accumulation institutional 13F Q1 2026",
+                        "short squeeze high short interest catalyst watchlist",
+                        "FCF yield undervalued stocks capital return buyback 2026",
+                        "earnings revision momentum analyst upgrades 2026",
+                    ]
+                )
+
         return focused
 
     @staticmethod

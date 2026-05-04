@@ -115,6 +115,20 @@ class FakePcBackend:
         ]
 
 
+class FakeTerminalBackend:
+    def __init__(self) -> None:
+        self.actions = []
+
+    def perform(self, action):
+        self.actions.append(action)
+        return json.dumps(
+            {
+                "status": "process-executed",
+                "process": {"exit_code": 0},
+            }
+        )
+
+
 class OrchestratorTests(unittest.TestCase):
     def test_general_research_does_not_schedule_pc_steps(self) -> None:
         tasks = SupervisorAgent().plan("research market evidence with sources")
@@ -254,6 +268,28 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(any("when the c" in url for url in decoded_urls))
         self.assertFalse(any("github.com/search" in url for url in urls))
 
+    def test_browser_search_queries_preserve_natural_objective_clauses(self) -> None:
+        objective = (
+            "[multi-hour] Research public stocks with the highest potential to soar as of now "
+            "using all available tools in sandbox. Produce the deepest possible analyst and scientist report "
+            "with live current-web evidence, explicit uncertainties, competing hypotheses, and critical ranking."
+        )
+
+        queries = WorkerAgent._browser_search_queries(objective, [])
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertTrue(
+            any(
+                query.startswith(
+                    "Research public stocks with the highest potential to soar as of now"
+                )
+                for query in queries
+            )
+        )
+        self.assertTrue(
+            any("deepest possible analyst and scientist report" in query for query in queries)
+        )
+
     def test_supervisor_data_task_adapts_to_research_domain(self) -> None:
         tasks = SupervisorAgent().plan(
             "Research highest-potential public companies as of now"
@@ -275,6 +311,132 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertTrue(WorkerAgent._browser_preview_is_blocked(blocked))
         self.assertFalse(WorkerAgent._browser_preview_is_blocked(clean))
+
+    def test_browser_findings_keep_multiple_high_signal_pages_per_domain(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        def fake_search_results(
+            query: str,
+            limit: int | None = None,
+        ) -> list[ResearchSource]:
+            del query, limit
+            return [
+                ResearchSource(
+                    provider="web-search",
+                    title=f"Example domain page {index}",
+                    url=f"https://example.com/report-{index}",
+                    abstract="High-signal page from same domain.",
+                    year=2026,
+                    score=90.0 - index,
+                )
+                for index in range(5)
+            ] + [
+                ResearchSource(
+                    provider="web-search",
+                    title=f"Other domain page {index}",
+                    url=f"https://other.com/post-{index}",
+                    abstract="Secondary domain coverage.",
+                    year=2026,
+                    score=80.0 - index,
+                )
+                for index in range(3)
+            ]
+
+        worker.research_engine._search_web_results = fake_search_results
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: sources
+        worker._ai_browser_source_strategy = lambda objective: {
+            "targeted_queries": ["nvidia earnings transcript", "nvidia valuation"]
+        }
+        worker._deep_page_read = lambda url: "signal " * 300
+        worker._content_block_quality = lambda content: {"quality_score": 0.8}
+        worker._browser_preview_is_blocked = lambda preview: False
+        worker._extract_page_evidence = (
+            lambda content, title, query: ["revenue growth acceleration"]
+        )
+        worker._ai_page_judgment = (
+            lambda source, content, objective, core_query: "high signal"
+        )
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] NVIDIA market research",
+            [],
+        )
+
+        example_hits = sum(
+            1 for url in findings["direct_urls"] if "example.com" in url
+        )
+        self.assertEqual(findings["frontier"]["mode"], "expansive")
+        self.assertGreaterEqual(findings["frontier"]["candidate_urls"], 5)
+        self.assertGreaterEqual(example_hits, 2)
+
+    def test_terminal_verification_uses_terminal_selector_and_json_receipt(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        backend = FakeTerminalBackend()
+
+        verified = worker._verify_claims_with_sandbox_terminal(
+            backend,
+            ["Revenue increased from 10 to 20."],
+        )
+
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(backend.actions[0].action_type, "execute_command")
+        self.assertEqual(backend.actions[0].selector, "terminal")
+        self.assertEqual(verified[0]["exit_code"], 0)
+
+    def test_browser_findings_fallback_to_raw_sources_when_ranking_starves(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        def fake_search_results(
+            query: str,
+            limit: int | None = None,
+        ) -> list[ResearchSource]:
+            del query, limit
+            return [
+                ResearchSource(
+                    provider="web-search",
+                    title="Fallback candidate one",
+                    url="https://example.com/fallback-one",
+                    abstract="Fallback browser candidate.",
+                    year=2026,
+                    score=60.0,
+                ),
+                ResearchSource(
+                    provider="web-search",
+                    title="Fallback candidate two",
+                    url="https://example.org/fallback-two",
+                    abstract="Fallback browser candidate.",
+                    year=2026,
+                    score=55.0,
+                ),
+            ]
+
+        worker.research_engine._search_web_results = fake_search_results
+        worker.research_engine._search_financial_portals = lambda query, limit=10: []
+        worker.research_engine._search_sec_edgar = lambda query, limit=6: []
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: []
+        worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
+        worker._deep_page_read = lambda url: "signal " * 300
+        worker._content_block_quality = lambda content: {"quality_score": 0.8}
+        worker._browser_preview_is_blocked = lambda preview: False
+        worker._extract_page_evidence = lambda content, title, query: ["candidate claim"]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: "raw fallback admitted"
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] Research broad opportunity landscape",
+            [],
+        )
+
+        self.assertGreaterEqual(len(findings["candidate_urls"]), 2)
+        self.assertGreaterEqual(len(findings["direct_urls"]), 2)
+        self.assertEqual(findings["frontier"]["ranked_candidates"], 0)
 
     def test_verification_flags_research_quality_warnings(self) -> None:
         result = WorkerResult(

@@ -726,7 +726,7 @@ function App() {
                                     <p>{job.objective}</p>
                                     {job.error && <p className="danger">{job.error}</p>}
                                 </div>
-                                {job.run_id && (
+                                {job.run_id && job.status === 'completed' && (
                                     <button onClick={() => openRun(job.run_id!)} title="Open research brief">
                                         <FileText size={16} />
                                     </button>

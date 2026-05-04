@@ -1041,13 +1041,12 @@ class WorkerAgent:
         queries = self._browser_search_queries(objective, urls)
         core_query = DeepResearchEngine._query_from_objective(objective)
 
-        # Step 1: AI-reason about what source types are authoritative for
-        # this specific objective, then extend the query set with targeted
-        # queries for those source types.
         source_strategy = self._ai_browser_source_strategy(objective)
         for sq in source_strategy.get("targeted_queries") or []:
             if sq and sq.strip() and sq not in queries:
                 queries.append(sq.strip()[:240])
+
+        budget = self._browser_research_budget(objective, core_query, len(queries))
 
         if not queries:
             return {
@@ -1055,87 +1054,119 @@ class WorkerAgent:
                 "judged_results": [],
                 "direct_urls": [],
                 "discovered_domains": [],
+                "candidate_urls": [],
+                "frontier": {},
             }
 
-        # Step 2: Search across all queries.
-        # For market/financial queries, use all three financial providers
-        # (financial-portals, sec-edgar, web-search) so the browser research
-        # generates real financial URLs — not just DuckDuckGo which returns
-        # ~0 results for stock/investment queries.
         raw_results: list[ResearchSource] = []
         is_market_query = DeepResearchEngine._looks_like_market_query(core_query)
-        for query in queries[:8]:
+        for query in queries[: int(budget["max_queries"])]:
             try:
                 raw_results.extend(
-                    self.research_engine._search_web_results(query, limit=8)
+                    self.research_engine._search_web_results(
+                        query,
+                        limit=int(budget["web_results_per_query"]),
+                    )
                 )
                 if is_market_query:
-                    # Financial providers: these return real financial pages
-                    # (Yahoo Finance, SEC EDGAR, MarketWatch, etc.)
                     if hasattr(self.research_engine, "_search_financial_portals"):
                         raw_results.extend(
                             self.research_engine._search_financial_portals(
-                                query, limit=10
+                                query,
+                                limit=int(budget["financial_results_per_query"]),
                             )
                         )
                     if hasattr(self.research_engine, "_search_sec_edgar"):
                         raw_results.extend(
-                            self.research_engine._search_sec_edgar(query, limit=6)
+                            self.research_engine._search_sec_edgar(
+                                query,
+                                limit=int(budget["sec_results_per_query"]),
+                            )
                         )
             except Exception:
                 continue
 
-        # Step 3: Rank and deduplicate.
+        deduped_results = self.research_engine._dedupe_sources(raw_results)
         ranked = self.research_engine._rank_sources(
-            self.research_engine._dedupe_sources(raw_results),
+            deduped_results,
             core_query,
         )
+        exploration_sources = list(ranked)
+        minimum_frontier = 4 if int(budget["max_direct_urls"]) >= 40 else 2
+        if len(exploration_sources) < minimum_frontier and deduped_results:
+            ranked_urls = {str(source.url or "").strip() for source in exploration_sources}
+            raw_fallback = sorted(
+                deduped_results,
+                key=lambda source: float(source.score or 0.0),
+                reverse=True,
+            )
+            for source in raw_fallback:
+                clean_url = str(source.url or "").strip()
+                if not clean_url or clean_url in ranked_urls:
+                    continue
+                exploration_sources.append(source)
+                ranked_urls.add(clean_url)
+                if len(exploration_sources) >= int(budget["candidate_urls"]):
+                    break
         judged_results: list[dict[str, Any]] = []
         direct_urls: list[str] = []
         discovered_domains: list[str] = []
         extracted_claims: list[str] = []
-        seen_domains: set[str] = set()
+        candidate_urls: list[str] = []
+        seen_candidate_urls: set[str] = set()
+        seen_direct_urls: set[str] = set()
+        domain_usage: dict[str, int] = {}
 
-        # Step 4: Deep-read each candidate page (60 KB) and extract evidence.
-        # Increased from 8 to 30 direct URLs for comprehensive browser research.
-        for source in ranked:
-            if len(direct_urls) >= 30:
+        for source in exploration_sources:
+            clean_url = str(source.url or "").strip()
+            if clean_url in seen_candidate_urls:
+                continue
+            if not DeepResearchEngine._is_safe_public_url(clean_url):
+                continue
+            if DeepResearchEngine._is_search_result_url(clean_url):
+                continue
+            seen_candidate_urls.add(clean_url)
+            candidate_urls.append(clean_url)
+            if len(candidate_urls) >= int(budget["candidate_urls"]):
                 break
-            if not DeepResearchEngine._is_safe_public_url(source.url):
+
+        for source in exploration_sources:
+            if len(direct_urls) >= int(budget["max_direct_urls"]):
+                break
+            clean_url = str(source.url or "").strip()
+            if not DeepResearchEngine._is_safe_public_url(clean_url):
                 continue
-            if DeepResearchEngine._is_search_result_url(source.url):
+            if DeepResearchEngine._is_search_result_url(clean_url):
                 continue
-            domain = urllib.parse.urlparse(source.url).netloc.lower().lstrip("www.")
-            if domain in seen_domains:
+            if clean_url in seen_direct_urls:
                 continue
-            # Deep page read — much more content than the old 20 KB preview.
-            full_content = self._deep_page_read(source.url)
+            domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
+            if domain and domain_usage.get(domain, 0) >= int(budget["max_per_domain"]):
+                continue
+
+            full_content = self._deep_page_read(clean_url)
             if not full_content:
                 continue
             quality = self._content_block_quality(full_content)
             if quality["quality_score"] < 0.22 and len(direct_urls) >= 2:
-                # Reject low-signal extraction once we already have minimal
-                # source coverage from stronger pages.
                 continue
             if quality["quality_score"] < 0.12:
-                # Always reject extremely noisy pages.
                 continue
-            # Skip bot-gated / JS-only shells.
             preview_proxy = {
                 "page_title": source.title,
                 "page_excerpt": full_content[:600],
             }
             if self._browser_preview_is_blocked(preview_proxy):
                 continue
-            seen_domains.add(domain)
 
-            # Step 5: Extract specific evidence claims from the full content.
+            seen_direct_urls.add(clean_url)
+            if domain:
+                domain_usage[domain] = domain_usage.get(domain, 0) + 1
+
             evidence_claims = self._extract_page_evidence(
                 full_content, source.title, core_query
             )
             extracted_claims.extend(evidence_claims[:3])
-
-            # Step 6: AI-reasoned judgment — why does this source matter?
             judgment = self._ai_page_judgment(
                 source, full_content[:2000], objective, core_query
             )
@@ -1144,7 +1175,7 @@ class WorkerAgent:
                 {
                     "query": queries[0],
                     "title": source.title,
-                    "url": source.url,
+                    "url": clean_url,
                     "domain": domain,
                     "abstract": source.abstract[:400],
                     "page_excerpt": full_content[:600],
@@ -1153,8 +1184,8 @@ class WorkerAgent:
                     "judgment": judgment,
                 }
             )
-            direct_urls.append(source.url)
-            if domain:
+            direct_urls.append(clean_url)
+            if domain and domain not in discovered_domains:
                 discovered_domains.append(domain)
 
         terminal_verifications: list[dict[str, Any]] = []
@@ -1165,22 +1196,27 @@ class WorkerAgent:
             )
 
         if not direct_urls:
-            for source in ranked:
-                if len(direct_urls) >= 3:
+            for source in exploration_sources:
+                if len(direct_urls) >= min(5, int(budget["max_direct_urls"])):
                     break
-                if not DeepResearchEngine._is_safe_public_url(source.url):
+                clean_url = str(source.url or "").strip()
+                if not DeepResearchEngine._is_safe_public_url(clean_url):
                     continue
-                if DeepResearchEngine._is_search_result_url(source.url):
+                if DeepResearchEngine._is_search_result_url(clean_url):
                     continue
-                domain = urllib.parse.urlparse(source.url).netloc.lower().lstrip("www.")
-                preview = self._browser_page_preview(source.url)
+                if clean_url in seen_direct_urls:
+                    continue
+                domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
+                if domain and domain_usage.get(domain, 0) >= int(budget["max_per_domain"]):
+                    continue
+                preview = self._browser_page_preview(clean_url)
                 excerpt = str(preview.get("page_excerpt") or "")
                 quality = self._content_block_quality(excerpt)
                 judged_results.append(
                     {
                         "query": queries[0],
                         "title": source.title,
-                        "url": source.url,
+                        "url": clean_url,
                         "domain": domain,
                         "abstract": source.abstract[:400],
                         "page_excerpt": excerpt[:600],
@@ -1190,17 +1226,62 @@ class WorkerAgent:
                         "quality_flags": ["low-signal-extraction"],
                     }
                 )
-                direct_urls.append(source.url)
+                seen_direct_urls.add(clean_url)
                 if domain:
+                    domain_usage[domain] = domain_usage.get(domain, 0) + 1
+                direct_urls.append(clean_url)
+                if domain and domain not in discovered_domains:
                     discovered_domains.append(domain)
 
         return {
-            "search_queries": queries[:5],
+            "search_queries": queries[: int(budget["returned_query_count"])],
             "judged_results": judged_results,
             "direct_urls": direct_urls,
             "discovered_domains": discovered_domains,
+            "candidate_urls": candidate_urls,
             "search_result_count": len(raw_results),
+            "frontier": {
+                "queries_considered": min(len(queries), int(budget["max_queries"])),
+                "candidate_urls": len(candidate_urls),
+                "deep_reads": len(direct_urls),
+                "max_per_domain": int(budget["max_per_domain"]),
+                "ranked_candidates": len(ranked),
+                "mode": str(budget["mode"]),
+            },
             "terminal_verifications": terminal_verifications,
+        }
+
+    @staticmethod
+    def _browser_research_budget(
+        objective: str,
+        core_query: str,
+        query_count: int,
+    ) -> dict[str, int | str]:
+        lower = objective.lower()
+        is_multi_hour = "multi-hour" in lower
+        current_web_mode = DeepResearchEngine._looks_like_current_evidence_query(
+            objective
+        )
+        is_market_query = DeepResearchEngine._looks_like_market_query(core_query)
+        expansive_mode = is_multi_hour or current_web_mode
+
+        max_queries = min(query_count, 24 if expansive_mode else 12)
+        web_results_per_query = 12 if expansive_mode else 8
+        max_direct_urls = 80 if expansive_mode else 40
+        max_per_domain = 4 if expansive_mode or is_market_query else 2
+        returned_query_count = min(query_count, 12 if expansive_mode else 8)
+        candidate_urls = min(max(max_direct_urls * 2, 40), 240)
+
+        return {
+            "mode": "expansive" if expansive_mode else "standard",
+            "max_queries": max(1, max_queries),
+            "web_results_per_query": web_results_per_query,
+            "financial_results_per_query": 16 if expansive_mode else 10,
+            "sec_results_per_query": 10 if expansive_mode else 6,
+            "max_direct_urls": max_direct_urls,
+            "max_per_domain": max_per_domain,
+            "returned_query_count": max(1, returned_query_count),
+            "candidate_urls": candidate_urls,
         }
 
     @staticmethod
@@ -1229,6 +1310,8 @@ class WorkerAgent:
         ):
             cleaned = cleaned.replace(prefix, " ")
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        for clause in WorkerAgent._browser_objective_queries(cleaned):
+            queries.append(clause)
         fallback = DeepResearchEngine._query_from_objective(cleaned)
         if fallback:
             queries.append(fallback)
@@ -1237,7 +1320,43 @@ class WorkerAgent:
             normalized = DeepResearchEngine._normalize_title(query)
             if normalized and query not in deduped:
                 deduped.append(query[:240])
-        return deduped[:4]
+        return deduped[:8]
+
+    @staticmethod
+    def _browser_objective_queries(cleaned: str) -> list[str]:
+        clauses: list[str] = []
+        normalized = cleaned.strip()
+        if not normalized:
+            return clauses
+
+        def _append_clause(candidate: str) -> None:
+            candidate = re.sub(r"\s+", " ", candidate).strip(" ,.;:-")
+            if len(candidate.split()) < 4:
+                return
+            if candidate not in clauses:
+                clauses.append(candidate[:240])
+
+        _append_clause(normalized)
+
+        primary = re.split(
+            r"\b(?:using|with|including|produce|producing|deliver|delivering|based on)\b",
+            normalized,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        _append_clause(primary)
+
+        for sentence in re.split(r"[.!?]+", normalized):
+            _append_clause(sentence)
+
+        for fragment in re.split(
+            r"\b(?:and|while|plus|then|while also|along with)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            _append_clause(fragment)
+
+        return clauses
 
     def _verify_claims_with_sandbox_terminal(
         self,
@@ -1257,13 +1376,24 @@ class WorkerAgent:
                 "print(eval(expr, {'__builtins__': {}}, {}))"
                 '"'
             )
-            receipt = backend.perform(
-                UiAction(
-                    action_type="execute_command",
-                    value=command,
-                    metadata={"source": "terminal-verification"},
+            try:
+                receipt = self._json_or_text(
+                    backend.perform(
+                        UiAction(
+                            action_type="execute_command",
+                            selector="terminal",
+                            value=command,
+                            metadata={"source": "terminal-verification"},
+                        )
+                    )
                 )
-            )
+            except Exception:
+                continue
+            if not isinstance(receipt, dict):
+                receipt = {
+                    "status": "process-executed",
+                    "raw_receipt": str(receipt),
+                }
             process = receipt.get("process") or {}
             verified.append(
                 {
@@ -1471,10 +1601,50 @@ class WorkerAgent:
                 raw = ""
         except Exception:
             raw = ""
-        if not raw:
-            return ""
-        text = self._render_aware_text(raw)
-        return self._strip_browser_boilerplate(text)
+        text = ""
+        quality_score = 0.0
+        if raw:
+            text = self._strip_browser_boilerplate(self._render_aware_text(raw))
+            quality_score = self._content_block_quality(text)["quality_score"]
+
+        needs_browser = False
+        browser_detector = getattr(self.research_engine, "_needs_browser", None)
+        if callable(browser_detector):
+            try:
+                needs_browser = bool(browser_detector(url))
+            except Exception:
+                needs_browser = False
+
+        blocked_preview = self._browser_preview_is_blocked(
+            {
+                "page_title": "",
+                "page_excerpt": text[:600],
+            }
+        )
+        should_retry_with_browser = (
+            needs_browser
+            or not text
+            or blocked_preview
+            or quality_score < 0.18
+        )
+        if should_retry_with_browser:
+            browser_reader = getattr(self.research_engine, "_get_text_browser", None)
+            if callable(browser_reader):
+                try:
+                    browser_text = str(
+                        browser_reader(url, max_chars=80_000) or ""
+                    ).strip()
+                except Exception:
+                    browser_text = ""
+                if browser_text:
+                    browser_text = self._strip_browser_boilerplate(browser_text)
+                    browser_quality = self._content_block_quality(browser_text)[
+                        "quality_score"
+                    ]
+                    if browser_quality >= max(quality_score, 0.14):
+                        return browser_text
+
+        return text
 
     def _render_aware_text(self, raw_html: str) -> str:
         """Prefer main/article/body-like blocks over navigation chrome."""

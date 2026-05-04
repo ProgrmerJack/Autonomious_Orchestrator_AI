@@ -438,6 +438,7 @@ fn apply_action(
             "focus" | "click" | "invoke" => focus_node(state, index),
             "type" | "set_text" | "set_value" => {
                 set_node_text(state, index, value.unwrap_or(""));
+                sync_browser_address_bar_navigation(state, index, value.unwrap_or(""));
                 if state.nodes[index].node_id == "spreadsheet-grid" {
                     let cell_edit = cell_edit_payload(&metadata, value.unwrap_or(""));
                     apply_cell_edit(state, index, &cell_edit);
@@ -507,6 +508,22 @@ fn apply_action(
         return receipt;
     }
 
+    if matches!(action_type, "navigate" | "goto" | "open_url") {
+        let url = value.unwrap_or(selector);
+        update_browser_url(state, url);
+        let receipt = json!({
+            "type": "sandbox.act",
+            "status": "navigated",
+            "sandbox": true,
+            "rights": "full-virtual-rights",
+            "action_type": action_type,
+            "selector": selector,
+            "value": url,
+        });
+        remember_receipt(state, &receipt);
+        return receipt;
+    }
+
     let receipt = json!({
         "type": "sandbox.act",
         "status": "executed",
@@ -540,6 +557,50 @@ fn requires_node(action_type: &str) -> bool {
             | "close_panel"
             | "select_tab"
     )
+}
+
+fn sync_browser_address_bar_navigation(
+    state: &mut SandboxState,
+    index: usize,
+    value: &str,
+) {
+    if state
+        .nodes
+        .get(index)
+        .map(|node| node.name.to_lowercase().contains("address"))
+        .unwrap_or(false)
+    {
+        update_browser_url(state, value);
+    }
+}
+
+fn update_browser_url(state: &mut SandboxState, url: &str) {
+    let target_url = if url.trim().is_empty() {
+        "about:blank"
+    } else {
+        url.trim()
+    };
+    for node in &mut state.nodes {
+        match node.node_id.as_str() {
+            "browser-address-bar" => {
+                node.value = target_url.to_string();
+                node.text = target_url.to_string();
+                node.metadata
+                    .insert("value".to_string(), Value::String(target_url.to_string()));
+            }
+            "browser-main-doc" => {
+                node.name = format!("Sandbox Page - {}", target_url);
+                node.text = format!("Sandbox content loaded for {}", target_url);
+                node.metadata
+                    .insert("url".to_string(), Value::String(target_url.to_string()));
+                node.metadata.insert(
+                    "text".to_string(),
+                    Value::String(format!("Sandbox content loaded for {}", target_url)),
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn find_node_index(state: &SandboxState, selector: &str) -> Option<usize> {
@@ -1574,6 +1635,36 @@ mod tests {
         );
         let node = find_node_mut(&mut state, "browser-address-bar").unwrap();
         assert_eq!(node.value, "https://example.com");
+        let doc = find_node_mut(&mut state, "browser-main-doc").unwrap();
+        assert_eq!(doc.name, "Sandbox Page - https://example.com");
+        assert_eq!(
+            doc.metadata.get("url").and_then(Value::as_str),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn navigate_action_updates_browser_document() {
+        let mut state = default_state();
+        let payload = handle_command(
+            &mut state,
+            CommandEnvelope::Act {
+                action_type: "navigate".to_string(),
+                selector: "https://example.org/report".to_string(),
+                value: None,
+                metadata: None,
+            },
+        );
+        assert_eq!(
+            payload.get("status").and_then(Value::as_str),
+            Some("navigated")
+        );
+        let doc = find_node_mut(&mut state, "browser-main-doc").unwrap();
+        assert_eq!(doc.name, "Sandbox Page - https://example.org/report");
+        assert_eq!(
+            doc.metadata.get("url").and_then(Value::as_str),
+            Some("https://example.org/report")
+        );
     }
 
     #[test]

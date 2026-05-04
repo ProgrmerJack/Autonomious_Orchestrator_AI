@@ -174,13 +174,7 @@ class DashboardRunManager:
         self.event_hub.publish({"job": {"job_id": job_id, "status": "running"}})
         try:
             report = self.orchestrator.run(run_objective, run_id=run_id)
-        except (
-            KeyError,
-            OSError,
-            PermissionError,
-            RuntimeError,
-            ValueError,
-        ) as exc:
+        except Exception as exc:
             self._update(job_id, status="failed", error=str(exc))
             self.event_hub.publish(
                 {

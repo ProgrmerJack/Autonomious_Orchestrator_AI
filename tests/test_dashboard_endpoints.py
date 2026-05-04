@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 
 from agentos_orchestrator.gateway import DashboardEventHub
-from agentos_orchestrator.gateway.dashboard import create_dashboard_app
+from agentos_orchestrator.gateway.dashboard import (
+    DashboardRunManager,
+    create_dashboard_app,
+)
 
 from tests.gateway_test_support import (
     FakeResearchEngine,
@@ -266,6 +269,29 @@ class DashboardEndpointsTests(unittest.TestCase):
                     time.sleep(0.05)
 
                 self.assertEqual(job["status"], "completed")
+
+    def test_dashboard_background_job_marks_unexpected_exception_failed(self) -> None:
+        class FailingOrchestrator:
+            def run(self, objective: str, run_id: str | None = None):
+                del objective, run_id
+                raise TypeError("unexpected worker failure")
+
+        manager = DashboardRunManager(
+            FailingOrchestrator(),
+            DashboardEventHub(),
+            max_workers=1,
+        )
+        job = manager.start("dashboard topic", depth="multi-hour")
+
+        for _attempt in range(40):
+            job = manager.get_job(job["job_id"])
+            if job is not None and job["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.05)
+
+        self.assertIsNotNone(job)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("unexpected worker failure", job["error"])
 
 
 if __name__ == "__main__":

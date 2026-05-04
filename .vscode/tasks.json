@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Launch AgentOS dashboard",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"agentos_orchestrator",
+				"launch",
+				"--no-browser",
+				"--skip-npm-install"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}
