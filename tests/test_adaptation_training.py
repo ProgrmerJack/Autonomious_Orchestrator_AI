@@ -4,8 +4,10 @@ import io
 import json
 import tempfile
 import unittest
+import urllib.parse
 import urllib.error
 import zipfile
+from contextlib import contextmanager
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -151,6 +153,159 @@ class StubAdaptationTrainer(UnknownAppAdaptationTrainer):
             {"app_context": "browser", "focused": "search"},
         )
         return {"transitions": transitions, "archives_parsed": len(paths)}
+
+
+class SparseRowsAdaptationTrainer(StubAdaptationTrainer):
+    _screenspot_rows = [
+        {
+            "file_name": "ignored_0.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "ignore linux item 0",
+            "data_type": "text",
+            "data_source": "linux",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+        {
+            "file_name": "match_a.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "open the first settings panel",
+            "data_type": "text",
+            "data_source": "windows",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+        {
+            "file_name": "ignored_1.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "ignore linux item 1",
+            "data_type": "text",
+            "data_source": "linux",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+        {
+            "file_name": "ignored_2.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "ignore linux item 2",
+            "data_type": "text",
+            "data_source": "linux",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+        {
+            "file_name": "match_b.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "open the second settings panel",
+            "data_type": "text",
+            "data_source": "windows",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+        {
+            "file_name": "match_c.png",
+            "bbox": [0.1, 0.1, 0.4, 0.3],
+            "instruction": "open the third settings panel",
+            "data_type": "text",
+            "data_source": "windows",
+            "image": {"src": "stub://image", "width": 400, "height": 200},
+        },
+    ]
+
+    @staticmethod
+    def _fetch_json(url: str):
+        if (
+            "datasets-server.huggingface.co/rows" in url
+            and "rootsautomation/ScreenSpot" in url
+        ):
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            offset = int((params.get("offset") or ["0"])[0])
+            length = int((params.get("length") or ["100"])[0])
+            rows = SparseRowsAdaptationTrainer._screenspot_rows[
+                offset : offset + length
+            ]
+            return {"rows": [{"row": row} for row in rows]}
+        return StubAdaptationTrainer._fetch_json(url)
+
+
+class GuiActorCursorAdaptationTrainer(StubAdaptationTrainer):
+    def __init__(self, workspace_root: str | Path, image_bytes: bytes) -> None:
+        super().__init__(workspace_root, image_bytes)
+        self._gui_archives = {
+            "source-a": self.workspace_root / "source_a.zip",
+            "source-b": self.workspace_root / "source_b.zip",
+        }
+        self._gui_rows = {
+            "source_a.json": [
+                {
+                    "image": "source_a.png",
+                    "conversations": [
+                        {"from": "human", "value": "<image> Click alpha"},
+                        {"from": "gpt", "bbox_gt": [0.1, 0.2, 0.3, 0.4]},
+                    ],
+                }
+            ],
+            "source_b.json": [
+                {
+                    "image": "source_b.png",
+                    "conversations": [
+                        {"from": "human", "value": "<image> Click beta"},
+                        {"from": "gpt", "bbox_gt": [0.2, 0.3, 0.4, 0.5]},
+                    ],
+                }
+            ],
+        }
+        image_names = {"source-a": "source_a.png", "source-b": "source_b.png"}
+        for source_name, archive_path in self._gui_archives.items():
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(image_names[source_name], image_bytes)
+
+    def _gui_actor_sources(
+        self,
+        source_names: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        pairs = [
+            {
+                "name": "source-a",
+                "annotation": "source_a.json",
+                "archive": str(self._gui_archives["source-a"]),
+            },
+            {
+                "name": "source-b",
+                "annotation": "source_b.json",
+                "archive": str(self._gui_archives["source-b"]),
+            },
+        ]
+        if source_names is None:
+            return pairs
+        return [pair for pair in pairs if pair["name"] in source_names]
+
+    @contextmanager
+    def _open_dataset_archive(
+        self,
+        repo_id: str,
+        path: str,
+        *,
+        cache_root: Path | None,
+        cache_budget_bytes: int,
+        stage_remote_archives: bool,
+    ):
+        del repo_id, cache_root, cache_budget_bytes, stage_remote_archives
+        with zipfile.ZipFile(path) as archive:
+            yield archive
+
+    def _iter_json_array_source(
+        self,
+        repo_id: str,
+        path: str,
+        *,
+        limit: int = 0,
+        skip: int = 0,
+        cache_root: Path | None,
+        cache_budget_bytes: int,
+        stage_remote_archives: bool,
+    ):
+        del repo_id, cache_root, cache_budget_bytes, stage_remote_archives
+        rows = list(self._gui_rows[path])[max(0, skip) :]
+        if limit > 0:
+            rows = rows[:limit]
+        yield from rows
 
 
 class AdaptationTrainingTests(unittest.TestCase):
@@ -442,6 +597,8 @@ class AdaptationTrainingTests(unittest.TestCase):
             self.assertFalse(result.underfill["underfilled"])
             self.assertEqual(result.scale_report["minimum_target"], 100_000)
             self.assertEqual(result.scale_report["production_target"], 10_000_000)
+            self.assertEqual(result.scale_report["app_family_count"], 3)
+            self.assertIn("gimp", result.scale_report["app_families"])
             self.assertFalse(result.scale_report["meets_production_scale"])
             self.assertEqual(result.scale_report["scale_stage"], "bootstrap")
             self.assertTrue(state_path.exists())
@@ -462,6 +619,75 @@ class AdaptationTrainingTests(unittest.TestCase):
             self.assertEqual(resumed.shards_completed, 2)
             self.assertEqual(len(resumed.shard_results), 2)
             self.assertEqual(resumed.osworld_archive_transitions, 8)
+
+    def test_train_long_run_advances_sparse_screenspot_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            buf = io.BytesIO()
+            Image.new("RGB", (400, 200), color=(245, 245, 245)).save(
+                buf,
+                format="PNG",
+            )
+            trainer = SparseRowsAdaptationTrainer(temp_dir, buf.getvalue())
+            state_path = Path(temp_dir) / "sparse_long_run_state.json"
+
+            result = trainer.train_long_run(
+                AdaptationLongRunConfig(
+                    shard_count=3,
+                    screenspot_limit_per_shard=1,
+                    click100k_limit_per_shard=0,
+                    gui_actor_limit_per_shard=0,
+                    include_internal_trajectories_first_shard=False,
+                    download_osworld_manifest=False,
+                    state_path=str(state_path),
+                )
+            )
+
+            self.assertEqual(result.screenspot_rows_used, 3)
+            file_names: list[str] = []
+            for shard in result.shard_results:
+                rows_path = Path(str(shard["screenspot_rows_path"]))
+                payload = json.loads(
+                    rows_path.read_text(encoding="utf-8").splitlines()[0]
+                )
+                file_names.append(str(payload["file_name"]))
+            self.assertEqual(file_names, ["match_a.png", "match_b.png", "match_c.png"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertGreaterEqual(state["dataset_cursors"]["screenspot_offset"], 6)
+
+    def test_train_long_run_rotates_gui_actor_sources_with_row_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            buf = io.BytesIO()
+            Image.new("RGB", (400, 200), color=(235, 235, 235)).save(
+                buf,
+                format="PNG",
+            )
+            trainer = GuiActorCursorAdaptationTrainer(temp_dir, buf.getvalue())
+            state_path = Path(temp_dir) / "gui_actor_long_run_state.json"
+
+            result = trainer.train_long_run(
+                AdaptationLongRunConfig(
+                    shard_count=2,
+                    screenspot_limit_per_shard=0,
+                    click100k_limit_per_shard=0,
+                    gui_actor_limit_per_shard=1,
+                    include_internal_trajectories_first_shard=False,
+                    download_osworld_manifest=False,
+                    state_path=str(state_path),
+                )
+            )
+
+            self.assertEqual(result.gui_actor_rows_used, 2)
+            sources: list[str] = []
+            for shard in result.shard_results:
+                rows_path = Path(str(shard["gui_actor_rows_path"]))
+                payload = json.loads(
+                    rows_path.read_text(encoding="utf-8").splitlines()[0]
+                )
+                sources.append(str(payload["source"]))
+            self.assertEqual(sources, ["source-a", "source-b"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("source-a", state["dataset_cursors"]["gui_actor_row_offsets"])
+            self.assertIn("source-b", state["dataset_cursors"]["gui_actor_row_offsets"])
 
 
 if __name__ == "__main__":

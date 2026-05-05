@@ -163,6 +163,21 @@ class RegionAwareFrontierClient:
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_software_agent_diagnostic_objective_upgrades_heuristic_profile(
+        self,
+    ) -> None:
+        objective = (
+            "Analyze why the deep research agent is not comparable to Claude, "
+            "GPT, or Gemini, is not using browser and sandbox tools effectively, "
+            "and fix the architectural gaps."
+        )
+
+        analysis = WorkerAgent._heuristic_objective_analysis(objective)
+
+        self.assertGreaterEqual(analysis["complexity_score"], 8)
+        self.assertTrue(analysis["profile"]["comparison"])
+        self.assertTrue(analysis["profile"]["risk"])
+
     def test_general_research_adds_pc_research(self) -> None:
         tasks = SupervisorAgent().plan("research market evidence with sources")
 
@@ -405,6 +420,39 @@ class OrchestratorTests(unittest.TestCase):
             "pc control evidence failures in deep research agents",
             queries,
         )
+
+    def test_software_agent_diagnostic_browser_plan_distills_complaint_text(
+        self,
+    ) -> None:
+        objective = (
+            "So fix the code. Analyze why the deep research agent is not "
+            "comparable to Claude, GPT, or Gemini, why it is not using sandbox, "
+            "browser, and pc control properly, and why retrieval breadth and "
+            "useful evidence quality are weak."
+        )
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker.research_engine._ai_research_strategy = lambda objective, query, depth: {}
+
+        browser_plan = worker._planning_browser_research(
+            objective,
+            WorkerAgent._heuristic_objective_analysis(objective),
+        )
+
+        queries = browser_plan["search_queries"]
+        self.assertGreaterEqual(len(queries), 6)
+        self.assertIn(
+            "deep research agent retrieval breadth crawl scaling",
+            queries,
+        )
+        self.assertIn(
+            "deep research agent browser sandbox pc control routing",
+            queries,
+        )
+        self.assertFalse(
+            any(query.lower().startswith("so fix the code") for query in queries)
+        )
+        self.assertIn("https://github.com", browser_plan["seed_urls"])
+        self.assertIn("https://playwright.dev", browser_plan["seed_urls"])
 
     def test_planning_browser_urls_preserve_seed_urls_and_queries(self) -> None:
         urls = WorkerAgent._planning_browser_urls(

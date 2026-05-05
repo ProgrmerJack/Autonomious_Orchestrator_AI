@@ -27,6 +27,11 @@ class CrawlWorkerRecord:
     poll_interval_seconds: float = 0.0
     batch_size: int = 0
     claim_ttl_seconds: int = 0
+    allow_js_required: bool = True
+    prefer_js_required: bool = False
+    max_claims_per_domain: int = 0
+    default_domain_cooldown_seconds: float = 0.0
+    js_domain_cooldown_seconds: float = 0.0
     detail: str = ""
 
 
@@ -46,6 +51,11 @@ class CrawlWorkerServiceRecord:
     poll_interval_seconds: float = 0.0
     batch_size: int = 0
     claim_ttl_seconds: int = 0
+    allow_js_required: bool = True
+    prefer_js_required: bool = False
+    max_claims_per_domain: int = 0
+    default_domain_cooldown_seconds: float = 0.0
+    js_domain_cooldown_seconds: float = 0.0
     reconcile_interval_seconds: float = 0.0
     detail: str = ""
 
@@ -104,6 +114,15 @@ class CrawlWorkerManager:
             poll_interval_seconds=float(payload.get("poll_interval_seconds") or 0.0),
             batch_size=int(payload.get("batch_size") or 0),
             claim_ttl_seconds=int(payload.get("claim_ttl_seconds") or 0),
+            allow_js_required=bool(payload.get("allow_js_required", True)),
+            prefer_js_required=bool(payload.get("prefer_js_required", False)),
+            max_claims_per_domain=int(payload.get("max_claims_per_domain") or 0),
+            default_domain_cooldown_seconds=float(
+                payload.get("default_domain_cooldown_seconds") or 0.0
+            ),
+            js_domain_cooldown_seconds=float(
+                payload.get("js_domain_cooldown_seconds") or 0.0
+            ),
             detail=detail,
         )
 
@@ -116,6 +135,11 @@ class CrawlWorkerManager:
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
+        allow_js_required: bool = True,
+        prefer_js_required: bool = False,
+        max_claims_per_domain: int = 2,
+        default_domain_cooldown_seconds: float = 2.0,
+        js_domain_cooldown_seconds: float = 8.0,
     ) -> CrawlWorkerRecord:
         desired_count = max(1, min(int(worker_count), 8))
         queue_path = (
@@ -133,6 +157,12 @@ class CrawlWorkerManager:
             and Path(current.queue_db_path) == queue_path
             and current.broker_url == resolved_broker_url
             and str(state_payload.get("broker_token") or "") == resolved_broker_token
+            and current.allow_js_required == bool(allow_js_required)
+            and current.prefer_js_required == bool(prefer_js_required)
+            and current.max_claims_per_domain == int(max_claims_per_domain)
+            and current.default_domain_cooldown_seconds
+            == float(default_domain_cooldown_seconds)
+            and current.js_domain_cooldown_seconds == float(js_domain_cooldown_seconds)
         ):
             return current
         if current.status in {"running", "degraded", "stale"}:
@@ -171,6 +201,20 @@ class CrawlWorkerManager:
                 command.extend(["--broker-url", resolved_broker_url])
             if resolved_broker_token:
                 command.extend(["--broker-token", resolved_broker_token])
+            if prefer_js_required:
+                command.append("--prefer-js")
+            if not allow_js_required:
+                command.append("--no-js")
+            command.extend(
+                [
+                    "--max-claims-per-domain",
+                    str(max(1, int(max_claims_per_domain))),
+                    "--domain-cooldown",
+                    str(max(0.0, float(default_domain_cooldown_seconds))),
+                    "--js-domain-cooldown",
+                    str(max(0.0, float(js_domain_cooldown_seconds))),
+                ]
+            )
             env = os.environ.copy()
             env["AGENTOS_CRAWL_WORKER_PROCESS"] = "1"
             env["AGENTOS_DISABLE_AUTO_CRAWL_WORKERS"] = "1"
@@ -198,6 +242,14 @@ class CrawlWorkerManager:
             poll_interval_seconds=float(poll_interval_seconds),
             batch_size=int(batch_size),
             claim_ttl_seconds=int(claim_ttl_seconds),
+            allow_js_required=bool(allow_js_required),
+            prefer_js_required=bool(prefer_js_required),
+            max_claims_per_domain=max(1, int(max_claims_per_domain)),
+            default_domain_cooldown_seconds=max(
+                0.0,
+                float(default_domain_cooldown_seconds),
+            ),
+            js_domain_cooldown_seconds=max(0.0, float(js_domain_cooldown_seconds)),
             detail="detached crawl workers started",
         )
         payload = asdict(record)
@@ -214,6 +266,11 @@ class CrawlWorkerManager:
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
+        allow_js_required: bool = True,
+        prefer_js_required: bool = False,
+        max_claims_per_domain: int = 2,
+        default_domain_cooldown_seconds: float = 2.0,
+        js_domain_cooldown_seconds: float = 8.0,
     ) -> CrawlWorkerRecord:
         desired_count = max(1, min(int(worker_count), 8))
         queue_path = (
@@ -227,6 +284,12 @@ class CrawlWorkerManager:
             and current.worker_count == desired_count
             and Path(current.queue_db_path) == queue_path
             and current.broker_url == str(broker_url or "").strip()
+            and current.allow_js_required == bool(allow_js_required)
+            and current.prefer_js_required == bool(prefer_js_required)
+            and current.max_claims_per_domain == int(max_claims_per_domain)
+            and current.default_domain_cooldown_seconds
+            == float(default_domain_cooldown_seconds)
+            and current.js_domain_cooldown_seconds == float(js_domain_cooldown_seconds)
         ):
             return current
         return self.start(
@@ -237,6 +300,11 @@ class CrawlWorkerManager:
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
             claim_ttl_seconds=claim_ttl_seconds,
+            allow_js_required=allow_js_required,
+            prefer_js_required=prefer_js_required,
+            max_claims_per_domain=max_claims_per_domain,
+            default_domain_cooldown_seconds=default_domain_cooldown_seconds,
+            js_domain_cooldown_seconds=js_domain_cooldown_seconds,
         )
 
     def supervise(
@@ -248,6 +316,11 @@ class CrawlWorkerManager:
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
+        allow_js_required: bool = True,
+        prefer_js_required: bool = False,
+        max_claims_per_domain: int = 2,
+        default_domain_cooldown_seconds: float = 2.0,
+        js_domain_cooldown_seconds: float = 8.0,
         reconcile_interval_seconds: float = 30.0,
         once: bool = False,
     ) -> CrawlWorkerRecord:
@@ -259,6 +332,11 @@ class CrawlWorkerManager:
                 "poll_interval_seconds": poll_interval_seconds,
                 "batch_size": batch_size,
                 "claim_ttl_seconds": claim_ttl_seconds,
+                "allow_js_required": allow_js_required,
+                "prefer_js_required": prefer_js_required,
+                "max_claims_per_domain": max_claims_per_domain,
+                "default_domain_cooldown_seconds": default_domain_cooldown_seconds,
+                "js_domain_cooldown_seconds": js_domain_cooldown_seconds,
             }
             if broker_url:
                 ensure_kwargs["broker_url"] = broker_url
@@ -337,6 +415,15 @@ class CrawlWorkerServiceManager:
         poll_interval_seconds = float(payload.get("poll_interval_seconds") or 0.0)
         batch_size = int(payload.get("batch_size") or 0)
         claim_ttl_seconds = int(payload.get("claim_ttl_seconds") or 0)
+        allow_js_required = bool(payload.get("allow_js_required", True))
+        prefer_js_required = bool(payload.get("prefer_js_required", False))
+        max_claims_per_domain = int(payload.get("max_claims_per_domain") or 0)
+        default_domain_cooldown_seconds = float(
+            payload.get("default_domain_cooldown_seconds") or 0.0
+        )
+        js_domain_cooldown_seconds = float(
+            payload.get("js_domain_cooldown_seconds") or 0.0
+        )
         reconcile_interval_seconds = float(
             payload.get("reconcile_interval_seconds") or 0.0
         )
@@ -376,6 +463,11 @@ class CrawlWorkerServiceManager:
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
             claim_ttl_seconds=claim_ttl_seconds,
+            allow_js_required=allow_js_required,
+            prefer_js_required=prefer_js_required,
+            max_claims_per_domain=max_claims_per_domain,
+            default_domain_cooldown_seconds=default_domain_cooldown_seconds,
+            js_domain_cooldown_seconds=js_domain_cooldown_seconds,
             reconcile_interval_seconds=reconcile_interval_seconds,
             detail=detail,
         )
@@ -389,6 +481,11 @@ class CrawlWorkerServiceManager:
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
+        allow_js_required: bool = True,
+        prefer_js_required: bool = False,
+        max_claims_per_domain: int = 2,
+        default_domain_cooldown_seconds: float = 2.0,
+        js_domain_cooldown_seconds: float = 8.0,
         reconcile_interval_seconds: float = 30.0,
         task_name: str | None = None,
         start_now: bool = True,
@@ -407,6 +504,17 @@ class CrawlWorkerServiceManager:
             "poll_interval_seconds": float(poll_interval_seconds),
             "batch_size": max(1, min(int(batch_size), 24)),
             "claim_ttl_seconds": max(60, min(int(claim_ttl_seconds), 7_200)),
+            "allow_js_required": bool(allow_js_required),
+            "prefer_js_required": bool(prefer_js_required),
+            "max_claims_per_domain": max(1, int(max_claims_per_domain)),
+            "default_domain_cooldown_seconds": max(
+                0.0,
+                float(default_domain_cooldown_seconds),
+            ),
+            "js_domain_cooldown_seconds": max(
+                0.0,
+                float(js_domain_cooldown_seconds),
+            ),
             "reconcile_interval_seconds": max(
                 5.0,
                 min(float(reconcile_interval_seconds), 300.0),
@@ -634,6 +742,12 @@ class CrawlWorkerServiceManager:
             str(payload["claim_ttl_seconds"]),
             "--supervisor-interval",
             str(payload["reconcile_interval_seconds"]),
+            "--max-claims-per-domain",
+            str(payload.get("max_claims_per_domain") or 2),
+            "--domain-cooldown",
+            str(payload.get("default_domain_cooldown_seconds") or 0.0),
+            "--js-domain-cooldown",
+            str(payload.get("js_domain_cooldown_seconds") or 0.0),
         ]
         broker_url = str(payload.get("broker_url") or "").strip()
         broker_token = str(payload.get("broker_token") or "")
@@ -641,6 +755,10 @@ class CrawlWorkerServiceManager:
             argument_list.extend(["--broker-url", broker_url])
         if broker_token:
             argument_list.extend(["--broker-token", broker_token])
+        if bool(payload.get("prefer_js_required", False)):
+            argument_list.append("--prefer-js")
+        if not bool(payload.get("allow_js_required", True)):
+            argument_list.append("--no-js")
         arguments = subprocess.list2cmdline(argument_list)
         actions = ET.SubElement(task, f"{{{namespace}}}Actions", Context="Author")
         exec_action = ET.SubElement(actions, f"{{{namespace}}}Exec")

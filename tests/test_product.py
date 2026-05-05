@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
+from agentos_orchestrator.cli import main
 from agentos_orchestrator.product import (
     CommandRegistry,
+    CrawlBrokerServer,
     CrawlWorkerManager,
     CrawlWorkerRecord,
     CrawlWorkerServiceManager,
@@ -17,6 +21,7 @@ from agentos_orchestrator.product import (
     WorkflowCommand,
     collect_product_status,
 )
+from agentos_orchestrator.research import DeepResearchEngine
 from agentos_orchestrator.sdk import AgentOSClient
 
 
@@ -190,8 +195,97 @@ class ProductTests(unittest.TestCase):
                 poll_interval_seconds=9.0,
                 batch_size=4,
                 claim_ttl_seconds=300,
+                allow_js_required=True,
+                prefer_js_required=False,
+                max_claims_per_domain=2,
+                default_domain_cooldown_seconds=2.0,
+                js_domain_cooldown_seconds=8.0,
             )
             self.assertEqual(record.status, "running")
+
+    def test_crawl_worker_manager_start_writes_js_routing_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+
+            class _FakeProcess:
+                def __init__(self, pid: int) -> None:
+                    self.pid = pid
+
+            with patch(
+                "agentos_orchestrator.product.crawl_worker.subprocess.Popen"
+            ) as popen:
+                popen.return_value = _FakeProcess(444)
+                manager = CrawlWorkerManager(temp_dir, python_executable="python")
+                record = manager.start(
+                    worker_count=1,
+                    queue_db_path=queue_db,
+                    broker_url="http://127.0.0.1:8787",
+                    prefer_js_required=True,
+                    max_claims_per_domain=1,
+                    default_domain_cooldown_seconds=5.0,
+                    js_domain_cooldown_seconds=15.0,
+                )
+
+            self.assertTrue(record.prefer_js_required)
+            self.assertEqual(record.max_claims_per_domain, 1)
+            self.assertIn("--prefer-js", popen.call_args.args[0])
+            self.assertIn("--max-claims-per-domain", popen.call_args.args[0])
+            self.assertIn("15.0", popen.call_args.args[0])
+
+    def test_crawl_worker_service_install_writes_js_routing_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            service = CrawlWorkerServiceManager(temp_dir, python_executable="python")
+            schtasks_result = subprocess.CompletedProcess(
+                args=["schtasks"],
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            )
+
+            with (
+                patch.object(service, "_is_supported", return_value=True),
+                patch.object(service, "_task_exists", return_value=True),
+                patch.object(
+                    service,
+                    "_run_schtasks",
+                    return_value=schtasks_result,
+                ),
+                patch(
+                    "agentos_orchestrator.product.crawl_worker.CrawlWorkerManager.status",
+                    return_value=CrawlWorkerRecord(
+                        status="running",
+                        worker_pids=[111],
+                        worker_count=1,
+                        queue_db_path=str(queue_db),
+                        log_paths=[
+                            str(Path(temp_dir) / ".agentos/logs/crawl-worker-1.log")
+                        ],
+                        broker_url="http://127.0.0.1:8787",
+                        prefer_js_required=True,
+                        max_claims_per_domain=1,
+                        default_domain_cooldown_seconds=5.0,
+                        js_domain_cooldown_seconds=15.0,
+                        detail="ok",
+                    ),
+                ),
+            ):
+                service.install(
+                    worker_count=1,
+                    queue_db_path=queue_db,
+                    broker_url="http://127.0.0.1:8787",
+                    prefer_js_required=True,
+                    max_claims_per_domain=1,
+                    default_domain_cooldown_seconds=5.0,
+                    js_domain_cooldown_seconds=15.0,
+                    task_name="AgentOS JS Crawl",
+                    start_now=False,
+                )
+
+            task_xml = service.task_xml_path.read_text(encoding="utf-16")
+            self.assertIn("--prefer-js", task_xml)
+            self.assertIn("--max-claims-per-domain", task_xml)
+            self.assertIn("--js-domain-cooldown", task_xml)
 
     def test_crawl_worker_service_manager_install_writes_task_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -304,6 +398,87 @@ class ProductTests(unittest.TestCase):
             self.assertIn("--broker-url", task_xml)
             self.assertIn("http://127.0.0.1:8787", task_xml)
             self.assertIn("--broker-token", task_xml)
+
+    def test_cli_crawl_worker_broker_metrics_and_inspect_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=2,
+            )
+            broker.start_in_thread()
+            try:
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    [
+                        "https://docs.example.org/cli-inspect",
+                        "https://www.bloomberg.com/news/cli-metrics",
+                    ],
+                    "agentos broker cli observability",
+                    "run_cli_metrics",
+                    source_url="https://seed.example.org/objective",
+                    priority=8.0,
+                )
+                coordinator._claim_crawl_queue_batch(
+                    1,
+                    "worker-cli",
+                    allow_js_required=False,
+                    max_claims_per_domain=1,
+                )
+
+                metrics_buffer = io.StringIO()
+                with redirect_stdout(metrics_buffer):
+                    metrics_exit = main(
+                        [
+                            "crawl-worker",
+                            "broker",
+                            "metrics",
+                            "--broker-url",
+                            broker.url,
+                            "--broker-token",
+                            "secret-token",
+                        ]
+                    )
+                metrics_payload = json.loads(metrics_buffer.getvalue())
+
+                inspect_buffer = io.StringIO()
+                with redirect_stdout(inspect_buffer):
+                    inspect_exit = main(
+                        [
+                            "crawl-worker",
+                            "broker",
+                            "inspect",
+                            "--broker-url",
+                            broker.url,
+                            "--broker-token",
+                            "secret-token",
+                            "--status",
+                            "claimed",
+                            "--worker-id",
+                            "worker-cli",
+                            "--limit",
+                            "4",
+                        ]
+                    )
+                inspect_payload = json.loads(inspect_buffer.getvalue())
+
+                self.assertEqual(metrics_exit, 0)
+                self.assertEqual(metrics_payload["queue"]["total"], 2)
+                self.assertIn("worker_utilization", metrics_payload)
+                self.assertEqual(inspect_exit, 0)
+                self.assertEqual(inspect_payload["total_matches"], 1)
+                self.assertEqual(
+                    inspect_payload["items"][0]["last_claimed_by"],
+                    "worker-cli",
+                )
+            finally:
+                broker.shutdown()
 
     def test_sdk_shapes_run_and_command_requests(self) -> None:
         client = FakeClient()

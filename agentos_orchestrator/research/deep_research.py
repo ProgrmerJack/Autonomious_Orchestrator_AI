@@ -348,6 +348,13 @@ class DeepResearchEngine:
             settings,
             research_objective,
         )
+        if pc_context is None:
+            pc_context = self._auto_pc_context_for_run(
+                research_objective,
+                query,
+                settings.depth,
+                run_id,
+            )
         pc_context_info = self._pc_context_summary(pc_context)
         plan = self._build_research_plan(
             research_objective,
@@ -432,6 +439,15 @@ class DeepResearchEngine:
             settings.depth,
             durable_notes,
         )
+        synthesis_packet = self._build_synthesis_packet(
+            research_objective,
+            query,
+            selected,
+            settings.depth,
+            plan,
+            durable_notes,
+            synthesis_mode,
+        )
         summary = self._summarize(
             research_objective,
             selected,
@@ -440,6 +456,7 @@ class DeepResearchEngine:
             query,
             durable_notes,
             synthesis_mode,
+            synthesis_packet=synthesis_packet,
         )
         artifacts = self._write_artifacts(
             run_id,
@@ -454,6 +471,7 @@ class DeepResearchEngine:
             retrieval,
             run_id,
             synthesis_mode,
+            synthesis_packet,
         )
         confidence = self._confidence(selected)
         return ResearchBrief(
@@ -557,6 +575,39 @@ class DeepResearchEngine:
 
     def crawl_broker_status(self) -> dict[str, Any]:
         return self._crawl_broker_request("/status")
+
+    def crawl_broker_metrics(self) -> dict[str, Any]:
+        return self._crawl_broker_request("/metrics")
+
+    def crawl_broker_queue_inspect(
+        self,
+        *,
+        limit: int = 24,
+        statuses: list[str] | None = None,
+        domain: str = "",
+        worker_id: str = "",
+        js_required: bool | None = None,
+        shard_index: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"limit": int(limit)}
+        normalized_statuses = [
+            str(status).strip() for status in (statuses or []) if str(status).strip()
+        ]
+        if normalized_statuses:
+            payload["statuses"] = normalized_statuses
+        if str(domain or "").strip():
+            payload["domain"] = str(domain).strip()
+        if str(worker_id or "").strip():
+            payload["worker_id"] = str(worker_id).strip()
+        if js_required is not None:
+            payload["js_required"] = bool(js_required)
+        if shard_index is not None:
+            payload["shard_index"] = int(shard_index)
+        return self._crawl_broker_request(
+            "/queue/inspect",
+            payload,
+            timeout_seconds=max(10.0, self.timeout_seconds),
+        )
 
     def _crawl_broker_request(
         self,
@@ -770,6 +821,8 @@ class DeepResearchEngine:
             if not clean or clean in seen:
                 continue
             if not self._is_safe_public_url(clean):
+                continue
+            if self._is_low_signal_seed_url(clean):
                 continue
             seen.add(clean)
             result.append(clean)
@@ -1009,40 +1062,68 @@ class DeepResearchEngine:
                 )
         return int(result.rowcount or 0)
 
-    def _claim_crawl_queue_batch(
+    def _peek_crawl_queue_rows(
         self,
         limit: int,
-        worker_id: str,
+        *,
+        statuses: tuple[str, ...] = ("queued",),
+        exclude_urls: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        if self._crawl_broker_enabled():
-            response = self._crawl_broker_request(
-                "/queue/claim-batch",
-                {
-                    "limit": int(limit),
-                    "worker_id": str(worker_id or "crawl-worker"),
-                },
-            )
-            claimed = response.get("claimed") or []
-            return [dict(item) for item in claimed if isinstance(item, dict)]
+        self._ensure_research_state_store()
+        normalized_statuses = [
+            str(status).strip() for status in statuses if str(status).strip()
+        ]
+        if not normalized_statuses:
+            return []
+        excluded_urls = self._persistent_unique_urls(exclude_urls or [])
+        status_placeholders = ", ".join("?" for _ in normalized_statuses)
+        query = f"""
+            SELECT url, domain, priority, status, source_query, source_url,
+                   run_id, js_required, attempts, updated_at
+            FROM crawl_queue
+            WHERE status IN ({status_placeholders})
+        """
+        params: list[Any] = list(normalized_statuses)
+        if excluded_urls:
+            exclude_placeholders = ", ".join("?" for _ in excluded_urls)
+            query += f" AND url NOT IN ({exclude_placeholders})"
+            params.extend(excluded_urls)
+        query += " ORDER BY priority DESC, js_required DESC, updated_at DESC LIMIT ?"
+        params.append(max(limit, 1))
+        with closing(self._connect_research_state()) as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _claim_specific_crawl_urls(
+        self,
+        urls: list[str],
+        worker_id: str,
+    ) -> list[dict[str, Any]]:
+        safe_urls = self._persistent_unique_urls(urls)
+        if not safe_urls:
+            return []
         self._ensure_research_state_store()
         claimed: list[dict[str, Any]] = []
+        placeholders = ", ".join("?" for _ in safe_urls)
         with closing(self._connect_research_state()) as connection:
             rows = connection.execute(
-                """
-                SELECT url, domain, priority, source_query, source_url,
-                       run_id, js_required, attempts
+                f"""
+                SELECT url, domain, priority, status, source_query, source_url,
+                       run_id, js_required, attempts, updated_at
                 FROM crawl_queue
-                WHERE status = 'queued'
-                ORDER BY priority DESC, js_required DESC, updated_at DESC
-                LIMIT ?
+                WHERE status = 'queued' AND url IN ({placeholders})
                 """,
-                (max(limit * 4, limit),),
+                tuple(safe_urls),
             ).fetchall()
+            row_map = {str(row["url"] or ""): dict(row) for row in rows}
             now = datetime.now(UTC).isoformat()
             with connection:
-                for row in rows:
+                for url in safe_urls:
+                    row = row_map.get(url)
+                    if row is None:
+                        continue
                     updated = connection.execute(
                         """
                         UPDATE crawl_queue
@@ -1057,15 +1138,75 @@ class DeepResearchEngine:
                             worker_id,
                             now,
                             now,
-                            str(row["url"] or ""),
+                            url,
                         ),
                     ).rowcount
                     if not updated:
                         continue
-                    claimed.append(dict(row))
-                    if len(claimed) >= limit:
-                        break
+                    claimed.append(row)
         return claimed
+
+    def _claim_crawl_queue_batch(
+        self,
+        limit: int,
+        worker_id: str,
+        *,
+        allow_js_required: bool = True,
+        prefer_js_required: bool = False,
+        max_claims_per_domain: int = 2,
+        default_domain_cooldown_seconds: float = 0.0,
+        js_domain_cooldown_seconds: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/queue/claim-batch",
+                {
+                    "limit": int(limit),
+                    "worker_id": str(worker_id or "crawl-worker"),
+                    "allow_js_required": bool(allow_js_required),
+                    "prefer_js_required": bool(prefer_js_required),
+                    "max_claims_per_domain": max(1, int(max_claims_per_domain)),
+                    "default_domain_cooldown_seconds": float(
+                        default_domain_cooldown_seconds
+                    ),
+                    "js_domain_cooldown_seconds": float(js_domain_cooldown_seconds),
+                },
+            )
+            claimed = response.get("claimed") or []
+            return [dict(item) for item in claimed if isinstance(item, dict)]
+        del default_domain_cooldown_seconds, js_domain_cooldown_seconds
+        preview_rows = self._peek_crawl_queue_rows(max(limit * 6, limit))
+        domain_counts: dict[str, int] = {}
+        selected_urls: list[str] = []
+
+        def _sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+            priority = float(row.get("priority") or 0.0)
+            js_required = int(row.get("js_required") or 0)
+            updated_at = str(row.get("updated_at") or "")
+            if prefer_js_required:
+                return (js_required, priority, updated_at)
+            return (priority, js_required, updated_at)
+
+        for row in sorted(preview_rows, key=_sort_key, reverse=True):
+            url = str(row.get("url") or "").strip()
+            if not url:
+                continue
+            js_required = bool(int(row.get("js_required") or 0))
+            if js_required and not allow_js_required:
+                continue
+            domain = str(row.get("domain") or "").strip() or self._source_domain(url)
+            if domain and domain_counts.get(domain, 0) >= max(
+                1, int(max_claims_per_domain)
+            ):
+                continue
+            selected_urls.append(url)
+            if domain:
+                domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            if len(selected_urls) >= limit:
+                break
+        return self._claim_specific_crawl_urls(selected_urls, worker_id)
 
     def _claim_persistent_crawl_sources(
         self,
@@ -1672,6 +1813,7 @@ class DeepResearchEngine:
         candidates: list[str] = []
         if pc_context:
             candidates.extend(cls._pc_context_priority_urls(pc_context))
+        candidates.extend(cls._software_agent_diagnostic_seed_urls(objective))
         candidates.extend(cls._collect_urls(objective))
         if planning_context:
             candidates.extend(cls._collect_urls(planning_context))
@@ -1684,6 +1826,8 @@ class DeepResearchEngine:
             cleaned = url.rstrip(").,;]}>\"'")
             if not cls._is_safe_public_url(cleaned):
                 continue
+            if cls._is_low_signal_seed_url(cleaned):
+                continue
             if cls._is_search_result_url(cleaned):
                 continue
             if cleaned in seen:
@@ -1691,6 +1835,125 @@ class DeepResearchEngine:
             seen.add(cleaned)
             deduped.append(cleaned)
         return deduped[:48]
+
+    def _auto_pc_context_for_run(
+        self,
+        objective: str,
+        query: str,
+        depth: str,
+        run_id: str = "",
+    ) -> dict[str, Any] | None:
+        if os.environ.get("AGENTOS_DISABLE_AUTONOMOUS_BROWSER_CONTEXT") == "1":
+            return None
+        if not self._should_auto_pc_context_for_run(objective, query, depth):
+            return None
+
+        direct_urls = self._source_seed_urls(objective, None, None)[:8]
+        if not direct_urls:
+            return None
+
+        rendered_pages = self._headless_browser_pool_fetch(
+            direct_urls,
+            max_chars=12_000,
+            timeout_ms=16_000,
+        )
+        judged_results: list[dict[str, Any]] = []
+        discovered_domains: list[str] = []
+        kept_urls: list[str] = []
+        search_queries = self._software_agent_diagnostic_queries(objective) or [query]
+
+        for url in direct_urls:
+            rendered = self._strip_dom_noise_tokens(str(rendered_pages.get(url) or ""))
+            used_browser = bool(rendered)
+            content = rendered or self._fetch_page_text(url, max_bytes=12_000)
+            content = self._strip_dom_noise_tokens(content)
+            quality_score = round(self._text_signal_score(content), 3)
+            if quality_score < 0.08:
+                continue
+
+            title = self._label_from_url(url)
+            source = ResearchSource(
+                provider="pc-browser-research",
+                title=title,
+                url=url,
+                authors=[self._source_domain(url)],
+                abstract=content[:1800],
+                score=24.0 if used_browser else 18.0,
+                evidence_grade="tool-observation" if used_browser else "ungraded",
+            )
+            claim = self._compressed_claim(source, query)
+            judged_results.append(
+                {
+                    "query": search_queries[0],
+                    "title": title,
+                    "url": url,
+                    "domain": self._source_domain(url),
+                    "abstract": content[:400],
+                    "page_excerpt": content[:800],
+                    "evidence_claims": [claim] if claim else [],
+                    "content_quality": {
+                        "quality_score": quality_score,
+                        "used_browser": used_browser,
+                    },
+                    "judgment": (
+                        "standalone browser context seeded from authoritative sources"
+                    ),
+                }
+            )
+            kept_urls.append(url)
+            domain = self._source_domain(url)
+            if domain and domain not in discovered_domains:
+                discovered_domains.append(domain)
+
+        if not kept_urls:
+            return None
+
+        self._record_provider_diagnostic(
+            "standalone-browser-context",
+            "ok",
+            (
+                f"seeded {len(kept_urls)} autonomous browser-reviewed urls"
+                + (f" for {run_id}" if run_id else "")
+            ),
+        )
+        return {
+            "snapshot_path": "__autonomous_browser__",
+            "pc_findings": {
+                "search_queries": search_queries[:12],
+                "judged_results": judged_results,
+                "direct_urls": kept_urls,
+                "discovered_domains": discovered_domains,
+                "candidate_urls": kept_urls,
+                "search_result_count": len(kept_urls),
+                "frontier": {
+                    "mode": "standalone-autonomous",
+                    "deep_reads": len(kept_urls),
+                    "candidate_urls": len(kept_urls),
+                },
+                "terminal_verifications": [],
+            },
+        }
+
+    @classmethod
+    def _should_auto_pc_context_for_run(
+        cls,
+        objective: str,
+        query: str,
+        depth: str,
+    ) -> bool:
+        combined = f"{objective} {query}".strip()
+        if cls._looks_like_software_agent_diagnostic_objective(combined):
+            return True
+        if depth != "multi-hour":
+            return False
+        if not cls._looks_like_current_evidence_query(combined):
+            return False
+        return bool(
+            re.search(
+                r"\b(browser|sandbox|pc control|computer use|desktop|local pc)\b",
+                combined.lower(),
+            )
+        )
 
     @classmethod
     def _pc_context_priority_urls(
@@ -1758,6 +2021,27 @@ class DeepResearchEngine:
         }
         return search_routes.get(host, False)
 
+    @staticmethod
+    def _is_low_signal_seed_url(url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.lower()
+        if not path:
+            return False
+        if re.search(
+            r"\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|webmanifest|woff2?|ttf|map)$",
+            path,
+        ):
+            return True
+        return any(
+            token in path
+            for token in (
+                "favicon",
+                "apple-touch-icon",
+                "safari-pinned-tab",
+                "site.webmanifest",
+            )
+        )
+
     def _seed_sources(self, seed_urls: list[str]) -> list[ResearchSource]:
         if not seed_urls:
             return []
@@ -1775,6 +2059,8 @@ class DeepResearchEngine:
 
     def _seed_source(self, url: str) -> ResearchSource | None:
         if not self._is_safe_public_url(url):
+            return None
+        if self._is_low_signal_seed_url(url):
             return None
         content = self._fetch_page_text(url, max_bytes=40_000)
         host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
@@ -2367,7 +2653,7 @@ class DeepResearchEngine:
                         chain_eq = self._enrich_top_sources(
                             chain_expansion_batch, query
                         )
-                        for cq in chain_eq:
+                        for cq in self._sanitize_query_variants(chain_eq, query):
                             if cq and cq not in all_variants:
                                 all_variants.append(cq)
 
@@ -2422,7 +2708,7 @@ class DeepResearchEngine:
                     selected[:enrich_count],
                     query,
                 )
-                for cq in content_queries:
+                for cq in self._sanitize_query_variants(content_queries, query):
                     if cq and cq not in all_variants:
                         all_variants.append(cq)
                 # Flush transient enrichment text from local loop context after
@@ -8000,6 +8286,7 @@ class DeepResearchEngine:
         retrieval: dict[str, Any],
         run_id_for_durable_notes: str,
         synthesis_mode: str,
+        synthesis_packet: dict[str, Any],
     ) -> list[str]:
         artifact_dir = self.workspace_root / "runs" / run_id / "research"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -8015,6 +8302,7 @@ class DeepResearchEngine:
         retrieval_metrics_path = artifact_dir / "retrieval_metrics.json"
         evidence_graph_path = artifact_dir / "evidence_graph.json"
         benchmark_adapters_path = artifact_dir / "benchmark_adapters.json"
+        synthesis_packet_path = artifact_dir / "synthesis_packet.json"
         durable_notes_path = self._durable_report_path(run_id_for_durable_notes)
         findings = self._finding_ledger(query, sources, plan)
         claim_trace_payload = self._claim_trace(objective, summary, findings)
@@ -8161,6 +8449,10 @@ class DeepResearchEngine:
             json.dumps(benchmark_adapters, indent=2),
             encoding="utf-8",
         )
+        synthesis_packet_path.write_text(
+            json.dumps(synthesis_packet, indent=2),
+            encoding="utf-8",
+        )
         diagnostics_path.write_text(
             json.dumps(self.provider_diagnostics, indent=2),
             encoding="utf-8",
@@ -8184,6 +8476,7 @@ class DeepResearchEngine:
             str(claim_trace_path.relative_to(self.workspace_root)),
             str(evidence_graph_path.relative_to(self.workspace_root)),
             str(benchmark_adapters_path.relative_to(self.workspace_root)),
+            str(synthesis_packet_path.relative_to(self.workspace_root)),
             str(diagnostics_path.relative_to(self.workspace_root)),
         ]
         artifacts.extend(
@@ -8896,8 +9189,6 @@ class DeepResearchEngine:
             query,
             query,
             "standard",
-            self._looks_like_software_agent_query(query),
-            self._looks_like_math_query(query),
         )
         findings: list[dict[str, Any]] = []
         used_titles: set[str] = set()
@@ -9156,6 +9447,92 @@ class DeepResearchEngine:
             )
         return "\n".join(lines).rstrip() + "\n"
 
+    @classmethod
+    def _synthesis_source_limit(
+        cls,
+        depth: str,
+        source_count: int,
+        synthesis_mode: str,
+        objective: str = "",
+    ) -> int:
+        if source_count <= 0:
+            return 0
+        if synthesis_mode == "durable-notes-only":
+            return min(source_count, 24)
+        limits = {
+            "quick": 12,
+            "standard": 24,
+            "multi-hour": 32,
+        }
+        if (
+            depth == "multi-hour"
+            and objective
+            and (
+                cls._looks_like_software_agent_query(objective)
+                or cls._looks_like_current_evidence_query(objective)
+                or cls._looks_like_comprehensive_research(objective.lower())
+            )
+        ):
+            return max(1, min(source_count, 96))
+        return max(1, min(source_count, limits.get(depth, 24)))
+
+    def _build_synthesis_packet(
+        self,
+        objective: str,
+        query: str,
+        sources: list[ResearchSource],
+        depth: str,
+        plan: dict[str, Any] | None,
+        durable_notes: str,
+        synthesis_mode: str,
+    ) -> dict[str, Any]:
+        source_limit = self._synthesis_source_limit(
+            depth,
+            len(sources),
+            synthesis_mode,
+            objective,
+        )
+        synthesis_sources = sources[:source_limit]
+        findings = self._finding_ledger(query or objective, synthesis_sources, plan)
+        perspective_coverage = self._perspective_coverage(
+            sources,
+            (plan or {}).get("perspectives") or [],
+        )
+        provider_counts: dict[str, int] = {}
+        for source in sources:
+            provider_counts[source.provider] = (
+                provider_counts.get(source.provider, 0) + 1
+            )
+        return {
+            "objective": objective,
+            "query": query,
+            "depth": depth,
+            "synthesis_mode": synthesis_mode,
+            "total_ranked_sources": len(sources),
+            "synthesis_source_count": len(synthesis_sources),
+            "durable_notes_available": bool(durable_notes.strip()),
+            "provider_counts": provider_counts,
+            "perspective_coverage": perspective_coverage,
+            "findings": findings,
+            "market_signals": (
+                self._market_signal_snapshot(synthesis_sources)
+                if self._looks_like_market_query(query or objective)
+                else []
+            ),
+            "top_sources": [
+                {
+                    "provider": source.provider,
+                    "title": source.title,
+                    "url": source.url,
+                    "year": source.year,
+                    "evidence_grade": source.evidence_grade,
+                    "score": round(source.score, 3),
+                    "abstract": (source.abstract or source.title)[:240],
+                }
+                for source in synthesis_sources
+            ],
+        }
+
     def _summarize(
         self,
         objective: str,
@@ -9165,6 +9542,7 @@ class DeepResearchEngine:
         query: str = "",
         durable_notes: str = "",
         synthesis_mode: str = "hybrid",
+        synthesis_packet: dict[str, Any] | None = None,
     ) -> str:
         if not sources:
             return (
@@ -9172,10 +9550,23 @@ class DeepResearchEngine:
                 f"providers for: {objective}. Check network policy, API "
                 "availability, or attach MCP research servers."
             )
+        packet = synthesis_packet or self._build_synthesis_packet(
+            objective,
+            query,
+            sources,
+            depth,
+            plan,
+            durable_notes,
+            synthesis_mode,
+        )
+        synthesis_source_count = int(packet.get("synthesis_source_count") or 0)
+        synthesis_sources = (
+            sources[:synthesis_source_count] if synthesis_source_count > 0 else sources
+        )
         if synthesis_mode == "durable-notes-only" and durable_notes.strip():
             ai_synthesis = self._ai_durable_notes_synthesis(
                 objective,
-                sources,
+                synthesis_sources,
                 durable_notes,
                 plan,
             )
@@ -9191,11 +9582,8 @@ class DeepResearchEngine:
                 f"Integrated {len(note_lines)} distilled claims from workflows/report.md "
                 "with minimal source metadata."
             )
-        findings = self._finding_ledger(query or objective, sources, plan)
-        perspective_coverage = self._perspective_coverage(
-            sources,
-            (plan or {}).get("perspectives") or [],
-        )
+        findings = list(packet.get("findings") or [])
+        perspective_coverage = dict(packet.get("perspective_coverage") or {})
         subquestion_count = len((plan or {}).get("subquestions", []))
 
         # ------------------------------------------------------------------
@@ -9205,7 +9593,7 @@ class DeepResearchEngine:
         # ------------------------------------------------------------------
         ai_synthesis = self._ai_scientist_synthesis(
             objective,
-            sources,
+            synthesis_sources,
             findings,
             plan,
             perspective_coverage,
@@ -9224,11 +9612,7 @@ class DeepResearchEngine:
             ", ".join(perspective_coverage["missing"][:3])
             or "no major uncovered perspectives detected"
         )
-        market_signal_lines = (
-            self._market_signal_snapshot(sources)
-            if self._looks_like_market_query(query or objective)
-            else []
-        )
+        market_signal_lines = list(packet.get("market_signals") or [])
         market_snapshot_text = (
             "Market signal snapshot: " + "; ".join(market_signal_lines[:5]) + ". "
             if market_signal_lines
@@ -9283,7 +9667,7 @@ class DeepResearchEngine:
             source_lines = self._minimal_source_metadata_lines(sources)
         else:
             source_lines = []
-            for src in sources[:40]:
+            for src in sources:
                 year = f" ({src.year})" if src.year else ""
                 grade = src.evidence_grade
                 snippet = (src.abstract or src.title)[:200].replace("\n", " ")
@@ -9361,7 +9745,7 @@ class DeepResearchEngine:
                 f"Subquestions investigated:\n{subquestions}\n\n"
                 f"Evidence collected ({len(sources)} sources across "
                 f"{len({s.provider for s in sources})} providers):\n"
-                + "\n".join(source_lines[:40])
+                + "\n".join(source_lines)
                 + (
                     "\n\nMarket signal candidates identified in evidence:\n"
                     + "\n".join(market_signal_lines)
@@ -9414,7 +9798,7 @@ class DeepResearchEngine:
                 f"Research objective: {objective}\n\n"
                 f"Subquestions investigated:\n{subquestions}\n\n"
                 f"Evidence found ({len(sources)} sources):\n"
-                + "\n".join(source_lines[:40])
+                + "\n".join(source_lines)
                 + (
                     "\n\nDurable distilled report notes:\n" + durable_notes[:16000]
                     if durable_notes
@@ -9483,8 +9867,6 @@ class DeepResearchEngine:
         )
         if configured in {"hybrid", "durable-notes-only"}:
             return configured
-        if depth == "multi-hour" and durable_notes.strip():
-            return "durable-notes-only"
         return "hybrid"
 
     def _initialize_durable_report(
@@ -9649,20 +10031,53 @@ class DeepResearchEngine:
         # strongest evidence.
         # ----------------------------------------------------------------
         ai_strategy = self._ai_research_strategy(objective, query, depth)
+        software_agent_mode = self._looks_like_software_agent_diagnostic_objective(
+            f"{objective} {query}"
+        )
+        diagnostic_queries = self._software_agent_diagnostic_queries(objective)
+        diagnostic_perspectives = self._software_agent_diagnostic_perspectives(
+            objective
+        )
+        diagnostic_subquestions = self._software_agent_diagnostic_subquestions(
+            objective
+        )
+        diagnostic_authorities = self._software_agent_diagnostic_seed_urls(
+            objective
+        )
 
         # ------------------------------------------------------------------
         # ADAPTIVE PLANNING: derive perspectives, comparative axes, and
         # evidence requirements from AI reasoning about THIS specific
         # objective, not from domain-type templates.
         # ------------------------------------------------------------------
-        perspectives = self._research_perspectives(query, objective, depth)
+        perspectives = (
+            diagnostic_perspectives
+            if diagnostic_perspectives
+            else self._research_perspectives(query, objective, depth)
+        )
 
         ai_axes = self._ai_research_axes(objective, query, depth)
         comparative_axes = ai_axes.get("comparative_axes") or []
         evidence_requirements = ai_axes.get("evidence_requirements") or []
+        if software_agent_mode:
+            comparative_axes = list(comparative_axes) + [
+                "planner/query distillation quality",
+                "browser and sandbox tool routing",
+                "retrieval breadth and crawl scaling",
+                "evidence ranking and synthesis fidelity",
+                "benchmark performance against leading research agents",
+            ]
+            evidence_requirements = list(evidence_requirements) + [
+                "code-path evidence for planning, routing, retrieval, and synthesis",
+                "browser or sandbox traces showing active tool usage",
+                "crawl breadth metrics, queue state, or frontier expansion evidence",
+                "authoritative benchmark or product documentation for competitor comparison",
+            ]
 
         # AI-derived subquestions from strategy call above.
         ai_subquestions = list(ai_strategy.get("subquestions") or [])
+        if diagnostic_subquestions:
+            ai_subquestions = diagnostic_subquestions + ai_subquestions
 
         if not ai_subquestions:
             # Absolute minimal fallback if AI strategy generation failed.
@@ -9706,7 +10121,8 @@ class DeepResearchEngine:
 
         # Entity-focused short queries come FIRST so they are not cut by
         # max_query_variants when the list is later sliced.
-        plan_queries = self._entity_queries(query, objective)
+        plan_queries = list(diagnostic_queries)
+        plan_queries.extend(self._entity_queries(query, objective))
 
         # AI-reasoned queries come next — these are derived from causal
         # thinking, not generic template expansions.
@@ -9735,6 +10151,20 @@ class DeepResearchEngine:
             deduped_queries.append(candidate)
             seen.add(normalized)
 
+        merged_domains: list[str] = []
+        seen_domains: set[str] = set()
+        for domain in diagnostic_authorities + list(
+            ai_strategy.get("authoritative_domains") or []
+        ):
+            text = str(domain or "").strip()
+            if not text:
+                continue
+            normalized = text.lower().rstrip("/")
+            if normalized in seen_domains:
+                continue
+            seen_domains.add(normalized)
+            merged_domains.append(text)
+
         return {
             "core_question": objective[:300],
             "subquestions": subquestions,
@@ -9744,7 +10174,7 @@ class DeepResearchEngine:
             "query_plan": deduped_queries,
             # AI-reasoned authoritative domains are stored so that
             # _iterative_retrieval can seed the source list with them.
-            "ai_authoritative_domains": ai_strategy.get("authoritative_domains") or [],
+            "ai_authoritative_domains": merged_domains,
             "ai_causal_connections": ai_strategy.get("causal_connections") or [],
         }
 
@@ -10088,8 +10518,217 @@ class DeepResearchEngine:
         )
         for prefix in prefixes:
             cleaned = cleaned.replace(prefix, "")
+        diagnostic_queries = DeepResearchEngine._software_agent_diagnostic_queries(
+            cleaned
+        )
+        if diagnostic_queries:
+            return diagnostic_queries[0]
         distilled = DeepResearchEngine._query_core_terms(cleaned)
         return distilled[:240].strip() or cleaned[:240].strip() or objective[:240]
+
+    @classmethod
+    def _software_agent_diagnostic_queries(cls, objective: str) -> list[str]:
+        if not cls._looks_like_software_agent_diagnostic_objective(objective):
+            return []
+        lower = re.sub(r"\s+", " ", objective).strip().lower()
+        anchors = ["deep research agent"]
+        if "agentos" in lower:
+            anchors.insert(0, "agentos deep research")
+        elif "orchestrator" in lower:
+            anchors.insert(0, "research orchestrator")
+
+        aspects: list[str] = []
+        if re.search(
+            r"\b(browser|sandbox|pc control|desktop|computer use|local pc|web browsing)\b",
+            lower,
+        ):
+            aspects.append("browser sandbox pc control routing")
+        if re.search(
+            r"\b(website|websites|url|urls|crawl|crawler|retrieval|breadth|coverage|10k|1000)\b",
+            lower,
+        ):
+            aspects.append("retrieval breadth crawl scaling")
+        if re.search(
+            r"\b(template|general|generic|useful data|ranking|evidence|synthesis|analyst|scientist)\b",
+            lower,
+        ):
+            aspects.append("evidence quality ranking synthesis")
+        if re.search(
+            r"\b(compare|comparison|comparable|claude|gpt|gemini|openhands|openclaw)\b",
+            lower,
+        ):
+            aspects.append("benchmark comparison")
+        if re.search(
+            r"\b(fix|issue|issues|failure|failures|gap|gaps|bug|bugs|why|underperform|shallow)\b",
+            lower,
+        ):
+            aspects.append("failure modes architecture gaps")
+        if not aspects:
+            aspects = [
+                "failure modes architecture gaps",
+                "retrieval breadth crawl scaling",
+                "evidence quality ranking synthesis",
+            ]
+
+        queries: list[str] = []
+        comparator_terms = [
+            token
+            for token in ("claude", "gpt", "gemini", "openhands", "openclaw")
+            if token in lower
+        ]
+        for anchor in anchors:
+            queries.append(anchor)
+            for aspect in aspects:
+                queries.append(f"{anchor} {aspect}")
+            for comparator in comparator_terms:
+                queries.append(f"{anchor} {comparator} comparison")
+        if "mcp" in lower:
+            queries.append("model context protocol research agent tool routing")
+        if "browser" in lower or "sandbox" in lower:
+            queries.append("computer use browser automation research agent architecture")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            text = str(query or "").strip()[:240]
+            normalized = cls._normalize_title(text)
+            if not text or not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(text)
+        return deduped[:14]
+
+    @classmethod
+    def _software_agent_diagnostic_seed_urls(cls, objective: str) -> list[str]:
+        if not cls._looks_like_software_agent_diagnostic_objective(objective):
+            return []
+        lower = objective.lower()
+        candidates = ["https://github.com"]
+        if "mcp" in lower:
+            candidates.append("https://modelcontextprotocol.io")
+        if "browser" in lower or "sandbox" in lower:
+            candidates.append("https://playwright.dev")
+        if "claude" in lower:
+            candidates.append("https://docs.anthropic.com")
+        if "gpt" in lower or "openai" in lower:
+            candidates.append("https://platform.openai.com/docs")
+        if "gemini" in lower or "google" in lower:
+            candidates.append("https://ai.google.dev")
+
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped[:8]
+
+    @classmethod
+    def _software_agent_diagnostic_perspectives(
+        cls,
+        objective: str,
+    ) -> list[dict[str, Any]]:
+        if not cls._looks_like_software_agent_diagnostic_objective(objective):
+            return []
+        lower = objective.lower()
+        perspectives = [
+            {
+                "name": "architecture",
+                "goal": "Audit orchestration, planning, and execution seams.",
+                "keywords": [
+                    "architecture",
+                    "planner",
+                    "orchestrator",
+                    "routing",
+                    "runtime",
+                ],
+                "queries": [
+                    "deep research agent failure modes architecture gaps",
+                    "deep research agent planner routing diagnostics",
+                ],
+            },
+            {
+                "name": "browser-tooling",
+                "goal": "Verify browser, sandbox, and pc-control tool routing.",
+                "keywords": [
+                    "browser",
+                    "sandbox",
+                    "pc control",
+                    "computer use",
+                    "tool routing",
+                ],
+                "queries": [
+                    "deep research agent browser sandbox pc control routing",
+                    "computer use browser automation research agent architecture",
+                ],
+            },
+            {
+                "name": "retrieval-breadth",
+                "goal": "Measure crawl scaling, frontier expansion, and source breadth.",
+                "keywords": [
+                    "retrieval",
+                    "crawl",
+                    "breadth",
+                    "coverage",
+                    "frontier",
+                ],
+                "queries": [
+                    "deep research agent retrieval breadth crawl scaling",
+                    "deep research agent frontier expansion coverage",
+                ],
+            },
+            {
+                "name": "evidence-quality",
+                "goal": "Assess ranking, evidence quality, and synthesis fidelity.",
+                "keywords": [
+                    "evidence quality",
+                    "ranking",
+                    "synthesis",
+                    "grounding",
+                    "useful data",
+                ],
+                "queries": [
+                    "deep research agent evidence quality ranking synthesis",
+                    "deep research agent grounding useful data diagnostics",
+                ],
+            },
+        ]
+        if re.search(
+            r"\b(compare|comparison|comparable|claude|gpt|gemini|openhands|openclaw)\b",
+            lower,
+        ):
+            perspectives.append(
+                {
+                    "name": "benchmarks",
+                    "goal": "Compare observed behavior against leading research agents.",
+                    "keywords": [
+                        "benchmark",
+                        "comparison",
+                        "claude",
+                        "gpt",
+                        "gemini",
+                    ],
+                    "queries": [
+                        "deep research agent benchmark comparison",
+                        "deep research agent claude gpt gemini comparison",
+                    ],
+                }
+            )
+        return perspectives[:5]
+
+    @classmethod
+    def _software_agent_diagnostic_subquestions(cls, objective: str) -> list[str]:
+        if not cls._looks_like_software_agent_diagnostic_objective(objective):
+            return []
+        questions = [
+            "Which planning or query-distillation steps are causing low-signal retrieval?",
+            "Which browser, sandbox, or pc-control routing decisions are limiting active research?",
+            "Where do retrieval, ranking, or synthesis stages discard high-signal evidence?",
+            "Which benchmark or competitor capabilities reveal the largest architectural gaps?",
+        ]
+        if "10k" in objective.lower() or "1000" in objective.lower():
+            questions.append(
+                "Which crawl, frontier, or queue limits prevent broad multi-thousand URL coverage?"
+            )
+        return questions[:5]
 
     @classmethod
     def _split_depth(cls, objective: str) -> tuple[str, str]:
@@ -11394,7 +12033,40 @@ class DeepResearchEngine:
     ) -> list[ResearchSource]:
         if not ranked:
             return []
-        capped = ranked[: max(max_sources * 3, max_sources)]
+        capped_limit = max(max_sources * 3, max_sources)
+        capped = ranked[:capped_limit]
+        capped_identity_keys = {
+            key
+            for source in capped
+            for key in DeepResearchEngine._source_identity_keys(source)
+        }
+        preserved_browser_sources = 0
+        for source in ranked[capped_limit:]:
+            if preserved_browser_sources >= 3:
+                break
+            if source.provider != "pc-browser-research":
+                continue
+            if "off-topic" in (source.quality_flags or []):
+                continue
+            if not any(
+                flag in (source.quality_flags or [])
+                for flag in (
+                    "browser-terminal-verified",
+                    "browser-navigation-seed",
+                    "browser-judged-source",
+                    "browser-fetched-seed",
+                )
+            ):
+                continue
+            if not DeepResearchEngine._source_is_on_topic(source, query):
+                continue
+            source_keys = DeepResearchEngine._source_identity_keys(source)
+            if source_keys and any(key in capped_identity_keys for key in source_keys):
+                continue
+            capped.append(source)
+            for key in source_keys:
+                capped_identity_keys.add(key)
+            preserved_browser_sources += 1
         capped = [
             source
             for source in capped
@@ -12104,6 +12776,9 @@ class DeepResearchEngine:
                 return True
 
         query_tokens = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower()))
+        for word in words:
+            if cls._looks_like_gibberish_query_token(word, query_tokens):
+                return True
         rare_letters = set("qxzjkvwy")
         for word in words:
             if len(word) < 6 or word in query_tokens:
@@ -12116,6 +12791,44 @@ class DeepResearchEngine:
         if anchors and not any(anchor in lower for anchor in anchors):
             return True
         return False
+
+    @staticmethod
+    def _looks_like_gibberish_query_token(
+        word: str,
+        query_tokens: set[str] | None = None,
+    ) -> bool:
+        token = str(word or "").lower().strip("-")
+        if len(token) < 6:
+            return False
+        if query_tokens and token in query_tokens:
+            return False
+        if not re.fullmatch(r"[a-z-]+", token):
+            return False
+
+        parts = [part for part in token.split("-") if part]
+        if len(parts) > 1:
+            return any(
+                DeepResearchEngine._looks_like_gibberish_query_token(
+                    part,
+                    query_tokens,
+                )
+                for part in parts
+            )
+
+        vowels = sum(1 for ch in token if ch in "aeiou")
+        vowel_ratio = vowels / max(len(token), 1)
+        rare_letters = set("qxzjkvwy")
+        rare_ratio = sum(1 for ch in token if ch in rare_letters) / len(token)
+
+        if vowels == 0:
+            return True
+        if (
+            vowels <= 1
+            and re.search(r"[bcdfghjklmnpqrstvwxyz]{5,}", token)
+            and (vowel_ratio < 0.25 or rare_ratio >= 0.3)
+        ):
+            return True
+        return rare_ratio >= 0.4 and vowel_ratio < 0.35
 
     @staticmethod
     def _looks_like_software_agent_query(query: str) -> bool:
@@ -12148,6 +12861,24 @@ class DeepResearchEngine:
             )
             and re.search(
                 r"\b(agent|orchestrator|desktop|browser|workflow|tool)\b",
+                lower,
+            )
+        )
+
+    @classmethod
+    def _looks_like_software_agent_diagnostic_objective(cls, query: str) -> bool:
+        if not cls._looks_like_software_agent_query(query):
+            return False
+        lower = query.lower()
+        return bool(
+            re.search(
+                (
+                    r"\b(fix|issue|issues|bug|bugs|failure|failures|gap|gaps|"
+                    r"shallow|template|comparable|comparison|benchmark|"
+                    r"claude|gpt|gemini|browser|sandbox|pc control|computer use|"
+                    r"retrieval|breadth|coverage|10k|1000|ranking|synthesis|"
+                    r"underperform|why)\b"
+                ),
                 lower,
             )
         )

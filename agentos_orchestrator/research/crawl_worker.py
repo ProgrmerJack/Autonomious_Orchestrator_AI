@@ -12,6 +12,11 @@ class CrawlWorkerLoopConfig:
     batch_size: int = 6
     poll_interval_seconds: float = 15.0
     claim_ttl_seconds: int = 900
+    allow_js_required: bool = True
+    prefer_js_required: bool = False
+    max_claims_per_domain: int = 2
+    default_domain_cooldown_seconds: float = 2.0
+    js_domain_cooldown_seconds: float = 8.0
     once: bool = False
 
 
@@ -46,6 +51,11 @@ class ResearchCrawlWorker:
         claimed_rows = self.engine._claim_crawl_queue_batch(
             self.config.batch_size,
             self.worker_id,
+            allow_js_required=self.config.allow_js_required,
+            prefer_js_required=self.config.prefer_js_required,
+            max_claims_per_domain=self.config.max_claims_per_domain,
+            default_domain_cooldown_seconds=self.config.default_domain_cooldown_seconds,
+            js_domain_cooldown_seconds=self.config.js_domain_cooldown_seconds,
         )
         if not claimed_rows:
             return asdict(

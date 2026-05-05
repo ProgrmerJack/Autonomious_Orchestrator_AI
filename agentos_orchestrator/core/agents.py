@@ -785,12 +785,19 @@ class WorkerAgent:
             except Exception:
                 ai_strategy = {}
 
+        diagnostic_queries = self._software_agent_diagnostic_queries(objective)
+        objective_queries = (
+            []
+            if diagnostic_queries
+            else list(self._browser_objective_queries(objective))
+        )
         search_queries: list[str] = []
         seen_queries: set[str] = set()
         for candidate in (
             list(ai_strategy.get("reasoning_queries") or [])
-            + list(self._browser_objective_queries(objective))
-            + [core_query]
+            + diagnostic_queries
+            + objective_queries
+            + ([] if diagnostic_queries else [core_query])
         ):
             query_text = str(candidate or "").strip()[:240]
             if not query_text:
@@ -809,11 +816,19 @@ class WorkerAgent:
                 continue
             seen_seed_urls.add(normalized_url)
             seed_urls.append(normalized_url)
+        for candidate in self._software_agent_diagnostic_seed_urls(objective):
+            normalized_url = self._planning_seed_url(candidate)
+            if not normalized_url or normalized_url in seen_seed_urls:
+                continue
+            seen_seed_urls.add(normalized_url)
+            seed_urls.append(normalized_url)
 
         current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
             objective
         ) and not DeepResearchEngine._looks_like_academic_query(objective)
         query_limit = 12 if depth == "multi-hour" or current_web_mode else 6
+        if DeepResearchEngine._looks_like_software_agent_query(objective):
+            query_limit = max(query_limit, 14)
         return {
             "enabled": SupervisorAgent._needs_active_pc_research(
                 objective,
@@ -981,6 +996,9 @@ class WorkerAgent:
     def _heuristic_objective_analysis(objective: str) -> dict[str, Any]:
         """Deterministic fallback when AI planning output is missing or malformed."""
         lower = objective.lower()
+        software_agent_query = DeepResearchEngine._looks_like_software_agent_query(
+            objective
+        )
         current = bool(
             re.search(
                 r"\b(as of now|right now|current(?:ly)?|latest|today|recent|this (?:week|month|year)|live)\b",
@@ -999,6 +1017,16 @@ class WorkerAgent:
                 lower,
             )
         )
+        if software_agent_query and re.search(
+            r"\b(compare|comparison|comparable|benchmark|claude|gpt|gemini|openhands|openclaw)\b",
+            lower,
+        ):
+            comparison = True
+        if software_agent_query and re.search(
+            r"\b(fix|issue|issues|bug|bugs|failure|failures|not using|underperform|gap|gaps|shallow|template)\b",
+            lower,
+        ):
+            risk = True
         academic = (
             bool(
                 re.search(
@@ -1015,6 +1043,8 @@ class WorkerAgent:
         complexity += 1 if comparison else 0
         complexity += 1 if risk else 0
         complexity += 1 if current else 0
+        if software_agent_query:
+            complexity += 2
         complexity = max(1, min(complexity, 10))
 
         multi_hour = "[multi-hour]" in lower
@@ -2588,9 +2618,20 @@ class WorkerAgent:
         ):
             cleaned = cleaned.replace(prefix, " ")
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        for clause in WorkerAgent._browser_objective_queries(cleaned):
+        diagnostic_queries = WorkerAgent._software_agent_diagnostic_queries(cleaned)
+        queries.extend(diagnostic_queries)
+        objective_queries = (
+            []
+            if diagnostic_queries
+            else WorkerAgent._browser_objective_queries(cleaned)
+        )
+        for clause in objective_queries:
             queries.append(clause)
-        fallback = DeepResearchEngine._query_from_objective(cleaned)
+        fallback = (
+            ""
+            if diagnostic_queries
+            else DeepResearchEngine._query_from_objective(cleaned)
+        )
         if fallback:
             queries.append(fallback)
         current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
@@ -3384,11 +3425,18 @@ class WorkerAgent:
             current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
                 cleaned
             ) and not DeepResearchEngine._looks_like_academic_query(cleaned)
-            query_candidates = WorkerAgent._browser_objective_queries(cleaned)
-            if query:
+            diagnostic_queries = WorkerAgent._software_agent_diagnostic_queries(cleaned)
+            query_candidates = list(diagnostic_queries)
+            if not diagnostic_queries:
+                query_candidates.extend(WorkerAgent._browser_objective_queries(cleaned))
+            variant_query = query
+            if diagnostic_queries:
+                variant_query = diagnostic_queries[0]
+            if query and not diagnostic_queries:
                 query_candidates.append(query)
             query_candidates.extend(
-                DeepResearchEngine._query_variants(query, depth) or [query]
+                DeepResearchEngine._query_variants(variant_query, depth)
+                or [variant_query]
             )
             variants: list[str] = []
             seen_variants: set[str] = set()
@@ -3432,6 +3480,14 @@ class WorkerAgent:
                 flags=re.IGNORECASE,
             )
         )
+
+    @staticmethod
+    def _software_agent_diagnostic_queries(objective: str) -> list[str]:
+        return DeepResearchEngine._software_agent_diagnostic_queries(objective)
+
+    @staticmethod
+    def _software_agent_diagnostic_seed_urls(objective: str) -> list[str]:
+        return DeepResearchEngine._software_agent_diagnostic_seed_urls(objective)
 
     @staticmethod
     def _latest_planning_context(

@@ -228,6 +228,19 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_start.add_argument("--claim-ttl", type=int, default=900)
     crawl_worker_start.add_argument("--broker-url", default="")
     crawl_worker_start.add_argument("--broker-token", default="")
+    crawl_worker_start.add_argument("--prefer-js", action="store_true")
+    crawl_worker_start.add_argument("--no-js", action="store_true")
+    crawl_worker_start.add_argument(
+        "--max-claims-per-domain",
+        type=int,
+        default=2,
+    )
+    crawl_worker_start.add_argument("--domain-cooldown", type=float, default=2.0)
+    crawl_worker_start.add_argument(
+        "--js-domain-cooldown",
+        type=float,
+        default=8.0,
+    )
     crawl_worker_supervise = crawl_worker_subparsers.add_parser(
         "supervise",
         help="Run a long-lived supervisor for the crawl worker pool.",
@@ -244,6 +257,23 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_supervise.add_argument("--claim-ttl", type=int, default=900)
     crawl_worker_supervise.add_argument("--broker-url", default="")
     crawl_worker_supervise.add_argument("--broker-token", default="")
+    crawl_worker_supervise.add_argument("--prefer-js", action="store_true")
+    crawl_worker_supervise.add_argument("--no-js", action="store_true")
+    crawl_worker_supervise.add_argument(
+        "--max-claims-per-domain",
+        type=int,
+        default=2,
+    )
+    crawl_worker_supervise.add_argument(
+        "--domain-cooldown",
+        type=float,
+        default=2.0,
+    )
+    crawl_worker_supervise.add_argument(
+        "--js-domain-cooldown",
+        type=float,
+        default=8.0,
+    )
     crawl_worker_supervise.add_argument(
         "--supervisor-interval",
         type=float,
@@ -262,6 +292,23 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_run.add_argument("--claim-ttl", type=int, default=900)
     crawl_worker_run.add_argument("--broker-url", default="")
     crawl_worker_run.add_argument("--broker-token", default="")
+    crawl_worker_run.add_argument("--prefer-js", action="store_true")
+    crawl_worker_run.add_argument("--no-js", action="store_true")
+    crawl_worker_run.add_argument(
+        "--max-claims-per-domain",
+        type=int,
+        default=2,
+    )
+    crawl_worker_run.add_argument(
+        "--domain-cooldown",
+        type=float,
+        default=2.0,
+    )
+    crawl_worker_run.add_argument(
+        "--js-domain-cooldown",
+        type=float,
+        default=8.0,
+    )
     crawl_worker_run.add_argument("--once", action="store_true")
     crawl_worker_broker = crawl_worker_subparsers.add_parser(
         "broker",
@@ -277,6 +324,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl_worker_broker_status.add_argument("--broker-url", required=True)
     crawl_worker_broker_status.add_argument("--broker-token", default="")
+    crawl_worker_broker_metrics = crawl_worker_broker_subparsers.add_parser(
+        "metrics",
+        help=("Read live broker metrics including shard load and worker utilization."),
+    )
+    crawl_worker_broker_metrics.add_argument("--broker-url", required=True)
+    crawl_worker_broker_metrics.add_argument("--broker-token", default="")
+    crawl_worker_broker_inspect = crawl_worker_broker_subparsers.add_parser(
+        "inspect",
+        help=("Inspect live broker queue rows with optional shard and worker filters."),
+    )
+    crawl_worker_broker_inspect.add_argument("--broker-url", required=True)
+    crawl_worker_broker_inspect.add_argument("--broker-token", default="")
+    crawl_worker_broker_inspect.add_argument("--limit", type=int, default=24)
+    crawl_worker_broker_inspect.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        help=("Filter queue rows by status. Repeat to include multiple statuses."),
+    )
+    crawl_worker_broker_inspect.add_argument("--domain", default="")
+    crawl_worker_broker_inspect.add_argument("--worker-id", default="")
+    crawl_worker_broker_inspect.add_argument("--shard", type=int)
+    crawl_worker_broker_inspect_js = (
+        crawl_worker_broker_inspect.add_mutually_exclusive_group()
+    )
+    crawl_worker_broker_inspect_js.add_argument(
+        "--js-required",
+        action="store_true",
+        help="Only show JS-required queue rows.",
+    )
+    crawl_worker_broker_inspect_js.add_argument(
+        "--no-js-required",
+        action="store_true",
+        help="Only show rows that do not require JS rendering.",
+    )
     crawl_worker_broker_serve = crawl_worker_broker_subparsers.add_parser(
         "serve",
         help="Run the shared crawl broker in the foreground.",
@@ -286,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_broker_serve.add_argument("--host", default="127.0.0.1")
     crawl_worker_broker_serve.add_argument("--port", type=int, default=8787)
     crawl_worker_broker_serve.add_argument("--auth-token", default="")
+    crawl_worker_broker_serve.add_argument("--shards", type=int, default=4)
     crawl_worker_service = crawl_worker_subparsers.add_parser(
         "service",
         help="Manage the OS service wrapper for crawl workers.",
@@ -343,6 +426,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl_worker_service_install.add_argument("--broker-url", default="")
     crawl_worker_service_install.add_argument("--broker-token", default="")
+    crawl_worker_service_install.add_argument("--prefer-js", action="store_true")
+    crawl_worker_service_install.add_argument("--no-js", action="store_true")
+    crawl_worker_service_install.add_argument(
+        "--max-claims-per-domain",
+        type=int,
+        default=2,
+    )
+    crawl_worker_service_install.add_argument(
+        "--domain-cooldown",
+        type=float,
+        default=2.0,
+    )
+    crawl_worker_service_install.add_argument(
+        "--js-domain-cooldown",
+        type=float,
+        default=8.0,
+    )
     crawl_worker_service_install.add_argument("--task-name", default="")
     crawl_worker_service_install.add_argument(
         "--no-start",
@@ -972,9 +1072,7 @@ def _daemon(args: argparse.Namespace) -> int:
 
 
 def _crawl_worker(args: argparse.Namespace) -> int:
-    workspace_root = Path(
-        getattr(args, "workspace_root", Path.cwd())
-    ).resolve()
+    workspace_root = Path(getattr(args, "workspace_root", Path.cwd())).resolve()
     manager = CrawlWorkerManager(workspace_root, sys.executable)
     service_manager = CrawlWorkerServiceManager(workspace_root, sys.executable)
     if args.crawl_worker_command == "status":
@@ -994,6 +1092,11 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             args.poll_interval = 15.0
             args.batch_size = 6
             args.claim_ttl = 900
+            args.no_js = False
+            args.prefer_js = False
+            args.max_claims_per_domain = 2
+            args.domain_cooldown = 2.0
+            args.js_domain_cooldown = 8.0
     if args.crawl_worker_command == "start":
         record = manager.start(
             worker_count=args.workers,
@@ -1003,6 +1106,11 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             poll_interval_seconds=args.poll_interval,
             batch_size=args.batch_size,
             claim_ttl_seconds=args.claim_ttl,
+            allow_js_required=not bool(args.no_js),
+            prefer_js_required=bool(args.prefer_js),
+            max_claims_per_domain=max(1, int(args.max_claims_per_domain)),
+            default_domain_cooldown_seconds=max(0.0, float(args.domain_cooldown)),
+            js_domain_cooldown_seconds=max(0.0, float(args.js_domain_cooldown)),
         )
         print(json.dumps(asdict(record), indent=2))
         return 0
@@ -1016,6 +1124,11 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             poll_interval_seconds=args.poll_interval,
             batch_size=args.batch_size,
             claim_ttl_seconds=args.claim_ttl,
+            allow_js_required=not bool(args.no_js),
+            prefer_js_required=bool(args.prefer_js),
+            max_claims_per_domain=max(1, int(args.max_claims_per_domain)),
+            default_domain_cooldown_seconds=max(0.0, float(args.domain_cooldown)),
+            js_domain_cooldown_seconds=max(0.0, float(args.js_domain_cooldown)),
             reconcile_interval_seconds=args.supervisor_interval,
             once=bool(args.once),
         )
@@ -1037,6 +1150,11 @@ def _crawl_worker(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size,
                 poll_interval_seconds=args.poll_interval,
                 claim_ttl_seconds=args.claim_ttl,
+                allow_js_required=not bool(args.no_js),
+                prefer_js_required=bool(args.prefer_js),
+                max_claims_per_domain=max(1, int(args.max_claims_per_domain)),
+                default_domain_cooldown_seconds=max(0.0, float(args.domain_cooldown)),
+                js_domain_cooldown_seconds=max(0.0, float(args.js_domain_cooldown)),
                 once=bool(args.once),
             ),
         )
@@ -1054,6 +1172,37 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             )
             print(json.dumps(engine.crawl_broker_status(), indent=2))
             return 0
+        if subcommand == "metrics":
+            engine = DeepResearchEngine(
+                crawl_broker_url=args.broker_url,
+                crawl_broker_token=(args.broker_token or None),
+            )
+            print(json.dumps(engine.crawl_broker_metrics(), indent=2))
+            return 0
+        if subcommand == "inspect":
+            js_required: bool | None = None
+            if bool(args.js_required):
+                js_required = True
+            elif bool(args.no_js_required):
+                js_required = False
+            engine = DeepResearchEngine(
+                crawl_broker_url=args.broker_url,
+                crawl_broker_token=(args.broker_token or None),
+            )
+            print(
+                json.dumps(
+                    engine.crawl_broker_queue_inspect(
+                        limit=args.limit,
+                        statuses=list(args.status or []),
+                        domain=args.domain,
+                        worker_id=args.worker_id,
+                        js_required=js_required,
+                        shard_index=args.shard,
+                    ),
+                    indent=2,
+                )
+            )
+            return 0
         if subcommand == "serve":
             broker = CrawlBrokerServer(
                 workspace_root=args.workspace_root,
@@ -1061,13 +1210,12 @@ def _crawl_worker(args: argparse.Namespace) -> int:
                 port=args.port,
                 queue_db_path=(args.queue_db or None),
                 auth_token=args.auth_token,
+                shard_count=max(1, int(args.shards)),
             )
             print(json.dumps(asdict(broker.start()), indent=2))
             broker.serve_forever()
             return 0
-        raise ValueError(
-            f"Unknown crawl worker broker command: {subcommand}"
-        )
+        raise ValueError(f"Unknown crawl worker broker command: {subcommand}")
     if args.crawl_worker_command == "service":
         subcommand = args.crawl_worker_service_command
         if subcommand == "status":
@@ -1095,6 +1243,17 @@ def _crawl_worker(args: argparse.Namespace) -> int:
                 poll_interval_seconds=args.poll_interval,
                 batch_size=args.batch_size,
                 claim_ttl_seconds=args.claim_ttl,
+                allow_js_required=not bool(args.no_js),
+                prefer_js_required=bool(args.prefer_js),
+                max_claims_per_domain=max(1, int(args.max_claims_per_domain)),
+                default_domain_cooldown_seconds=max(
+                    0.0,
+                    float(args.domain_cooldown),
+                ),
+                js_domain_cooldown_seconds=max(
+                    0.0,
+                    float(args.js_domain_cooldown),
+                ),
                 reconcile_interval_seconds=args.supervisor_interval,
                 task_name=args.task_name or None,
                 start_now=not args.no_start,

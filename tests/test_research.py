@@ -212,6 +212,25 @@ class SeedUrlResearchEngine(FakeDeepResearchEngine):
         return ""
 
 
+class AutoPcContextResearchEngine(FakeDeepResearchEngine):
+    def _headless_browser_pool_fetch(
+        self,
+        urls: list[str],
+        max_chars: int = 80_000,
+        timeout_ms: int = 18_000,
+    ) -> dict[str, str]:
+        del max_chars, timeout_ms
+        return {
+            url: (
+                "AgentOS browser frontier evidence covers planner routing, "
+                "sandbox/browser grounding, retrieval breadth, benchmark safety, "
+                "and useful evidence quality for general purpose deep research "
+                "agents."
+            )
+            for url in urls
+        }
+
+
 class FakeCrawlWorkerResearchEngine(DeepResearchEngine):
     def _get_json(self, url: str) -> dict[str, Any]:
         del url
@@ -389,6 +408,19 @@ class StableLowNoveltyEngine(DeepResearchEngine):
     ) -> list[str]:
         del selected, pass_index, force_new_domains, existing_domains, coverage
         return [f"{objective} SEC filing revenue growth catalyst"]
+
+
+class NoisyEnrichmentResearchEngine(StableLowNoveltyEngine):
+    def _enrich_top_sources(
+        self,
+        selected: list[ResearchSource],
+        query: str,
+    ) -> list[str]:
+        del selected, query
+        return [
+            "research agent deep research google deep vfppkd vfppkd-strngf",
+            "deep research agent benchmark comparison",
+        ]
 
 
 class ResearchTests(unittest.TestCase):
@@ -652,14 +684,310 @@ class ResearchTests(unittest.TestCase):
                 )
                 post_snapshot = coordinator._persistent_crawl_queue_snapshot(limit=8)
                 statuses = {
-                    item["url"]: item["status"]
-                    for item in post_snapshot["queued"]
+                    item["url"]: item["status"] for item in post_snapshot["queued"]
                 }
 
                 self.assertTrue(hints)
                 self.assertIn(root_url, seeds)
                 self.assertIn(child_url, seeds)
                 self.assertEqual(statuses[root_url], "processed")
+            finally:
+                broker.shutdown()
+
+    def test_crawl_broker_uses_sharded_queue_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=3,
+            )
+            broker.start_in_thread()
+            try:
+                urls: list[str] = []
+                seen_shards: set[int] = set()
+                candidate_index = 0
+                while len(seen_shards) < 3 and candidate_index < 40:
+                    url = f"https://docs{candidate_index}.example.org/page"
+                    shard_index = broker.store._shard_index_for_key(url)
+                    if shard_index not in seen_shards:
+                        seen_shards.add(shard_index)
+                        urls.append(url)
+                    candidate_index += 1
+
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    urls,
+                    "agentos sharded crawl broker",
+                    "run_sharded_broker",
+                    source_url="https://seed.example.org/objective",
+                    priority=10.0,
+                )
+
+                snapshot = coordinator._persistent_crawl_queue_snapshot(limit=16)
+                self.assertEqual(
+                    {item["url"] for item in snapshot["queued"]}, set(urls)
+                )
+                status = broker.status()
+                self.assertEqual(status.backend, "sqlite-sharded")
+                self.assertEqual(status.shard_count, 3)
+                self.assertEqual(len(broker.store.engines), 3)
+                self.assertGreaterEqual(
+                    sum(1 for path in broker.store._shard_paths if path.exists()),
+                    2,
+                )
+            finally:
+                broker.shutdown()
+
+    def test_crawl_broker_routes_js_claims_to_browser_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=2,
+            )
+            broker.start_in_thread()
+            try:
+                objective = "agentos browser render pool routing"
+                js_url = "https://www.bloomberg.com/markets/example"
+                docs_url = "https://docs.example.org/browser-pool"
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    [docs_url, js_url],
+                    objective,
+                    "run_js_routing",
+                    source_url="https://seed.example.org/objective",
+                    priority=9.0,
+                )
+
+                browser_claim = coordinator._claim_crawl_queue_batch(
+                    1,
+                    "browser-renderer-1",
+                    prefer_js_required=True,
+                    max_claims_per_domain=1,
+                )
+                general_claim = coordinator._claim_crawl_queue_batch(
+                    2,
+                    "general-worker-1",
+                    allow_js_required=False,
+                    max_claims_per_domain=1,
+                )
+
+                self.assertEqual([row["url"] for row in browser_claim], [js_url])
+                self.assertEqual([row["url"] for row in general_claim], [docs_url])
+            finally:
+                broker.shutdown()
+
+    def test_crawl_broker_throttles_same_domain_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=2,
+            )
+            broker.start_in_thread()
+            try:
+                objective = "agentos domain throttle scheduling"
+                urls = [
+                    "https://docs.example.org/a",
+                    "https://docs.example.org/b",
+                    "https://other.example.org/c",
+                ]
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    urls,
+                    objective,
+                    "run_domain_throttle",
+                    source_url="https://seed.example.org/objective",
+                    priority=11.0,
+                )
+
+                first_claim = coordinator._claim_crawl_queue_batch(
+                    3,
+                    "worker-1",
+                    max_claims_per_domain=1,
+                    default_domain_cooldown_seconds=60.0,
+                    js_domain_cooldown_seconds=60.0,
+                )
+                second_claim = coordinator._claim_crawl_queue_batch(
+                    2,
+                    "worker-2",
+                    max_claims_per_domain=1,
+                    default_domain_cooldown_seconds=60.0,
+                    js_domain_cooldown_seconds=60.0,
+                )
+
+                first_urls = [row["url"] for row in first_claim]
+                self.assertEqual(len(first_urls), 2)
+                self.assertEqual(
+                    sum(1 for url in first_urls if "docs.example.org" in url),
+                    1,
+                )
+                self.assertEqual(second_claim, [])
+            finally:
+                broker.shutdown()
+
+    def test_crawl_broker_metrics_report_leases_and_worker_utilization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=2,
+            )
+            broker.start_in_thread()
+            try:
+                objective = "agentos broker observability metrics"
+                docs_url = "https://docs.example.org/metrics"
+                js_url = "https://www.bloomberg.com/markets/agentos-observability"
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    [docs_url, js_url],
+                    objective,
+                    "run_metrics",
+                    source_url="https://seed.example.org/objective",
+                    priority=10.0,
+                )
+
+                claimed = coordinator._claim_crawl_queue_batch(
+                    1,
+                    "browser-renderer-1",
+                    prefer_js_required=True,
+                    max_claims_per_domain=1,
+                    default_domain_cooldown_seconds=5.0,
+                    js_domain_cooldown_seconds=15.0,
+                )
+                self.assertEqual([row["url"] for row in claimed], [js_url])
+
+                coordinator._record_crawl_observation(
+                    ResearchSource(
+                        provider="test",
+                        title="AgentOS observability",
+                        url=js_url,
+                        authors=["bloomberg.com"],
+                        abstract="JS-heavy source",
+                        citation_count=0,
+                        score=1.0,
+                        quality_flags=["js-render-required"],
+                    ),
+                    "browser rendered content",
+                    objective,
+                    ["agentos metrics"],
+                    [],
+                    "browser-renderer-1",
+                    True,
+                )
+
+                metrics = coordinator.crawl_broker_metrics()
+
+                self.assertEqual(metrics["queue"]["total"], 2)
+                self.assertEqual(metrics["queue"]["status_counts"]["claimed"], 1)
+                self.assertEqual(metrics["queue"]["status_counts"]["queued"], 1)
+                self.assertEqual(
+                    metrics["queue"]["js_required_counts"]["claimed"],
+                    1,
+                )
+                self.assertEqual(metrics["domain_leases"]["active_count"], 1)
+                self.assertEqual(len(metrics["shards"]), 2)
+                worker_stats = {
+                    item["worker_id"]: item
+                    for item in metrics["worker_utilization"]["items"]
+                }
+                self.assertIn("browser-renderer-1", worker_stats)
+                self.assertEqual(
+                    worker_stats["browser-renderer-1"]["active_js_claims"],
+                    1,
+                )
+                self.assertEqual(
+                    worker_stats["browser-renderer-1"]["browser_observations"],
+                    1,
+                )
+                self.assertIn(
+                    "bloomberg.com",
+                    [lease["domain"] for lease in metrics["domain_leases"]["items"]],
+                )
+            finally:
+                broker.shutdown()
+
+    def test_crawl_broker_queue_inspect_filters_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+                shard_count=3,
+            )
+            broker.start_in_thread()
+            try:
+                objective = "agentos broker queue inspect"
+                docs_url = "https://docs.example.org/inspect"
+                js_url = "https://www.bloomberg.com/news/agentos-queue-inspect"
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    [docs_url, js_url],
+                    objective,
+                    "run_inspect",
+                    source_url="https://seed.example.org/objective",
+                    priority=9.0,
+                )
+
+                claimed = coordinator._claim_crawl_queue_batch(
+                    1,
+                    "worker-1",
+                    allow_js_required=False,
+                    max_claims_per_domain=1,
+                )
+                self.assertEqual([row["url"] for row in claimed], [docs_url])
+
+                claimed_rows = coordinator.crawl_broker_queue_inspect(
+                    limit=8,
+                    statuses=["claimed"],
+                    worker_id="worker-1",
+                )
+                js_rows = coordinator.crawl_broker_queue_inspect(
+                    limit=8,
+                    statuses=["queued"],
+                    js_required=True,
+                )
+
+                self.assertEqual(claimed_rows["total_matches"], 1)
+                self.assertEqual(claimed_rows["items"][0]["url"], docs_url)
+                self.assertEqual(
+                    claimed_rows["items"][0]["last_claimed_by"],
+                    "worker-1",
+                )
+                self.assertEqual(js_rows["total_matches"], 1)
+                self.assertEqual(js_rows["items"][0]["url"], js_url)
+                self.assertTrue(js_rows["items"][0]["js_required"])
             finally:
                 broker.shutdown()
 
@@ -1034,6 +1362,323 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("Durable report notes", engine.last_user)
         self.assertIn("Minimal source metadata", engine.last_user)
         self.assertNotIn("ABSTRACT_SENTINEL_SHOULD_NOT_APPEAR", engine.last_user)
+
+    def test_standard_synthesis_packet_caps_prompt_sources(self) -> None:
+        engine = CapturingSynthesisEngine()
+        sources = [
+            ResearchSource(
+                provider="web-search",
+                title=f"Source {index}",
+                url=f"https://example.org/source-{index}",
+                abstract=f"Evidence abstract {index}",
+                evidence_grade="moderate",
+                score=float(100 - index),
+            )
+            for index in range(40)
+        ]
+        packet = engine._build_synthesis_packet(
+            "packet objective",
+            "packet objective",
+            sources,
+            "standard",
+            {"subquestions": ["What is supported?"]},
+            "",
+            "hybrid",
+        )
+
+        summary = engine._summarize(
+            objective="packet objective",
+            sources=sources,
+            depth="standard",
+            plan={"subquestions": ["What is supported?"]},
+            query="packet objective",
+            durable_notes="",
+            synthesis_mode="hybrid",
+            synthesis_packet=packet,
+        )
+
+        self.assertEqual(summary, "SYNTHESIS")
+        self.assertEqual(packet["synthesis_source_count"], 24)
+        self.assertIn("Evidence found (24 sources)", engine.last_user)
+        self.assertNotIn("Source 39", engine.last_user)
+
+    def test_multi_hour_software_agent_synthesis_packet_expands_prompt_sources(
+        self,
+    ) -> None:
+        engine = CapturingSynthesisEngine()
+        objective = (
+            "Analyze why a deep research agent is not comparable to Claude, GPT, "
+            "or Gemini, is not using browser and sandbox tools effectively, and "
+            "fix the architectural gaps."
+        )
+        sources = [
+            ResearchSource(
+                provider="web-search",
+                title=f"Source {index}",
+                url=f"https://example.org/software-agent-source-{index}",
+                abstract=f"Evidence abstract {index}",
+                evidence_grade="moderate",
+                score=float(200 - index),
+            )
+            for index in range(140)
+        ]
+        packet = engine._build_synthesis_packet(
+            objective,
+            objective,
+            sources,
+            "multi-hour",
+            {"subquestions": ["Where does the evidence handoff narrow too early?"]},
+            "",
+            "hybrid",
+        )
+
+        summary = engine._summarize(
+            objective=objective,
+            sources=sources,
+            depth="multi-hour",
+            plan={
+                "subquestions": ["Where does the evidence handoff narrow too early?"]
+            },
+            query=objective,
+            durable_notes="",
+            synthesis_mode="hybrid",
+            synthesis_packet=packet,
+        )
+
+        self.assertEqual(summary, "SYNTHESIS")
+        self.assertEqual(packet["synthesis_source_count"], 96)
+        self.assertIn("Evidence found (96 sources)", engine.last_user)
+        self.assertIn("Source 95", engine.last_user)
+        self.assertNotIn("Source 120", engine.last_user)
+
+    def test_multi_hour_synthesis_defaults_to_hybrid_with_durable_notes(self) -> None:
+        with patch.dict("os.environ", {"AGENTOS_FINAL_SYNTHESIS_MODE": ""}, clear=False):
+            self.assertEqual(
+                DeepResearchEngine._resolve_final_synthesis_mode(
+                    "multi-hour",
+                    "### Pass 1\n- [strong/openalex] grounded claim",
+                ),
+                "hybrid",
+            )
+
+    def test_software_agent_direct_research_plan_distills_complaint_objective(
+        self,
+    ) -> None:
+        objective = (
+            "So fix the code. Analyze why the deep research agent is not "
+            "comparable to Claude, GPT, or Gemini, why it is not using sandbox, "
+            "browser, and pc control properly, and why retrieval breadth and "
+            "useful evidence quality are weak."
+        )
+        engine = FakeDeepResearchEngine()
+        engine._ai_research_strategy = lambda objective, query, depth: {}
+        engine._ai_research_axes = lambda objective, query, depth: {}
+
+        distilled_query = engine._query_from_objective(objective)
+        plan = engine._build_research_plan(
+            objective,
+            distilled_query,
+            "multi-hour",
+            {"browser_context_detected": False},
+        )
+
+        self.assertEqual(distilled_query, "deep research agent")
+        self.assertIn(
+            "deep research agent browser sandbox pc control routing",
+            plan["query_plan"],
+        )
+        self.assertIn(
+            "https://github.com",
+            plan["ai_authoritative_domains"],
+        )
+        self.assertIn(
+            "https://playwright.dev",
+            plan["ai_authoritative_domains"],
+        )
+        self.assertFalse(
+            any(query.lower().startswith("so fix code") for query in plan["query_plan"])
+        )
+        perspective_names = {item["name"] for item in plan["perspectives"]}
+        self.assertIn("browser-tooling", perspective_names)
+        self.assertIn("retrieval-breadth", perspective_names)
+        self.assertIn("evidence-quality", perspective_names)
+
+    def test_software_agent_source_seed_urls_include_authoritative_roots(
+        self,
+    ) -> None:
+        objective = (
+            "Analyze why a deep research agent is not comparable to Claude, GPT, "
+            "or Gemini and is not using browser and sandbox tools effectively."
+        )
+
+        seed_urls = DeepResearchEngine._source_seed_urls(objective, None, None)
+
+        self.assertIn("https://github.com", seed_urls)
+        self.assertIn("https://playwright.dev", seed_urls)
+        self.assertIn("https://docs.anthropic.com", seed_urls)
+        self.assertIn("https://platform.openai.com/docs", seed_urls)
+        self.assertIn("https://ai.google.dev", seed_urls)
+
+    def test_standalone_autonomous_pc_context_seeds_browser_findings(self) -> None:
+        objective = (
+            "So fix the code. Analyze why the deep research agent is not "
+            "comparable to Claude, GPT, or Gemini, why it is not using sandbox, "
+            "browser, and pc control properly, and why retrieval breadth and "
+            "useful evidence quality are weak."
+        )
+        engine = AutoPcContextResearchEngine()
+
+        pc_context = engine._auto_pc_context_for_run(
+            objective,
+            engine._query_from_objective(objective),
+            "multi-hour",
+            "run_auto_pc",
+        )
+
+        self.assertIsNotNone(pc_context)
+        assert pc_context is not None
+        pc_findings = pc_context["pc_findings"]
+        self.assertIn(
+            "deep research agent browser sandbox pc control routing",
+            pc_findings["search_queries"],
+        )
+        self.assertTrue(pc_findings["judged_results"])
+        self.assertIn("https://github.com", pc_findings["direct_urls"])
+
+        sources = engine._pc_finding_seed_sources(pc_context)
+
+        self.assertTrue(any(source.provider == "pc-browser-research" for source in sources))
+
+    def test_static_asset_urls_are_excluded_from_persistent_url_sets(self) -> None:
+        engine = FakeDeepResearchEngine()
+
+        urls = engine._persistent_unique_urls(
+            [
+                "https://arxiv.org/static/browse/0.3.4/css/arxiv-html-papers.css",
+                "https://arxiv.org/static/browse/0.3.4/images/icons/favicon-32x32.png",
+                "https://example.com/report",
+            ]
+        )
+
+        self.assertEqual(urls, ["https://example.com/report"])
+
+    def test_gibberish_query_variants_are_rejected(self) -> None:
+        cleaned = DeepResearchEngine._sanitize_query_variants(
+            [
+                "research agent deep research google deep vfppkd vfppkd-strngf",
+                "deep research agent browser sandbox pc control routing",
+            ],
+            "deep research agent",
+        )
+
+        self.assertNotIn(
+            "research agent deep research google deep vfppkd vfppkd-strngf",
+            cleaned,
+        )
+        self.assertIn(
+            "deep research agent browser sandbox pc control routing",
+            cleaned,
+        )
+
+    def test_iterative_retrieval_sanitizes_enrichment_queries_before_reuse(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = NoisyEnrichmentResearchEngine(workspace_root=temp_dir)
+            retrieval = engine._iterative_retrieval(
+                query="deep research agent",
+                settings=DeepResearchEngine._settings_for_depth("standard"),
+                plan={
+                    "core_question": "deep research agent",
+                    "query_plan": ["deep research agent"],
+                    "perspectives": [],
+                },
+                targets={
+                    "max_retrieval_passes": 2,
+                    "min_depth_passes": 2,
+                    "min_source_count": 999,
+                    "min_provider_count": 1,
+                    "min_scholarly_sources": 0,
+                    "min_strong_or_moderate": 0,
+                    "min_novelty_rate": 0.0,
+                    "max_contradiction_risk": 1.0,
+                },
+            )
+
+            self.assertIn(
+                "deep research agent benchmark comparison",
+                retrieval["query_variants"],
+            )
+            self.assertNotIn(
+                "research agent deep research google deep vfppkd vfppkd-strngf",
+                retrieval["query_variants"],
+            )
+
+    def test_select_balanced_top_preserves_browser_sources_beyond_cap(self) -> None:
+        ranked = [
+            ResearchSource(
+                provider="crossref",
+                title=f"Deep research agent study {index}",
+                url=f"https://doi.org/10.1000/test-{index}",
+                abstract=(
+                    "Deep research agent architecture and retrieval evidence."
+                ),
+                score=100.0 - index,
+                relevance=0.9,
+                credibility_score=0.7,
+            )
+            for index in range(12)
+        ]
+        ranked.append(
+            ResearchSource(
+                provider="pc-browser-research",
+                title="Deep research agent browser routing evidence",
+                url="https://example.com/browser-evidence",
+                abstract=(
+                    "Browser-judged evidence about sandbox and pc control routing "
+                    "for the deep research agent."
+                ),
+                score=12.0,
+                relevance=0.8,
+                credibility_score=0.55,
+                evidence_grade="tool-observation",
+                quality_flags=["browser-judged-source"],
+            )
+        )
+
+        selected = DeepResearchEngine._select_balanced_top(
+            ranked,
+            max_sources=4,
+            query="deep research agent browser sandbox pc control routing",
+        )
+
+        self.assertIn(
+            "pc-browser-research",
+            {source.provider for source in selected},
+        )
+
+    def test_run_writes_synthesis_packet_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            brief = engine.run(
+                "[quick] accessibility tree desktop agents",
+                "run_synthesis_packet",
+            )
+
+            packet_path = (
+                Path(temp_dir)
+                / "runs/run_synthesis_packet/research/synthesis_packet.json"
+            )
+            self.assertTrue(packet_path.exists())
+            packet = json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertGreater(packet["synthesis_source_count"], 0)
+            self.assertTrue(
+                any(
+                    artifact.replace("\\", "/")
+                    == "runs/run_synthesis_packet/research/synthesis_packet.json"
+                    for artifact in brief.artifacts
+                )
+            )
 
     def test_depth_marker_survives_supervisor_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

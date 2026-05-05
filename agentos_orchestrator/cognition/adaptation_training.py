@@ -102,6 +102,7 @@ class AdaptationTrainingConfig:
     gui_actor_limit: int = 0
     gui_actor_offset: int = 0
     gui_actor_sources: tuple[str, ...] = ()
+    gui_actor_row_offsets: dict[str, int] = field(default_factory=dict)
     screenspot_sources: tuple[str, ...] = ("windows", "web", "macos")
     include_internal_trajectories: bool = True
     trajectory_paths: tuple[str, ...] = ()
@@ -158,6 +159,10 @@ class AdaptationTrainingResult:
     osworld_manifest_path: str = ""
     osworld_archive_dataset_path: str = ""
     dataset_inventory_path: str = ""
+    screenspot_next_offset: int = 0
+    click100k_next_offset: int = 0
+    gui_actor_next_source_offset: int = 0
+    gui_actor_row_offsets: dict[str, int] = field(default_factory=dict)
     dataset_summaries: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     requested: dict[str, int] = field(default_factory=dict)
@@ -191,6 +196,20 @@ class AdaptationLongRunResult:
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class _RowsDatasetTrainingProgress:
+    used: int
+    next_offset: int
+    exhausted: bool
+
+
+@dataclass(slots=True)
+class _GuiActorTrainingProgress:
+    used: int
+    next_source_offset: int
+    source_row_offsets: dict[str, int]
 
 
 class UnknownAppAdaptationTrainer:
@@ -230,13 +249,16 @@ class UnknownAppAdaptationTrainer:
 
         screenspot_rows_path = output_dir / "screenspot_rows.jsonl"
         screenspot_rows_used = 0
+        screenspot_next_offset = max(0, config.screenspot_offset)
         if config.screenspot_limit > 0:
-            screenspot_rows_used = self._train_vla_from_screenspot(
+            screenspot_progress = self._train_vla_from_screenspot(
                 limit=config.screenspot_limit,
                 start_offset=config.screenspot_offset,
                 sources=set(source.lower() for source in config.screenspot_sources),
                 output_path=screenspot_rows_path,
             )
+            screenspot_rows_used = screenspot_progress.used
+            screenspot_next_offset = screenspot_progress.next_offset
             total_vla_feedback_samples += screenspot_rows_used
             dataset_summaries.append(
                 {
@@ -250,12 +272,15 @@ class UnknownAppAdaptationTrainer:
 
         click100k_rows_path = output_dir / "click100k_rows.jsonl"
         click100k_rows_used = 0
+        click100k_next_offset = max(0, config.click100k_offset)
         if config.click100k_limit > 0:
-            click100k_rows_used = self._train_vla_from_click100k(
+            click100k_progress = self._train_vla_from_click100k(
                 limit=config.click100k_limit,
                 start_offset=config.click100k_offset,
                 output_path=click100k_rows_path,
             )
+            click100k_rows_used = click100k_progress.used
+            click100k_next_offset = click100k_progress.next_offset
             total_vla_feedback_samples += click100k_rows_used
             dataset_summaries.append(
                 {
@@ -269,8 +294,10 @@ class UnknownAppAdaptationTrainer:
 
         gui_actor_rows_path = output_dir / "gui_actor_rows.jsonl"
         gui_actor_rows_used = 0
+        gui_actor_next_source_offset = max(0, config.gui_actor_offset)
+        gui_actor_row_offsets: dict[str, int] = {}
         if config.gui_actor_limit > 0:
-            gui_actor_rows_used = self._train_vla_from_gui_actor(
+            gui_actor_progress = self._train_vla_from_gui_actor(
                 limit=config.gui_actor_limit,
                 source_offset=config.gui_actor_offset,
                 source_names=set(config.gui_actor_sources)
@@ -280,7 +307,11 @@ class UnknownAppAdaptationTrainer:
                 cache_budget_bytes=config.cache_budget_bytes,
                 stage_remote_archives=config.stage_remote_archives,
                 output_path=gui_actor_rows_path,
+                source_row_offsets=dict(config.gui_actor_row_offsets),
             )
+            gui_actor_rows_used = gui_actor_progress.used
+            gui_actor_next_source_offset = gui_actor_progress.next_source_offset
+            gui_actor_row_offsets = dict(gui_actor_progress.source_row_offsets)
             total_vla_feedback_samples += gui_actor_rows_used
             dataset_summaries.append(
                 {
@@ -466,6 +497,10 @@ class UnknownAppAdaptationTrainer:
                 else ""
             ),
             dataset_inventory_path=str(dataset_inventory_path),
+            screenspot_next_offset=screenspot_next_offset,
+            click100k_next_offset=click100k_next_offset,
+            gui_actor_next_source_offset=gui_actor_next_source_offset,
+            gui_actor_row_offsets=gui_actor_row_offsets,
             dataset_summaries=dataset_summaries,
             notes=notes,
             requested=requested,
@@ -508,6 +543,8 @@ class UnknownAppAdaptationTrainer:
                 "shard_results": [],
             }
         )
+        state.setdefault("dataset_cursors", {})
+        state.setdefault("app_families", [])
 
         gui_sources = [source["name"] for source in self._gui_actor_sources()]
         gui_source_stride = max(
@@ -556,6 +593,13 @@ class UnknownAppAdaptationTrainer:
         completed_shards = {
             int(index) for index in list(state.get("completed_shards") or [])
         }
+        dataset_cursors = dict(state.get("dataset_cursors") or {})
+        gui_actor_row_offsets = {
+            str(name): max(0, _safe_int(offset))
+            for name, offset in dict(
+                dataset_cursors.get("gui_actor_row_offsets") or {}
+            ).items()
+        }
         for shard_index in range(max(0, config.shard_count)):
             if shard_index in completed_shards:
                 continue
@@ -568,14 +612,22 @@ class UnknownAppAdaptationTrainer:
                 AdaptationTrainingConfig(
                     run_id=f"{run_id}_shard_{shard_index:04d}",
                     screenspot_limit=config.screenspot_limit_per_shard,
-                    screenspot_offset=shard_index
-                    * max(0, config.screenspot_limit_per_shard),
+                    screenspot_offset=max(
+                        0,
+                        _safe_int(dataset_cursors.get("screenspot_offset")),
+                    ),
                     click100k_limit=config.click100k_limit_per_shard,
-                    click100k_offset=shard_index
-                    * max(0, config.click100k_limit_per_shard),
+                    click100k_offset=max(
+                        0,
+                        _safe_int(dataset_cursors.get("click100k_offset")),
+                    ),
                     gui_actor_limit=config.gui_actor_limit_per_shard,
-                    gui_actor_offset=shard_index * gui_source_stride,
+                    gui_actor_offset=max(
+                        0,
+                        _safe_int(dataset_cursors.get("gui_actor_source_offset")),
+                    ),
                     gui_actor_sources=tuple(gui_sources),
+                    gui_actor_row_offsets=dict(gui_actor_row_offsets),
                     screenspot_sources=config.screenspot_sources,
                     include_internal_trajectories=(
                         config.include_internal_trajectories_first_shard
@@ -597,6 +649,34 @@ class UnknownAppAdaptationTrainer:
                 )
             )
             shard_payload = shard_result.asdict()
+            dataset_cursors["screenspot_offset"] = max(
+                _safe_int(dataset_cursors.get("screenspot_offset")),
+                shard_result.screenspot_next_offset,
+            )
+            dataset_cursors["click100k_offset"] = max(
+                _safe_int(dataset_cursors.get("click100k_offset")),
+                shard_result.click100k_next_offset,
+            )
+            dataset_cursors["gui_actor_source_offset"] = max(
+                0,
+                shard_result.gui_actor_next_source_offset,
+            )
+            merged_gui_actor_offsets = dict(gui_actor_row_offsets)
+            for name, offset in shard_result.gui_actor_row_offsets.items():
+                merged_gui_actor_offsets[str(name)] = max(0, _safe_int(offset))
+            gui_actor_row_offsets = merged_gui_actor_offsets
+            dataset_cursors["gui_actor_row_offsets"] = dict(gui_actor_row_offsets)
+            state["dataset_cursors"] = dict(dataset_cursors)
+            state["app_families"] = sorted(
+                {
+                    str(item).strip()
+                    for item in (
+                        list(state.get("app_families") or [])
+                        + list(shard_result.osworld_domains)
+                    )
+                    if str(item).strip()
+                }
+            )[:256]
             state.setdefault("completed_shards", []).append(shard_index)
             state.setdefault("shard_results", []).append(shard_payload)
             self._write_long_run_state(state_path, state)
@@ -630,6 +710,10 @@ class UnknownAppAdaptationTrainer:
                 )
         if config.gui_actor_limit_per_shard > 0:
             notes.append(f"GUI-Actor source stride per shard: {gui_source_stride}.")
+        if dataset_cursors:
+            notes.append(
+                "Adaptive dataset cursors retained for ScreenSpot, Click-100k, and GUI-Actor shards."
+            )
         requested = {
             "screenspot_rows": max(0, config.shard_count)
             * max(0, config.screenspot_limit_per_shard),
@@ -657,7 +741,7 @@ class UnknownAppAdaptationTrainer:
                 + totals["gui_actor_rows_used"]
             ),
             world_model_transitions=totals["world_model_transitions"],
-            app_families=[],
+            app_families=self._aggregate_long_run_app_families(state),
         )
         notes.extend(_underfill_notes(underfill))
         if not scale_report["meets_minimum_scale"]:
@@ -706,9 +790,28 @@ class UnknownAppAdaptationTrainer:
             return 1
         if config.osworld_archive_candidate_multiplier > 0:
             return max(1, config.osworld_archive_candidate_multiplier)
+        if config.osworld_archive_transition_limit_per_shard > 0:
+            return 3 if (config.cache_dir or config.stage_remote_archives) else 2
         if config.cache_dir or config.stage_remote_archives:
             return 2
         return 1
+
+    @staticmethod
+    def _aggregate_long_run_app_families(state: dict[str, Any]) -> list[str]:
+        families = {
+            str(item).strip()
+            for item in list(state.get("app_families") or [])
+            if str(item).strip()
+        }
+        for shard in list(state.get("shard_results") or []):
+            if not isinstance(shard, dict):
+                continue
+            families.update(
+                str(item).strip()
+                for item in list(shard.get("osworld_domains") or [])
+                if str(item).strip()
+            )
+        return sorted(families)
 
     def _train_vla_from_screenspot(
         self,
@@ -717,7 +820,7 @@ class UnknownAppAdaptationTrainer:
         start_offset: int,
         sources: set[str],
         output_path: Path,
-    ) -> int:
+    ) -> _RowsDatasetTrainingProgress:
         return self._train_vla_from_rows_dataset(
             url_pattern=SCREENSPOT_ROWS_URL,
             limit=limit,
@@ -733,7 +836,7 @@ class UnknownAppAdaptationTrainer:
         limit: int,
         start_offset: int,
         output_path: Path,
-    ) -> int:
+    ) -> _RowsDatasetTrainingProgress:
         return self._train_vla_from_rows_dataset(
             url_pattern=CLICK100K_ROWS_URL,
             limit=limit,
@@ -753,13 +856,28 @@ class UnknownAppAdaptationTrainer:
         cache_budget_bytes: int,
         stage_remote_archives: bool,
         output_path: Path,
-    ) -> int:
+        source_row_offsets: dict[str, int] | None,
+    ) -> _GuiActorTrainingProgress:
         used = 0
         lines: list[str] = []
-        sources = self._gui_actor_sources(source_names=source_names)
+        all_sources = self._gui_actor_sources(source_names=source_names)
+        normalized_offsets = {
+            str(name): max(0, _safe_int(offset))
+            for name, offset in dict(source_row_offsets or {}).items()
+        }
+        if not all_sources or limit <= 0:
+            return _GuiActorTrainingProgress(
+                used=0,
+                next_source_offset=max(0, source_offset),
+                source_row_offsets=normalized_offsets,
+            )
+        start_index = max(0, source_offset) % len(all_sources)
+        sources = all_sources[start_index:] + all_sources[:start_index]
         targets = _distributed_targets(limit, len(sources))
         carry_forward = 0
+        visited_sources = 0
         for index, source in enumerate(sources):
+            visited_sources += 1
             source_target = targets[index] if index < len(targets) else 0
             source_target += carry_forward
             carry_forward = 0
@@ -768,6 +886,8 @@ class UnknownAppAdaptationTrainer:
             if source_target <= 0:
                 continue
             source_start = used
+            source_cursor = normalized_offsets.get(str(source["name"]), 0)
+            scanned_rows = 0
             try:
                 with self._open_dataset_archive(
                     GUI_ACTOR_DATASET_REPO,
@@ -778,16 +898,17 @@ class UnknownAppAdaptationTrainer:
                 ) as archive:
                     image_prefixes = self._archive_image_prefixes(archive)
                     remaining = min(limit - used, source_target)
-                    scan_limit = max(remaining, remaining * 4)
+                    scan_limit = max(64, remaining * 8)
                     for row in self._iter_json_array_source(
                         GUI_ACTOR_DATASET_REPO,
                         source["annotation"],
                         limit=scan_limit,
-                        skip=source_offset,
+                        skip=source_cursor,
                         cache_root=cache_root,
                         cache_budget_bytes=cache_budget_bytes,
                         stage_remote_archives=stage_remote_archives,
                     ):
+                        scanned_rows += 1
                         sample = self._gui_actor_training_sample(
                             dict(row),
                             archive,
@@ -804,14 +925,21 @@ class UnknownAppAdaptationTrainer:
                             break
             except (OSError, ValueError, zipfile.BadZipFile):
                 carry_forward += min(limit - used, source_target)
+                normalized_offsets[str(source["name"])] = source_cursor
                 continue
+            normalized_offsets[str(source["name"])] = source_cursor + scanned_rows
             source_used = used - source_start
             source_missing = min(limit - source_start, source_target) - source_used
             if source_missing > 0:
                 carry_forward += source_missing
         if lines:
             output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return used
+        next_source_offset = (start_index + max(1, visited_sources)) % len(all_sources)
+        return _GuiActorTrainingProgress(
+            used=used,
+            next_source_offset=next_source_offset,
+            source_row_offsets=normalized_offsets,
+        )
 
     def _train_vla_from_rows_dataset(
         self,
@@ -825,19 +953,23 @@ class UnknownAppAdaptationTrainer:
             [dict[str, Any]],
             tuple[bytes, int, int, str, dict[str, Any]] | None,
         ],
-    ) -> int:
+    ) -> _RowsDatasetTrainingProgress:
         used = 0
         offset = max(0, start_offset)
-        page_size = min(100, max(1, limit))
+        page_size = min(200, max(25, max(1, limit) * 2))
         lines: list[str] = []
+        exhausted = False
         while used < limit:
             payload = self._fetch_json(
                 url_pattern.format(offset=offset, length=page_size)
             )
             rows = list((payload or {}).get("rows") or [])
             if not rows:
+                exhausted = True
                 break
+            rows_scanned = 0
             for item in rows:
+                rows_scanned += 1
                 row = dict(item.get("row") or {})
                 if not row or not row_filter(row):
                     continue
@@ -853,10 +985,14 @@ class UnknownAppAdaptationTrainer:
                 used += 1
                 if used >= limit:
                     break
-            offset += len(rows)
+            offset += rows_scanned
         if lines:
             output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return used
+        return _RowsDatasetTrainingProgress(
+            used=used,
+            next_offset=offset,
+            exhausted=exhausted,
+        )
 
     def _screenspot_training_sample(
         self,
