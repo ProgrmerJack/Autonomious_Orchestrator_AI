@@ -125,6 +125,39 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(payload["worker_pids"], [111, 222])
             self.assertEqual(payload["queue_db_path"], str(queue_db))
 
+    def test_crawl_worker_manager_start_records_broker_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+
+            class _FakeProcess:
+                def __init__(self, pid: int) -> None:
+                    self.pid = pid
+
+            with patch(
+                "agentos_orchestrator.product.crawl_worker.subprocess.Popen"
+            ) as popen:
+                popen.return_value = _FakeProcess(333)
+                manager = CrawlWorkerManager(temp_dir, python_executable="python")
+                record = manager.start(
+                    worker_count=1,
+                    queue_db_path=queue_db,
+                    broker_url="http://127.0.0.1:8787",
+                    broker_token="secret-token",
+                )
+
+            self.assertEqual(record.broker_url, "http://127.0.0.1:8787")
+            self.assertTrue(record.broker_token_configured)
+            self.assertIn("--broker-url", popen.call_args.args[0])
+            self.assertIn("http://127.0.0.1:8787", popen.call_args.args[0])
+            self.assertIn("--broker-token", popen.call_args.args[0])
+            payload = json.loads(
+                (Path(temp_dir) / ".agentos/crawl_worker.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(payload["broker_url"], "http://127.0.0.1:8787")
+            self.assertEqual(payload["broker_token"], "secret-token")
+
     def test_crawl_worker_manager_supervise_once_uses_reconcile_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
@@ -138,7 +171,9 @@ class ProductTests(unittest.TestCase):
                 detail="ok",
             )
 
-            with patch.object(manager, "ensure_running", return_value=running) as ensure:
+            with patch.object(
+                manager, "ensure_running", return_value=running
+            ) as ensure:
                 record = manager.supervise(
                     worker_count=1,
                     queue_db_path=queue_db,
@@ -180,17 +215,22 @@ class ProductTests(unittest.TestCase):
                 detail="ok",
             )
 
-            with patch.object(service, "_is_supported", return_value=True), patch.object(
-                service,
-                "_task_exists",
-                return_value=True,
-            ), patch.object(
-                service,
-                "_run_schtasks",
-                return_value=schtasks_result,
-            ) as schtasks, patch(
-                "agentos_orchestrator.product.crawl_worker.CrawlWorkerManager.status",
-                return_value=running,
+            with (
+                patch.object(service, "_is_supported", return_value=True),
+                patch.object(
+                    service,
+                    "_task_exists",
+                    return_value=True,
+                ),
+                patch.object(
+                    service,
+                    "_run_schtasks",
+                    return_value=schtasks_result,
+                ) as schtasks,
+                patch(
+                    "agentos_orchestrator.product.crawl_worker.CrawlWorkerManager.status",
+                    return_value=running,
+                ),
             ):
                 record = service.install(
                     worker_count=2,
@@ -215,6 +255,55 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(schtasks.call_count, 2)
             self.assertIn("/Create", schtasks.call_args_list[0].args[0])
             self.assertIn("/Run", schtasks.call_args_list[1].args[0])
+
+    def test_crawl_worker_service_install_writes_broker_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            service = CrawlWorkerServiceManager(temp_dir, python_executable="python")
+            schtasks_result = subprocess.CompletedProcess(
+                args=["schtasks"],
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            )
+
+            with (
+                patch.object(service, "_is_supported", return_value=True),
+                patch.object(service, "_task_exists", return_value=True),
+                patch.object(
+                    service,
+                    "_run_schtasks",
+                    return_value=schtasks_result,
+                ),
+                patch(
+                    "agentos_orchestrator.product.crawl_worker.CrawlWorkerManager.status",
+                    return_value=CrawlWorkerRecord(
+                        status="running",
+                        worker_pids=[111],
+                        worker_count=1,
+                        queue_db_path=str(queue_db),
+                        broker_url="http://127.0.0.1:8787",
+                        broker_token_configured=True,
+                        log_paths=[
+                            str(Path(temp_dir) / ".agentos/logs/crawl-worker-1.log")
+                        ],
+                        detail="ok",
+                    ),
+                ),
+            ):
+                service.install(
+                    worker_count=1,
+                    queue_db_path=queue_db,
+                    broker_url="http://127.0.0.1:8787",
+                    broker_token="secret-token",
+                    task_name="AgentOS Broker Crawl",
+                    start_now=False,
+                )
+
+            task_xml = service.task_xml_path.read_text(encoding="utf-16")
+            self.assertIn("--broker-url", task_xml)
+            self.assertIn("http://127.0.0.1:8787", task_xml)
+            self.assertIn("--broker-token", task_xml)
 
     def test_sdk_shapes_run_and_command_requests(self) -> None:
         client = FakeClient()

@@ -498,8 +498,10 @@ class SupervisorAgent:
             objective
         ):
             return True
-        if effort == "multi-hour" and risk_mode and not DeepResearchEngine._looks_like_academic_query(
-            objective
+        if (
+            effort == "multi-hour"
+            and risk_mode
+            and not DeepResearchEngine._looks_like_academic_query(objective)
         ):
             return True
         if has_explicit_browser_intent and (strong_hits > 0 or weak_hits > 0):
@@ -785,9 +787,11 @@ class WorkerAgent:
 
         search_queries: list[str] = []
         seen_queries: set[str] = set()
-        for candidate in list(ai_strategy.get("reasoning_queries") or []) + list(
-            self._browser_objective_queries(objective)
-        ) + [core_query]:
+        for candidate in (
+            list(ai_strategy.get("reasoning_queries") or [])
+            + list(self._browser_objective_queries(objective))
+            + [core_query]
+        ):
             query_text = str(candidate or "").strip()[:240]
             if not query_text:
                 continue
@@ -818,9 +822,9 @@ class WorkerAgent:
             ),
             "search_queries": search_queries[:query_limit],
             "seed_urls": seed_urls[:8],
-            "authoritative_domains": list(ai_strategy.get("authoritative_domains") or [])[
-                :12
-            ],
+            "authoritative_domains": list(
+                ai_strategy.get("authoritative_domains") or []
+            )[:12],
             "profile": analysis.get("profile") or {},
         }
 
@@ -1459,7 +1463,9 @@ class WorkerAgent:
             session_summary = {
                 "cycle": cycle_index + 1,
                 "worker_count": len(batch_results),
-                "batch_sizes": [len(result.get("batch_urls") or []) for result in batch_results],
+                "batch_sizes": [
+                    len(result.get("batch_urls") or []) for result in batch_results
+                ],
                 "direct_urls": 0,
                 "judged_results": 0,
             }
@@ -1513,9 +1519,7 @@ class WorkerAgent:
                 cycle_index,
             )
             checkpoints.append(checkpoint)
-            frontier_graph.setdefault("reasoning_checkpoints", []).append(
-                checkpoint
-            )
+            frontier_graph.setdefault("reasoning_checkpoints", []).append(checkpoint)
             frontier_graph = self._merge_browser_checkpoint_into_frontier_graph(
                 frontier_graph,
                 checkpoint,
@@ -1673,9 +1677,7 @@ class WorkerAgent:
         seeds: list[str] = []
         seeds.extend(str(url) for url in (browser_plan.get("seed_urls") or []))
         seeds.extend(urls)
-        seeds.extend(
-            self._planning_browser_urls({"browser_research": browser_plan})
-        )
+        seeds.extend(self._planning_browser_urls({"browser_research": browser_plan}))
         seed_limit = max(
             16,
             min(
@@ -1704,7 +1706,10 @@ class WorkerAgent:
             url = str(item.get("url") or "").strip()
             if not url:
                 continue
-            if int(item.get("visits") or 0) > 0 and str(item.get("status") or "") == "judged":
+            if (
+                int(item.get("visits") or 0) > 0
+                and str(item.get("status") or "") == "judged"
+            ):
                 continue
             urls.append(url)
             if len(urls) >= limit:
@@ -1854,9 +1859,9 @@ class WorkerAgent:
             list(current.get("judged_results") or [])
             + list(update.get("judged_results") or [])
         )
-        merged["search_result_count"] = int(current.get("search_result_count") or 0) + int(
-            update.get("search_result_count") or 0
-        )
+        merged["search_result_count"] = int(
+            current.get("search_result_count") or 0
+        ) + int(update.get("search_result_count") or 0)
         merged_frontier = dict(current.get("frontier") or {})
         merged_frontier.update(update.get("frontier") or {})
         merged["frontier"] = merged_frontier
@@ -1867,7 +1872,11 @@ class WorkerAgent:
         result: list[Any] = []
         seen: set[str] = set()
         for item in items:
-            key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else str(item)
+            key = (
+                json.dumps(item, sort_keys=True)
+                if isinstance(item, dict)
+                else str(item)
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -1901,7 +1910,9 @@ class WorkerAgent:
         run_entry["last_updated"] = datetime.now(UTC).isoformat()
 
         direct_urls = {
-            str(url).strip() for url in (findings.get("direct_urls") or []) if str(url).strip()
+            str(url).strip()
+            for url in (findings.get("direct_urls") or [])
+            if str(url).strip()
         }
         candidate_urls = [
             str(url).strip()
@@ -1934,7 +1945,9 @@ class WorkerAgent:
                 entry["visits"] = int(entry.get("visits") or 0) + 1
             judged = judged_index.get(url) or {}
             if judged:
-                entry["title"] = str(judged.get("title") or entry.get("title") or "")[:200]
+                entry["title"] = str(judged.get("title") or entry.get("title") or "")[
+                    :200
+                ]
                 entry["judgment"] = str(judged.get("judgment") or "")[:400]
                 entry["quality_flags"] = self._dedupe_list(
                     list(entry.get("quality_flags") or [])
@@ -1966,14 +1979,18 @@ class WorkerAgent:
                     if url not in claim_entry["sources"]:
                         claim_entry["sources"].append(url)
                     if claim_key in verified_claims:
-                        claim_entry["verified_count"] = int(
-                            claim_entry.get("verified_count") or 0
-                        ) + 1
+                        claim_entry["verified_count"] = (
+                            int(claim_entry.get("verified_count") or 0) + 1
+                        )
             if domain:
-                domain_entry = domains.setdefault(domain, {"urls": [], "observations": 0})
+                domain_entry = domains.setdefault(
+                    domain, {"urls": [], "observations": 0}
+                )
                 if url not in domain_entry["urls"]:
                     domain_entry["urls"].append(url)
-                domain_entry["observations"] = int(domain_entry.get("observations") or 0) + 1
+                domain_entry["observations"] = (
+                    int(domain_entry.get("observations") or 0) + 1
+                )
                 domain_entry["last_run"] = run_id
         return frontier_graph
 
@@ -1996,8 +2013,12 @@ class WorkerAgent:
                 }
                 for item in list(findings.get("judged_results") or [])[:16]
             ],
-            "terminal_verifications": list(findings.get("terminal_verifications") or [])[:12],
-            "prior_contradictions": list(frontier_graph.get("contradictions") or [])[:12],
+            "terminal_verifications": list(
+                findings.get("terminal_verifications") or []
+            )[:12],
+            "prior_contradictions": list(frontier_graph.get("contradictions") or [])[
+                :12
+            ],
         }
         system = (
             "You are a browser research coordinator. Based on the browser findings, "
@@ -2019,19 +2040,39 @@ class WorkerAgent:
                 return {
                     "cycle": cycle_index + 1,
                     "follow_up_queries": self._dedupe_list(
-                        [str(item)[:240] for item in (parsed.get("follow_up_queries") or []) if str(item).strip()]
+                        [
+                            str(item)[:240]
+                            for item in (parsed.get("follow_up_queries") or [])
+                            if str(item).strip()
+                        ]
                     )[:18],
                     "domain_leads": self._dedupe_list(
-                        [str(item).strip() for item in (parsed.get("domain_leads") or []) if str(item).strip()]
+                        [
+                            str(item).strip()
+                            for item in (parsed.get("domain_leads") or [])
+                            if str(item).strip()
+                        ]
                     )[:16],
                     "url_leads": self._dedupe_public_urls(
-                        [str(item).strip() for item in (parsed.get("url_leads") or []) if str(item).strip()]
+                        [
+                            str(item).strip()
+                            for item in (parsed.get("url_leads") or [])
+                            if str(item).strip()
+                        ]
                     )[:16],
                     "missing_evidence": self._dedupe_list(
-                        [str(item)[:240] for item in (parsed.get("missing_evidence") or []) if str(item).strip()]
+                        [
+                            str(item)[:240]
+                            for item in (parsed.get("missing_evidence") or [])
+                            if str(item).strip()
+                        ]
                     )[:16],
                     "contradictions": self._dedupe_list(
-                        [str(item)[:280] for item in (parsed.get("contradictions") or []) if str(item).strip()]
+                        [
+                            str(item)[:280]
+                            for item in (parsed.get("contradictions") or [])
+                            if str(item).strip()
+                        ]
                     )[:16],
                     "continue_research": bool(parsed.get("continue_research", True)),
                 }
@@ -2079,11 +2120,17 @@ class WorkerAgent:
 
         missing_evidence: list[str] = []
         if len(direct_domains) < 2:
-            missing_evidence.append("Need broader domain coverage beyond the current browser pages.")
+            missing_evidence.append(
+                "Need broader domain coverage beyond the current browser pages."
+            )
         if not findings.get("terminal_verifications"):
-            missing_evidence.append("Need independent verification of browser-derived claims.")
+            missing_evidence.append(
+                "Need independent verification of browser-derived claims."
+            )
         if len(judged_results) < 3:
-            missing_evidence.append("Need more direct pages with substantive evidence extraction.")
+            missing_evidence.append(
+                "Need more direct pages with substantive evidence extraction."
+            )
 
         contradictions: list[str] = []
         follow_up_queries: list[str] = []
@@ -2103,17 +2150,25 @@ class WorkerAgent:
                     f"Potential contradiction or unresolved uncertainty from {title[:80] or result.get('url')}."
                 )
                 follow_up_queries.append(
-                    (self.research_engine._query_core_terms(f"{title} counterevidence {objective}") or objective)[:240]
+                    (
+                        self.research_engine._query_core_terms(
+                            f"{title} counterevidence {objective}"
+                        )
+                        or objective
+                    )[:240]
                 )
             for claim in evidence_claims[:1]:
-                query_text = self.research_engine._query_core_terms(
-                    f"{title} {claim}"
-                )
+                query_text = self.research_engine._query_core_terms(f"{title} {claim}")
                 if query_text and len(query_text.split()) >= 3:
                     follow_up_queries.append(query_text[:240])
         if not follow_up_queries and missing_evidence:
             follow_up_queries.append(
-                (self.research_engine._query_core_terms(f"{objective} independent verification") or objective)[:240]
+                (
+                    self.research_engine._query_core_terms(
+                        f"{objective} independent verification"
+                    )
+                    or objective
+                )[:240]
             )
         graph_contradictions = [
             str(item.get("text") or "").strip()
@@ -2541,7 +2596,9 @@ class WorkerAgent:
         current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
             cleaned
         ) and not DeepResearchEngine._looks_like_academic_query(cleaned)
-        query_limit = 20 if "multi-hour" in objective.lower() or current_web_mode else 12
+        query_limit = (
+            20 if "multi-hour" in objective.lower() or current_web_mode else 12
+        )
         deduped: list[str] = []
         seen: set[str] = set()
         for query in queries:
@@ -3330,7 +3387,9 @@ class WorkerAgent:
             query_candidates = WorkerAgent._browser_objective_queries(cleaned)
             if query:
                 query_candidates.append(query)
-            query_candidates.extend(DeepResearchEngine._query_variants(query, depth) or [query])
+            query_candidates.extend(
+                DeepResearchEngine._query_variants(query, depth) or [query]
+            )
             variants: list[str] = []
             seen_variants: set[str] = set()
             for candidate in query_candidates:
@@ -3595,11 +3654,13 @@ class WorkerAgent:
             if frontier_navigation is not None:
                 navigate_result, navigate_attempts = frontier_navigation
             else:
-                navigate_result, navigate_attempts = self._perform_with_selector_fallback(
-                    backend,
-                    "set_text",
-                    self._browser_region_selectors(post_nodes, "address"),
-                    value=url,
+                navigate_result, navigate_attempts = (
+                    self._perform_with_selector_fallback(
+                        backend,
+                        "set_text",
+                        self._browser_region_selectors(post_nodes, "address"),
+                        value=url,
+                    )
                 )
             receipts.append(
                 {
@@ -3628,10 +3689,12 @@ class WorkerAgent:
             if frontier_content_focus is not None:
                 content_focus_result, content_attempts = frontier_content_focus
             else:
-                content_focus_result, content_attempts = self._perform_with_selector_fallback(
-                    backend,
-                    "focus",
-                    self._browser_region_selectors(post_nodes, "content"),
+                content_focus_result, content_attempts = (
+                    self._perform_with_selector_fallback(
+                        backend,
+                        "focus",
+                        self._browser_region_selectors(post_nodes, "content"),
+                    )
                 )
             receipts.append(
                 {
@@ -4030,9 +4093,7 @@ class WorkerAgent:
             name = node.name.lower()
             panel = str((node.metadata or {}).get("panel_type") or "").lower()
             if region == "window" and (
-                node_id == "window-browser"
-                or role == "window"
-                or "browser" in name
+                node_id == "window-browser" or role == "window" or "browser" in name
             ):
                 matches.append(node)
             elif region == "address" and (
@@ -4057,9 +4118,15 @@ class WorkerAgent:
         nodes: list[UiNode],
         region: str,
     ) -> tuple[bytes, dict[str, Any], dict[int, list[str]]]:
-        normalized_bounds = [self._frontier_node_bounds(node, index) for index, node in enumerate(nodes)]
-        canvas_width = max(1280, max((x + width + 40) for x, _, width, _ in normalized_bounds))
-        canvas_height = max(900, max((y + height + 40) for _, y, _, height in normalized_bounds))
+        normalized_bounds = [
+            self._frontier_node_bounds(node, index) for index, node in enumerate(nodes)
+        ]
+        canvas_width = max(
+            1280, max((x + width + 40) for x, _, width, _ in normalized_bounds)
+        )
+        canvas_height = max(
+            900, max((y + height + 40) for _, y, _, height in normalized_bounds)
+        )
         image = Image.new("RGB", (canvas_width, canvas_height), (244, 240, 232))
         draw = ImageDraw.Draw(image)
         selector_map: dict[int, list[str]] = {}

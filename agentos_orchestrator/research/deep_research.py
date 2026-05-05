@@ -284,15 +284,17 @@ class DeepResearchEngine:
         limit_per_provider: int = 6,
         timeout_seconds: int = 20,
         research_state_path: str | Path | None = None,
+        crawl_broker_url: str | None = None,
+        crawl_broker_token: str | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.limit_per_provider = limit_per_provider
         self.timeout_seconds = timeout_seconds
         self._research_state_path_override = (
-            Path(research_state_path)
-            if research_state_path is not None
-            else None
+            Path(research_state_path) if research_state_path is not None else None
         )
+        self._crawl_broker_url_override = crawl_broker_url
+        self._crawl_broker_token_override = crawl_broker_token
         self.provider_diagnostics: list[dict[str, Any]] = []
         self._durable_note_urls: set[str] = set()
         self._durable_note_passes: set[int] = set()
@@ -538,8 +540,92 @@ class DeepResearchEngine:
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    def _crawl_broker_base_url(self) -> str:
+        if os.environ.get("AGENTOS_DISABLE_CRAWL_BROKER") == "1":
+            return ""
+        if self._crawl_broker_url_override is not None:
+            return str(self._crawl_broker_url_override or "").strip().rstrip("/")
+        return os.environ.get("AGENTOS_CRAWL_BROKER_URL", "").strip().rstrip("/")
+
+    def _crawl_broker_token(self) -> str:
+        if self._crawl_broker_token_override is not None:
+            return str(self._crawl_broker_token_override or "")
+        return os.environ.get("AGENTOS_CRAWL_BROKER_TOKEN", "")
+
+    def _crawl_broker_enabled(self) -> bool:
+        return bool(self._crawl_broker_base_url())
+
+    def crawl_broker_status(self) -> dict[str, Any]:
+        return self._crawl_broker_request("/status")
+
+    def _crawl_broker_request(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        base_url = self._crawl_broker_base_url()
+        if not base_url:
+            raise RuntimeError("crawl broker is not configured")
+        method = "GET" if payload is None else "POST"
+        headers = {
+            "User-Agent": "AgentOS/1.0",
+            "Accept": "application/json",
+        }
+        request_data: bytes | None = None
+        if payload is not None:
+            request_data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        token = self._crawl_broker_token().strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            data=request_data,
+            method=method,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout_seconds or self.timeout_seconds,
+            ) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"crawl broker request failed ({exc.code}): {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"crawl broker unavailable: {exc}") from exc
+        if not raw.strip():
+            return {}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("crawl broker returned a non-object JSON payload")
+        return parsed
+
+    @staticmethod
+    def _deserialize_research_sources(payload: Any) -> list[ResearchSource]:
+        if not isinstance(payload, list):
+            return []
+        allowed = set(ResearchSource.__dataclass_fields__)
+        sources: list[ResearchSource] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            normalized = {key: item.get(key) for key in allowed if key in item}
+            try:
+                sources.append(ResearchSource(**normalized))
+            except TypeError:
+                continue
+        return sources
+
     def _ensure_research_state_store(self) -> None:
         if self._research_state_ready:
+            return
+        if self._crawl_broker_enabled():
+            self._research_state_ready = True
             return
         with closing(self._connect_research_state()) as connection:
             with connection:
@@ -718,6 +804,20 @@ class DeepResearchEngine:
         safe_urls = self._persistent_unique_urls(urls)
         if not safe_urls:
             return
+        if self._crawl_broker_enabled():
+            self._crawl_broker_request(
+                "/queue/enqueue",
+                {
+                    "urls": safe_urls,
+                    "source_query": str(source_query or "")[:320],
+                    "run_id": run_id,
+                    "source_url": str(source_url or "")[:320],
+                    "priority": float(priority),
+                },
+                timeout_seconds=max(10.0, self.timeout_seconds),
+            )
+            self._maybe_start_detached_crawl_workers()
+            return
         self._ensure_research_state_store()
         now = datetime.now(UTC).isoformat()
         with closing(self._connect_research_state()) as connection:
@@ -868,6 +968,8 @@ class DeepResearchEngine:
                 manager.start(
                     worker_count=worker_count,
                     queue_db_path=self._research_state_path(),
+                    broker_url=self._crawl_broker_base_url() or None,
+                    broker_token=self._crawl_broker_token() or None,
                     poll_interval_seconds=self._detached_crawl_poll_interval(),
                     batch_size=self._detached_crawl_batch_size(),
                     claim_ttl_seconds=self._detached_crawl_claim_ttl(),
@@ -880,6 +982,12 @@ class DeepResearchEngine:
         self,
         stale_after_seconds: int = 900,
     ) -> int:
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/queue/requeue-stale",
+                {"stale_after_seconds": int(stale_after_seconds)},
+            )
+            return int(response.get("reclaimed_count") or 0)
         self._ensure_research_state_store()
         cutoff = datetime.now(UTC) - timedelta(seconds=max(stale_after_seconds, 60))
         with closing(self._connect_research_state()) as connection:
@@ -908,6 +1016,16 @@ class DeepResearchEngine:
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/queue/claim-batch",
+                {
+                    "limit": int(limit),
+                    "worker_id": str(worker_id or "crawl-worker"),
+                },
+            )
+            claimed = response.get("claimed") or []
+            return [dict(item) for item in claimed if isinstance(item, dict)]
         self._ensure_research_state_store()
         claimed: list[dict[str, Any]] = []
         with closing(self._connect_research_state()) as connection:
@@ -958,11 +1076,23 @@ class DeepResearchEngine:
     ) -> list[ResearchSource]:
         if limit <= 0:
             return []
+        excluded_urls = self._persistent_unique_urls(exclude_urls or [])
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/queue/claim-sources",
+                {
+                    "query": query,
+                    "objective": objective,
+                    "limit": int(limit),
+                    "exclude_urls": excluded_urls,
+                },
+                timeout_seconds=max(10.0, self.timeout_seconds),
+            )
+            return self._deserialize_research_sources(response.get("sources") or [])
         self._ensure_research_state_store()
-        excluded = set(self._persistent_unique_urls(exclude_urls or []))
+        excluded = set(excluded_urls)
         worker_seed = (
-            f"{os.getpid()}:{threading.get_ident()}:"
-            f"{time.monotonic_ns()}:{query[:64]}"
+            f"{os.getpid()}:{threading.get_ident()}:{time.monotonic_ns()}:{query[:64]}"
         )
         worker_id = hashlib.sha1(worker_seed.encode("utf-8")).hexdigest()[:12]
         rows_to_claim: list[tuple[sqlite3.Row, float]] = []
@@ -1060,6 +1190,16 @@ class DeepResearchEngine:
         clean_url = str(url or "").strip()
         if not clean_url:
             return
+        if self._crawl_broker_enabled():
+            self._crawl_broker_request(
+                "/queue/update-status",
+                {
+                    "url": clean_url,
+                    "status": status,
+                    "error": str(error or "")[:320],
+                },
+            )
+            return
         self._ensure_research_state_store()
         with closing(self._connect_research_state()) as connection:
             with connection:
@@ -1138,13 +1278,9 @@ class DeepResearchEngine:
             signal_before = self._text_signal_score(
                 self._html_to_text(raw_html) if raw_html else content
             )
-            overlay_markers = (
-                self._overlay_marker_count(raw_html) if raw_html else 0
-            )
+            overlay_markers = self._overlay_marker_count(raw_html) if raw_html else 0
             if signal_before < 0.16 and overlay_markers > 0:
-                resolved_html, status = self._interrupt_resolve_overlays(
-                    raw_html
-                )
+                resolved_html, status = self._interrupt_resolve_overlays(raw_html)
                 if status != "resolved":
                     if "unreachable-paywalled" not in source.quality_flags:
                         source.quality_flags.append("unreachable-paywalled")
@@ -1183,6 +1319,21 @@ class DeepResearchEngine:
     ) -> None:
         clean_url = str(source.url or "").strip()
         if not clean_url:
+            return
+        if self._crawl_broker_enabled():
+            self._crawl_broker_request(
+                "/observations/record",
+                {
+                    "source": asdict(source),
+                    "content": content,
+                    "source_query": str(source_query or "")[:320],
+                    "query_hints": list(query_hints or []),
+                    "outbound_urls": list(outbound_urls or []),
+                    "worker_id": worker_id[:120],
+                    "used_browser": bool(used_browser),
+                },
+                timeout_seconds=max(10.0, self.timeout_seconds),
+            )
             return
         self._ensure_research_state_store()
         excerpt = re.sub(r"\s+", " ", content).strip()[:1600]
@@ -1289,8 +1440,7 @@ class DeepResearchEngine:
                             + float(existing_domain["score"] or 0.0)
                             if existing_domain
                             else float(signal_score * 10.0),
-                            1
-                            + int(existing_domain["observation_count"] or 0)
+                            1 + int(existing_domain["observation_count"] or 0)
                             if existing_domain
                             else 1,
                             json.dumps(merged_urls),
@@ -1319,6 +1469,20 @@ class DeepResearchEngine:
         objective: str,
         limit: int = 16,
     ) -> list[str]:
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/evidence/query-hints",
+                {
+                    "query": query,
+                    "objective": objective,
+                    "limit": int(limit),
+                },
+            )
+            return [
+                str(item).strip()
+                for item in (response.get("query_hints") or [])
+                if str(item).strip()
+            ][:limit]
         self._ensure_research_state_store()
         candidates: list[str] = []
         with closing(self._connect_research_state()) as connection:
@@ -1419,6 +1583,22 @@ class DeepResearchEngine:
         objective: str,
         limit: int = 16,
     ) -> list[str]:
+        if self._crawl_broker_enabled():
+            response = self._crawl_broker_request(
+                "/evidence/seed-urls",
+                {
+                    "query": query,
+                    "objective": objective,
+                    "limit": int(limit),
+                },
+            )
+            return self._persistent_unique_urls(
+                [
+                    str(item).strip()
+                    for item in (response.get("seed_urls") or [])
+                    if str(item).strip()
+                ]
+            )[:limit]
         self._ensure_research_state_store()
         urls: list[str] = []
         with closing(self._connect_research_state()) as connection:
@@ -1481,6 +1661,7 @@ class DeepResearchEngine:
                     break
 
         return self._persistent_unique_urls(urls)[:limit]
+
     @classmethod
     def _source_seed_urls(
         cls,
@@ -1520,16 +1701,12 @@ class DeepResearchEngine:
         if not isinstance(pc_findings, dict):
             return []
         candidates: list[str] = []
-        candidates.extend(
-            str(url) for url in (pc_findings.get("direct_urls") or [])
-        )
+        candidates.extend(str(url) for url in (pc_findings.get("direct_urls") or []))
         for result in pc_findings.get("judged_results") or []:
             if not isinstance(result, dict):
                 continue
             candidates.append(str(result.get("url") or ""))
-        candidates.extend(
-            str(url) for url in (pc_findings.get("candidate_urls") or [])
-        )
+        candidates.extend(str(url) for url in (pc_findings.get("candidate_urls") or []))
         deduped: list[str] = []
         seen: set[str] = set()
         for url in candidates:
@@ -1744,9 +1921,7 @@ class DeepResearchEngine:
                         formatted.append(f"{claim_text} [terminal:{expression}]")
                     else:
                         formatted.append(claim_text)
-                abstract_parts.append(
-                    "Terminal verification: " + "; ".join(formatted)
-                )
+                abstract_parts.append("Terminal verification: " + "; ".join(formatted))
             if excerpt:
                 abstract_parts.append(excerpt[:1400])
             if not abstract_parts:
@@ -1814,9 +1989,7 @@ class DeepResearchEngine:
                     evidence_grade="weak",
                     quality_flags=[quality_flag, "unfetched-browser-lead"],
                 )
-            elif fetched.abstract.startswith(
-                "Seeded external source collected"
-            ):
+            elif fetched.abstract.startswith("Seeded external source collected"):
                 if frontier_mode != "expansive":
                     continue
                 fetched.provider = "pc-browser-research"
@@ -2950,15 +3123,9 @@ class DeepResearchEngine:
                     )
                 ):
                     return False
-            return (
-                deterministic and actionable_market_signal
-            ) or alignment >= 0.35
+            return (deterministic and actionable_market_signal) or alignment >= 0.35
         if source.provider == "gemini-flash":
-            return (
-                alignment >= 0.25
-                or entity_hits > 0
-                or source.relevance >= 0.55
-            )
+            return alignment >= 0.25 or entity_hits > 0 or source.relevance >= 0.55
         return deterministic or alignment >= 0.35 or entity_hits > 0
 
     @staticmethod
@@ -8038,6 +8205,18 @@ class DeepResearchEngine:
         claims = list(claim_trace.get("claims") or [])
         if not claims:
             return
+        if self._crawl_broker_enabled():
+            self._crawl_broker_request(
+                "/evidence/update-index",
+                {
+                    "run_id": run_id,
+                    "objective": objective,
+                    "query": query,
+                    "claim_trace": claim_trace,
+                },
+                timeout_seconds=max(15.0, self.timeout_seconds),
+            )
+            return
         self._ensure_research_state_store()
         now = datetime.now(UTC).isoformat()
         try:
@@ -8049,15 +8228,11 @@ class DeepResearchEngine:
                         if not claim_key:
                             continue
                         support_count = int(claim.get("support_count") or 0)
-                        contradiction_count = int(
-                            claim.get("contradiction_count") or 0
-                        )
+                        contradiction_count = int(claim.get("contradiction_count") or 0)
                         confidence_rank = self._finding_confidence_rank(
                             str(claim.get("confidence") or "")
                         )
-                        supporting_sources = list(
-                            claim.get("supporting_sources") or []
-                        )
+                        supporting_sources = list(claim.get("supporting_sources") or [])
                         source_urls = self._persistent_unique_urls(
                             [
                                 str(source.get("url") or "")
@@ -8293,8 +8468,7 @@ class DeepResearchEngine:
                                     + float(existing_domain["score"] or 0.0)
                                     if existing_domain
                                     else float(support_count + confidence_rank),
-                                    1
-                                    + int(existing_domain["observation_count"] or 0)
+                                    1 + int(existing_domain["observation_count"] or 0)
                                     if existing_domain
                                     else 1,
                                     json.dumps(merged_domain_urls),
@@ -8313,6 +8487,16 @@ class DeepResearchEngine:
         objective: str,
         limit: int = 12,
     ) -> dict[str, Any]:
+        if self._crawl_broker_enabled():
+            return self._crawl_broker_request(
+                "/evidence/snapshot",
+                {
+                    "query": query,
+                    "objective": objective,
+                    "limit": int(limit),
+                },
+                timeout_seconds=max(10.0, self.timeout_seconds),
+            )
         self._ensure_research_state_store()
         with closing(self._connect_research_state()) as connection:
             claim_rows = connection.execute(
@@ -8359,12 +8543,12 @@ class DeepResearchEngine:
                     "support_count": int(row["support_count"] or 0),
                     "contradiction_count": int(row["contradiction_count"] or 0),
                     "confidence_rank": int(row["confidence_rank"] or 0),
-                    "source_urls": self._load_json_text_list(
-                        row["source_urls_json"]
-                    )[:8],
-                    "perspectives": self._load_json_text_list(
-                        row["perspectives_json"]
-                    )[:6],
+                    "source_urls": self._load_json_text_list(row["source_urls_json"])[
+                        :8
+                    ],
+                    "perspectives": self._load_json_text_list(row["perspectives_json"])[
+                        :6
+                    ],
                 }
             )
             if len(claims) >= limit:
@@ -8373,23 +8557,24 @@ class DeepResearchEngine:
         contradictions: list[dict[str, Any]] = []
         for row in contradiction_rows:
             contradiction_text = str(row["contradiction_text"] or "").strip()
-            if self._persistent_match_score(
-                contradiction_text,
-                query,
-                objective,
-            ) < 0.22:
+            if (
+                self._persistent_match_score(
+                    contradiction_text,
+                    query,
+                    objective,
+                )
+                < 0.22
+            ):
                 continue
             contradictions.append(
                 {
                     "contradiction_key": str(row["contradiction_key"] or ""),
                     "text": contradiction_text,
                     "count": int(row["count"] or 0),
-                    "claim_keys": self._load_json_text_list(
-                        row["claim_keys_json"]
-                    )[:8],
-                    "source_urls": self._load_json_text_list(
-                        row["source_urls_json"]
-                    )[:8],
+                    "claim_keys": self._load_json_text_list(row["claim_keys_json"])[:8],
+                    "source_urls": self._load_json_text_list(row["source_urls_json"])[
+                        :8
+                    ],
                 }
             )
             if len(contradictions) >= limit:
@@ -8403,9 +8588,7 @@ class DeepResearchEngine:
                     "score": float(row["score"] or 0.0),
                     "observation_count": int(row["observation_count"] or 0),
                     "urls": self._load_json_text_list(row["urls_json"])[:8],
-                    "claim_keys": self._load_json_text_list(
-                        row["claim_keys_json"]
-                    )[:8],
+                    "claim_keys": self._load_json_text_list(row["claim_keys_json"])[:8],
                     "contradiction_keys": self._load_json_text_list(
                         row["contradiction_keys_json"]
                     )[:8],
@@ -8422,6 +8605,12 @@ class DeepResearchEngine:
         }
 
     def _persistent_crawl_queue_snapshot(self, limit: int = 24) -> dict[str, Any]:
+        if self._crawl_broker_enabled():
+            return self._crawl_broker_request(
+                "/queue/snapshot",
+                {"limit": int(limit)},
+                timeout_seconds=max(10.0, self.timeout_seconds),
+            )
         self._ensure_research_state_store()
         with closing(self._connect_research_state()) as connection:
             rows = connection.execute(
@@ -9596,14 +9785,22 @@ class DeepResearchEngine:
         anchor_tokens: list[str] = []
         seen_anchor_tokens: set[str] = set()
         for token in re.findall(r"\b[a-z][a-z0-9-]{3,}\b", lower):
-            if token in generic_terms or token in entity_tokens or token in seen_anchor_tokens:
+            if (
+                token in generic_terms
+                or token in entity_tokens
+                or token in seen_anchor_tokens
+            ):
                 continue
             seen_anchor_tokens.add(token)
             anchor_tokens.append(token)
             if len(anchor_tokens) >= 8:
                 break
         for token in DeepResearchEngine._keywords(combined):
-            if token in generic_terms or token in entity_tokens or token in seen_anchor_tokens:
+            if (
+                token in generic_terms
+                or token in entity_tokens
+                or token in seen_anchor_tokens
+            ):
                 continue
             seen_anchor_tokens.add(token)
             anchor_tokens.append(token)
@@ -11287,12 +11484,14 @@ class DeepResearchEngine:
         append_preferred(
             "pc-browser-research",
             lambda source: (
-                "browser-terminal-verified" in (source.quality_flags or [])
-                or "browser-navigation-seed" in (source.quality_flags or [])
-                or "browser-judged-source" in (source.quality_flags or [])
-                or "browser-fetched-seed" in (source.quality_flags or [])
-            )
-            and DeepResearchEngine._source_is_on_topic(source, query),
+                (
+                    "browser-terminal-verified" in (source.quality_flags or [])
+                    or "browser-navigation-seed" in (source.quality_flags or [])
+                    or "browser-judged-source" in (source.quality_flags or [])
+                    or "browser-fetched-seed" in (source.quality_flags or [])
+                )
+                and DeepResearchEngine._source_is_on_topic(source, query)
+            ),
         )
 
         # For current-evidence tasks, preserve at least one tool observation
@@ -11681,9 +11880,7 @@ class DeepResearchEngine:
         anchors = cls._objective_anchor_terms(query)
         entity_terms = cls._entity_terms_from_query(query)
         lower_text = text.lower()
-        words = {
-            token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", lower_text)
-        }
+        words = {token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", lower_text)}
         if not words and not lower_text.strip():
             return 0.0
         overlap = len(anchors & words)
@@ -11808,8 +12005,7 @@ class DeepResearchEngine:
             meaningful_words = [
                 word
                 for word in words
-                if word not in cls._generic_query_terms()
-                and word not in noise_tokens
+                if word not in cls._generic_query_terms() and word not in noise_tokens
             ]
             broad_domain_terms = {
                 "stock",

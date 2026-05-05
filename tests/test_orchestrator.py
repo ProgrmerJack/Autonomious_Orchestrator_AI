@@ -429,7 +429,10 @@ class OrchestratorTests(unittest.TestCase):
             any("nvidia latest 10-Q guidance" in url for url in decoded_urls)
         )
         self.assertTrue(
-            any("semiconductor supply chain recent pricing" in url for url in decoded_urls)
+            any(
+                "semiconductor supply chain recent pricing" in url
+                for url in decoded_urls
+            )
         )
 
     def test_planning_browser_urls_allow_deeper_frontier(self) -> None:
@@ -747,9 +750,7 @@ class OrchestratorTests(unittest.TestCase):
         worker.research_engine._search_sec_edgar = lambda query, limit=6: []
         worker.research_engine._dedupe_sources = lambda sources: sources
         worker.research_engine._rank_sources = lambda sources, query: [
-            source
-            for source in sources
-            if "search.example.com" in source.url
+            source for source in sources if "search.example.com" in source.url
         ]
         worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
         worker._deep_page_read = lambda url: f"signal from {url} " * 40

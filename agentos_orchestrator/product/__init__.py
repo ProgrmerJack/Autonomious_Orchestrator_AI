@@ -1,5 +1,6 @@
 """Product readiness and operations helpers for AgentOS."""
 
+from .crawl_broker import CrawlBrokerRecord, CrawlBrokerServer
 from .crawl_worker import (
     CrawlWorkerManager,
     CrawlWorkerRecord,
@@ -16,6 +17,8 @@ from .status import (
 )
 
 __all__ = [
+    "CrawlBrokerRecord",
+    "CrawlBrokerServer",
     "CrawlWorkerManager",
     "CrawlWorkerRecord",
     "CrawlWorkerServiceManager",

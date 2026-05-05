@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from agentos_orchestrator.product import CrawlWorkerServiceRecord
+from agentos_orchestrator.product import CrawlBrokerServer, CrawlWorkerServiceRecord
 from agentos_orchestrator.research import DeepResearchEngine, ResearchSource
 from agentos_orchestrator.research.crawl_worker import (
     CrawlWorkerLoopConfig,
@@ -462,9 +462,7 @@ class ResearchTests(unittest.TestCase):
             engine.run("accessibility tree desktop agents", "run_1")
 
             followup = FakeDeepResearchEngine(workspace_root=temp_dir)
-            query = followup._query_from_objective(
-                "accessibility tree desktop agents"
-            )
+            query = followup._query_from_objective("accessibility tree desktop agents")
             hints = followup._persistent_evidence_query_hints(
                 query,
                 "accessibility tree desktop agents",
@@ -529,8 +527,7 @@ class ResearchTests(unittest.TestCase):
             objective = "agentos semantic browser deep research reliability"
             root_url = "https://docs.example.org/root"
             child_url = (
-                "https://docs.example.org/articles/"
-                "agentos-semantic-browser-worker-pool"
+                "https://docs.example.org/articles/agentos-semantic-browser-worker-pool"
             )
             engine = FakeCrawlWorkerResearchEngine(workspace_root=temp_dir)
             engine._ensure_research_state_store()
@@ -588,6 +585,84 @@ class ResearchTests(unittest.TestCase):
             self.assertIn(root_url, seeds)
             self.assertIn(child_url, seeds)
 
+    def test_crawl_broker_shares_queue_and_evidence_across_remote_workers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            broker = CrawlBrokerServer(
+                workspace_root=temp_dir,
+                host="127.0.0.1",
+                port=0,
+                auth_token="secret-token",
+            )
+            broker.start_in_thread()
+            try:
+                objective = "agentos semantic browser deep research reliability"
+                root_url = "https://docs.example.org/root"
+                child_url = (
+                    "https://docs.example.org/articles/"
+                    "agentos-semantic-browser-worker-pool"
+                )
+                coordinator = DeepResearchEngine(
+                    workspace_root=Path(temp_dir) / "client",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                coordinator._enqueue_url_batch(
+                    [root_url],
+                    objective,
+                    "run_remote_broker",
+                    source_url="https://seed.example.org/objective",
+                    priority=12.0,
+                )
+
+                pre_snapshot = coordinator._persistent_crawl_queue_snapshot(limit=8)
+                self.assertEqual(pre_snapshot["queued"][0]["url"], root_url)
+                self.assertEqual(pre_snapshot["queued"][0]["status"], "queued")
+
+                worker_engine = FakeCrawlWorkerResearchEngine(
+                    workspace_root=Path(temp_dir) / "remote-worker",
+                    crawl_broker_url=broker.url,
+                    crawl_broker_token="secret-token",
+                )
+                worker = ResearchCrawlWorker(
+                    worker_engine,
+                    worker_id="remote-worker-1",
+                    config=CrawlWorkerLoopConfig(
+                        batch_size=2,
+                        claim_ttl_seconds=60,
+                        once=True,
+                    ),
+                )
+                result = worker.run_once()
+
+                self.assertEqual(result["processed_count"], 1)
+                self.assertGreaterEqual(result["enqueued_count"], 1)
+
+                query = coordinator._query_from_objective(objective)
+                hints = coordinator._persistent_evidence_query_hints(
+                    query,
+                    objective,
+                    limit=8,
+                )
+                seeds = coordinator._persistent_seed_urls(
+                    query,
+                    objective,
+                    limit=8,
+                )
+                post_snapshot = coordinator._persistent_crawl_queue_snapshot(limit=8)
+                statuses = {
+                    item["url"]: item["status"]
+                    for item in post_snapshot["queued"]
+                }
+
+                self.assertTrue(hints)
+                self.assertIn(root_url, seeds)
+                self.assertIn(child_url, seeds)
+                self.assertEqual(statuses[root_url], "processed")
+            finally:
+                broker.shutdown()
+
     def test_auto_start_prefers_installed_crawl_worker_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
@@ -609,15 +684,19 @@ class ResearchTests(unittest.TestCase):
                 detail="installed",
             )
 
-            with patch.object(
-                engine,
-                "_auto_start_crawl_workers_enabled",
-                return_value=True,
-            ), patch(
-                "agentos_orchestrator.product.CrawlWorkerServiceManager"
-            ) as service_manager_cls, patch(
-                "agentos_orchestrator.product.CrawlWorkerManager"
-            ) as worker_manager_cls:
+            with (
+                patch.object(
+                    engine,
+                    "_auto_start_crawl_workers_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "agentos_orchestrator.product.CrawlWorkerServiceManager"
+                ) as service_manager_cls,
+                patch(
+                    "agentos_orchestrator.product.CrawlWorkerManager"
+                ) as worker_manager_cls,
+            ):
                 service_manager = service_manager_cls.return_value
                 service_manager.status.return_value = service_status
                 engine._maybe_start_detached_crawl_workers()
@@ -780,8 +859,7 @@ class ResearchTests(unittest.TestCase):
 
         self.assertTrue(
             any(
-                "revenue growth" in query.lower()
-                and "nvidia" in query.lower()
+                "revenue growth" in query.lower() and "nvidia" in query.lower()
                 for query in queries
             )
         )
@@ -810,16 +888,12 @@ class ResearchTests(unittest.TestCase):
         queries = engine._pc_query_seeds(pc_context, "nvidia valuation outlook")
 
         self.assertTrue(
-            any(
-                "supplier concentration" in query.lower()
-                for query in queries
-            )
+            any("supplier concentration" in query.lower() for query in queries)
         )
         self.assertTrue(any("site:sec.gov" in query.lower() for query in queries))
         self.assertTrue(
             any(
-                "margin compression" in query.lower()
-                or "capex" in query.lower()
+                "margin compression" in query.lower() or "capex" in query.lower()
                 for query in queries
             )
         )
@@ -832,9 +906,7 @@ class ResearchTests(unittest.TestCase):
                     {"url_leads": ["https://docs.example.org/agentos"]}
                 ],
                 "frontier_graph": {
-                    "summary": {
-                        "top_urls": ["https://docs.example.org/agentos"]
-                    }
+                    "summary": {"top_urls": ["https://docs.example.org/agentos"]}
                 },
                 "frontier": {"mode": "expansive"},
             }
@@ -842,7 +914,9 @@ class ResearchTests(unittest.TestCase):
 
         sources = engine._pc_finding_seed_sources(pc_context)
         matching = [
-            source for source in sources if source.url == "https://docs.example.org/agentos"
+            source
+            for source in sources
+            if source.url == "https://docs.example.org/agentos"
         ]
 
         self.assertTrue(matching)
@@ -1759,7 +1833,8 @@ class ResearchTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                query in {
+                query
+                in {
                     "LLM agent benchmark evaluation",
                     "autonomous agent task planning execution",
                     "AI agent computer use evaluation",

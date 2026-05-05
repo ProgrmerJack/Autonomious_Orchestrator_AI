@@ -21,6 +21,8 @@ class CrawlWorkerRecord:
     worker_count: int
     queue_db_path: str
     log_paths: list[str]
+    broker_url: str = ""
+    broker_token_configured: bool = False
     started_at: str | None = None
     poll_interval_seconds: float = 0.0
     batch_size: int = 0
@@ -39,6 +41,8 @@ class CrawlWorkerServiceRecord:
     config_path: str
     worker_count: int
     queue_db_path: str
+    broker_url: str = ""
+    broker_token_configured: bool = False
     poll_interval_seconds: float = 0.0
     batch_size: int = 0
     claim_ttl_seconds: int = 0
@@ -69,6 +73,8 @@ class CrawlWorkerManager:
                 queue_db_path=str(
                     self.workspace_root / ".agentos" / "research_state.sqlite3"
                 ),
+                broker_url="",
+                broker_token_configured=False,
                 log_paths=[str(self.log_dir / "crawl_worker_1.log")],
             )
         worker_pids = [
@@ -91,6 +97,8 @@ class CrawlWorkerManager:
             worker_pids=worker_pids,
             worker_count=int(payload.get("worker_count") or len(worker_pids) or 0),
             queue_db_path=str(payload.get("queue_db_path") or ""),
+            broker_url=str(payload.get("broker_url") or ""),
+            broker_token_configured=bool(payload.get("broker_token") or ""),
             log_paths=[str(path) for path in list(payload.get("log_paths") or [])],
             started_at=payload.get("started_at"),
             poll_interval_seconds=float(payload.get("poll_interval_seconds") or 0.0),
@@ -103,19 +111,28 @@ class CrawlWorkerManager:
         self,
         worker_count: int = 1,
         queue_db_path: str | Path | None = None,
+        broker_url: str | None = None,
+        broker_token: str | None = None,
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
     ) -> CrawlWorkerRecord:
         desired_count = max(1, min(int(worker_count), 8))
-        queue_path = Path(queue_db_path) if queue_db_path is not None else (
-            self.workspace_root / ".agentos" / "research_state.sqlite3"
+        queue_path = (
+            Path(queue_db_path)
+            if queue_db_path is not None
+            else (self.workspace_root / ".agentos" / "research_state.sqlite3")
         )
+        resolved_broker_url = str(broker_url or "").strip()
+        resolved_broker_token = str(broker_token or "")
+        state_payload = self._read_state() or {}
         current = self.status()
         if (
             current.status == "running"
             and current.worker_count == desired_count
             and Path(current.queue_db_path) == queue_path
+            and current.broker_url == resolved_broker_url
+            and str(state_payload.get("broker_token") or "") == resolved_broker_token
         ):
             return current
         if current.status in {"running", "degraded", "stale"}:
@@ -150,6 +167,10 @@ class CrawlWorkerManager:
                 "--claim-ttl",
                 str(claim_ttl_seconds),
             ]
+            if resolved_broker_url:
+                command.extend(["--broker-url", resolved_broker_url])
+            if resolved_broker_token:
+                command.extend(["--broker-token", resolved_broker_token])
             env = os.environ.copy()
             env["AGENTOS_CRAWL_WORKER_PROCESS"] = "1"
             env["AGENTOS_DISABLE_AUTO_CRAWL_WORKERS"] = "1"
@@ -170,6 +191,8 @@ class CrawlWorkerManager:
             worker_pids=worker_pids,
             worker_count=desired_count,
             queue_db_path=str(queue_path),
+            broker_url=resolved_broker_url,
+            broker_token_configured=bool(resolved_broker_token),
             log_paths=log_paths,
             started_at=utc_now(),
             poll_interval_seconds=float(poll_interval_seconds),
@@ -177,31 +200,40 @@ class CrawlWorkerManager:
             claim_ttl_seconds=int(claim_ttl_seconds),
             detail="detached crawl workers started",
         )
-        self._write_state(asdict(record))
+        payload = asdict(record)
+        payload["broker_token"] = resolved_broker_token
+        self._write_state(payload)
         return record
 
     def ensure_running(
         self,
         worker_count: int = 1,
         queue_db_path: str | Path | None = None,
+        broker_url: str | None = None,
+        broker_token: str | None = None,
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
     ) -> CrawlWorkerRecord:
         desired_count = max(1, min(int(worker_count), 8))
-        queue_path = Path(queue_db_path) if queue_db_path is not None else (
-            self.workspace_root / ".agentos" / "research_state.sqlite3"
+        queue_path = (
+            Path(queue_db_path)
+            if queue_db_path is not None
+            else (self.workspace_root / ".agentos" / "research_state.sqlite3")
         )
         current = self.status()
         if (
             current.status == "running"
             and current.worker_count == desired_count
             and Path(current.queue_db_path) == queue_path
+            and current.broker_url == str(broker_url or "").strip()
         ):
             return current
         return self.start(
             worker_count=desired_count,
             queue_db_path=queue_path,
+            broker_url=broker_url,
+            broker_token=broker_token,
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
             claim_ttl_seconds=claim_ttl_seconds,
@@ -211,6 +243,8 @@ class CrawlWorkerManager:
         self,
         worker_count: int = 1,
         queue_db_path: str | Path | None = None,
+        broker_url: str | None = None,
+        broker_token: str | None = None,
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
@@ -219,13 +253,18 @@ class CrawlWorkerManager:
     ) -> CrawlWorkerRecord:
         interval = max(5.0, min(float(reconcile_interval_seconds), 300.0))
         while True:
-            record = self.ensure_running(
-                worker_count=worker_count,
-                queue_db_path=queue_db_path,
-                poll_interval_seconds=poll_interval_seconds,
-                batch_size=batch_size,
-                claim_ttl_seconds=claim_ttl_seconds,
-            )
+            ensure_kwargs: dict[str, Any] = {
+                "worker_count": worker_count,
+                "queue_db_path": queue_db_path,
+                "poll_interval_seconds": poll_interval_seconds,
+                "batch_size": batch_size,
+                "claim_ttl_seconds": claim_ttl_seconds,
+            }
+            if broker_url:
+                ensure_kwargs["broker_url"] = broker_url
+            if broker_token:
+                ensure_kwargs["broker_token"] = broker_token
+            record = self.ensure_running(**ensure_kwargs)
             if once:
                 return record
             time.sleep(interval)
@@ -241,6 +280,8 @@ class CrawlWorkerManager:
             worker_pids=[],
             worker_count=0,
             queue_db_path=current.queue_db_path,
+            broker_url=current.broker_url,
+            broker_token_configured=current.broker_token_configured,
             log_paths=current.log_paths,
             detail="crawl workers stopped",
         )
@@ -285,12 +326,13 @@ class CrawlWorkerServiceManager:
     ) -> CrawlWorkerServiceRecord:
         payload = self._read_config()
         configured_task_name = str(payload.get("task_name") or "").strip()
-        resolved_task_name = (
-            str(task_name or configured_task_name or self.default_task_name()).strip()
-        )
+        resolved_task_name = str(
+            task_name or configured_task_name or self.default_task_name()
+        ).strip()
         queue_db_path = self._resolve_queue_db_path(
             str(payload.get("queue_db_path") or "")
         )
+        broker_url = str(payload.get("broker_url") or "")
         worker_count = max(0, int(payload.get("worker_count") or 0))
         poll_interval_seconds = float(payload.get("poll_interval_seconds") or 0.0)
         batch_size = int(payload.get("batch_size") or 0)
@@ -329,6 +371,8 @@ class CrawlWorkerServiceManager:
             config_path=str(self.config_path),
             worker_count=worker_count,
             queue_db_path=str(queue_db_path),
+            broker_url=broker_url,
+            broker_token_configured=bool(payload.get("broker_token") or ""),
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
             claim_ttl_seconds=claim_ttl_seconds,
@@ -340,6 +384,8 @@ class CrawlWorkerServiceManager:
         self,
         worker_count: int = 1,
         queue_db_path: str | Path | None = None,
+        broker_url: str | None = None,
+        broker_token: str | None = None,
         poll_interval_seconds: float = 15.0,
         batch_size: int = 6,
         claim_ttl_seconds: int = 900,
@@ -356,6 +402,8 @@ class CrawlWorkerServiceManager:
             "task_name": resolved_task_name,
             "worker_count": max(1, min(int(worker_count), 8)),
             "queue_db_path": str(queue_path),
+            "broker_url": str(broker_url or "").strip(),
+            "broker_token": str(broker_token or ""),
             "poll_interval_seconds": float(poll_interval_seconds),
             "batch_size": max(1, min(int(batch_size), 24)),
             "claim_ttl_seconds": max(60, min(int(claim_ttl_seconds), 7_200)),
@@ -390,11 +438,13 @@ class CrawlWorkerServiceManager:
         if not self._is_supported():
             return self.status(task_name=task_name)
         resolved_task_name = self._resolve_task_name(task_name)
-        result = self._run_schtasks([
-            "/Run",
-            "/TN",
-            resolved_task_name,
-        ])
+        result = self._run_schtasks(
+            [
+                "/Run",
+                "/TN",
+                resolved_task_name,
+            ]
+        )
         if result.returncode != 0:
             output = self._command_error("start", result)
             if "already running" not in output.lower():
@@ -407,11 +457,13 @@ class CrawlWorkerServiceManager:
     ) -> CrawlWorkerServiceRecord:
         resolved_task_name = self._resolve_task_name(task_name)
         if self._is_supported() and self._task_exists(resolved_task_name):
-            result = self._run_schtasks([
-                "/End",
-                "/TN",
-                resolved_task_name,
-            ])
+            result = self._run_schtasks(
+                [
+                    "/End",
+                    "/TN",
+                    resolved_task_name,
+                ]
+            )
             if result.returncode != 0:
                 output = self._command_error("stop", result)
                 if "there is no running instance" not in output.lower():
@@ -436,12 +488,14 @@ class CrawlWorkerServiceManager:
         resolved_task_name = self._resolve_task_name(task_name)
         if self._is_supported() and self._task_exists(resolved_task_name):
             self.stop(task_name=resolved_task_name)
-            result = self._run_schtasks([
-                "/Delete",
-                "/TN",
-                resolved_task_name,
-                "/F",
-            ])
+            result = self._run_schtasks(
+                [
+                    "/Delete",
+                    "/TN",
+                    resolved_task_name,
+                    "/F",
+                ]
+            )
             if result.returncode != 0:
                 raise RuntimeError(self._command_error("uninstall", result))
         if self.config_path.exists():
@@ -487,11 +541,13 @@ class CrawlWorkerServiceManager:
         )
 
     def _task_exists(self, task_name: str) -> bool:
-        result = self._run_schtasks([
-            "/Query",
-            "/TN",
-            task_name,
-        ])
+        result = self._run_schtasks(
+            [
+                "/Query",
+                "/TN",
+                task_name,
+            ]
+        )
         return result.returncode == 0
 
     def _write_task_xml(self, payload: dict[str, Any]) -> None:
@@ -506,9 +562,9 @@ class CrawlWorkerServiceManager:
             "Supervise AgentOS crawl workers so the research queue resumes "
             "after reboot and task failure."
         )
-        ET.SubElement(registration, f"{{{namespace}}}URI").text = (
-            f"\\AgentOS\\{payload['task_name']}"
-        )
+        ET.SubElement(
+            registration, f"{{{namespace}}}URI"
+        ).text = f"\\AgentOS\\{payload['task_name']}"
 
         principals = ET.SubElement(task, f"{{{namespace}}}Principals")
         principal = ET.SubElement(
@@ -517,12 +573,8 @@ class CrawlWorkerServiceManager:
             id="Author",
         )
         ET.SubElement(principal, f"{{{namespace}}}UserId").text = "S-1-5-18"
-        ET.SubElement(principal, f"{{{namespace}}}LogonType").text = (
-            "ServiceAccount"
-        )
-        ET.SubElement(principal, f"{{{namespace}}}RunLevel").text = (
-            "HighestAvailable"
-        )
+        ET.SubElement(principal, f"{{{namespace}}}LogonType").text = "ServiceAccount"
+        ET.SubElement(principal, f"{{{namespace}}}RunLevel").text = "HighestAvailable"
 
         triggers = ET.SubElement(task, f"{{{namespace}}}Triggers")
         boot_trigger = ET.SubElement(triggers, f"{{{namespace}}}BootTrigger")
@@ -563,36 +615,41 @@ class CrawlWorkerServiceManager:
         ET.SubElement(restart, f"{{{namespace}}}Interval").text = "PT1M"
         ET.SubElement(restart, f"{{{namespace}}}Count").text = "255"
 
-        arguments = subprocess.list2cmdline(
-            [
-                "-m",
-                "agentos_orchestrator",
-                "crawl-worker",
-                "supervise",
-                "--workspace-root",
-                str(self.workspace_root),
-                "--queue-db",
-                str(payload["queue_db_path"]),
-                "--workers",
-                str(payload["worker_count"]),
-                "--poll-interval",
-                str(payload["poll_interval_seconds"]),
-                "--batch-size",
-                str(payload["batch_size"]),
-                "--claim-ttl",
-                str(payload["claim_ttl_seconds"]),
-                "--supervisor-interval",
-                str(payload["reconcile_interval_seconds"]),
-            ]
-        )
+        argument_list = [
+            "-m",
+            "agentos_orchestrator",
+            "crawl-worker",
+            "supervise",
+            "--workspace-root",
+            str(self.workspace_root),
+            "--queue-db",
+            str(payload["queue_db_path"]),
+            "--workers",
+            str(payload["worker_count"]),
+            "--poll-interval",
+            str(payload["poll_interval_seconds"]),
+            "--batch-size",
+            str(payload["batch_size"]),
+            "--claim-ttl",
+            str(payload["claim_ttl_seconds"]),
+            "--supervisor-interval",
+            str(payload["reconcile_interval_seconds"]),
+        ]
+        broker_url = str(payload.get("broker_url") or "").strip()
+        broker_token = str(payload.get("broker_token") or "")
+        if broker_url:
+            argument_list.extend(["--broker-url", broker_url])
+        if broker_token:
+            argument_list.extend(["--broker-token", broker_token])
+        arguments = subprocess.list2cmdline(argument_list)
         actions = ET.SubElement(task, f"{{{namespace}}}Actions", Context="Author")
         exec_action = ET.SubElement(actions, f"{{{namespace}}}Exec")
-        ET.SubElement(exec_action, f"{{{namespace}}}Command").text = (
-            str(Path(self.python_executable).resolve())
+        ET.SubElement(exec_action, f"{{{namespace}}}Command").text = str(
+            Path(self.python_executable).resolve()
         )
         ET.SubElement(exec_action, f"{{{namespace}}}Arguments").text = arguments
-        ET.SubElement(exec_action, f"{{{namespace}}}WorkingDirectory").text = (
-            str(self.workspace_root)
+        ET.SubElement(exec_action, f"{{{namespace}}}WorkingDirectory").text = str(
+            self.workspace_root
         )
 
         tree = ET.ElementTree(task)

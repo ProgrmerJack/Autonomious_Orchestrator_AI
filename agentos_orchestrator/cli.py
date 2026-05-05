@@ -44,6 +44,7 @@ from .os_control import (
     WindowsUiaBackend,
 )
 from .product import (
+    CrawlBrokerServer,
     CrawlWorkerManager,
     CrawlWorkerServiceManager,
     DaemonManager,
@@ -225,6 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl_worker_start.add_argument("--batch-size", type=int, default=6)
     crawl_worker_start.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_start.add_argument("--broker-url", default="")
+    crawl_worker_start.add_argument("--broker-token", default="")
     crawl_worker_supervise = crawl_worker_subparsers.add_parser(
         "supervise",
         help="Run a long-lived supervisor for the crawl worker pool.",
@@ -239,6 +242,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl_worker_supervise.add_argument("--batch-size", type=int, default=6)
     crawl_worker_supervise.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_supervise.add_argument("--broker-url", default="")
+    crawl_worker_supervise.add_argument("--broker-token", default="")
     crawl_worker_supervise.add_argument(
         "--supervisor-interval",
         type=float,
@@ -255,7 +260,32 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_run.add_argument("--poll-interval", type=float, default=15.0)
     crawl_worker_run.add_argument("--batch-size", type=int, default=6)
     crawl_worker_run.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_run.add_argument("--broker-url", default="")
+    crawl_worker_run.add_argument("--broker-token", default="")
     crawl_worker_run.add_argument("--once", action="store_true")
+    crawl_worker_broker = crawl_worker_subparsers.add_parser(
+        "broker",
+        help="Serve or inspect a shared crawl broker for remote workers.",
+    )
+    crawl_worker_broker_subparsers = crawl_worker_broker.add_subparsers(
+        dest="crawl_worker_broker_command",
+        required=True,
+    )
+    crawl_worker_broker_status = crawl_worker_broker_subparsers.add_parser(
+        "status",
+        help="Read broker status from a running crawl broker endpoint.",
+    )
+    crawl_worker_broker_status.add_argument("--broker-url", required=True)
+    crawl_worker_broker_status.add_argument("--broker-token", default="")
+    crawl_worker_broker_serve = crawl_worker_broker_subparsers.add_parser(
+        "serve",
+        help="Run the shared crawl broker in the foreground.",
+    )
+    crawl_worker_broker_serve.add_argument("--workspace-root", default=".")
+    crawl_worker_broker_serve.add_argument("--queue-db", default="")
+    crawl_worker_broker_serve.add_argument("--host", default="127.0.0.1")
+    crawl_worker_broker_serve.add_argument("--port", type=int, default=8787)
+    crawl_worker_broker_serve.add_argument("--auth-token", default="")
     crawl_worker_service = crawl_worker_subparsers.add_parser(
         "service",
         help="Manage the OS service wrapper for crawl workers.",
@@ -311,6 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
     )
+    crawl_worker_service_install.add_argument("--broker-url", default="")
+    crawl_worker_service_install.add_argument("--broker-token", default="")
     crawl_worker_service_install.add_argument("--task-name", default="")
     crawl_worker_service_install.add_argument(
         "--no-start",
@@ -957,6 +989,8 @@ def _crawl_worker(args: argparse.Namespace) -> int:
         if not hasattr(args, "workers"):
             args.workers = 1
             args.queue_db = ""
+            args.broker_url = ""
+            args.broker_token = ""
             args.poll_interval = 15.0
             args.batch_size = 6
             args.claim_ttl = 900
@@ -964,6 +998,8 @@ def _crawl_worker(args: argparse.Namespace) -> int:
         record = manager.start(
             worker_count=args.workers,
             queue_db_path=args.queue_db or None,
+            broker_url=args.broker_url or None,
+            broker_token=args.broker_token or None,
             poll_interval_seconds=args.poll_interval,
             batch_size=args.batch_size,
             claim_ttl_seconds=args.claim_ttl,
@@ -975,6 +1011,8 @@ def _crawl_worker(args: argparse.Namespace) -> int:
         record = manager.supervise(
             worker_count=args.workers,
             queue_db_path=args.queue_db or None,
+            broker_url=args.broker_url or None,
+            broker_token=args.broker_token or None,
             poll_interval_seconds=args.poll_interval,
             batch_size=args.batch_size,
             claim_ttl_seconds=args.claim_ttl,
@@ -985,9 +1023,12 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             print(json.dumps(asdict(record), indent=2))
         return 0
     if args.crawl_worker_command == "run":
+        os.environ["AGENTOS_CRAWL_WORKER_PROCESS"] = "1"
         engine = DeepResearchEngine(
             workspace_root=args.workspace_root,
             research_state_path=(args.queue_db or None),
+            crawl_broker_url=(args.broker_url or None),
+            crawl_broker_token=(args.broker_token or None),
         )
         worker = ResearchCrawlWorker(
             engine,
@@ -1004,6 +1045,29 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             return 0
         worker.run_forever()
         return 0
+    if args.crawl_worker_command == "broker":
+        subcommand = args.crawl_worker_broker_command
+        if subcommand == "status":
+            engine = DeepResearchEngine(
+                crawl_broker_url=args.broker_url,
+                crawl_broker_token=(args.broker_token or None),
+            )
+            print(json.dumps(engine.crawl_broker_status(), indent=2))
+            return 0
+        if subcommand == "serve":
+            broker = CrawlBrokerServer(
+                workspace_root=args.workspace_root,
+                host=args.host,
+                port=args.port,
+                queue_db_path=(args.queue_db or None),
+                auth_token=args.auth_token,
+            )
+            print(json.dumps(asdict(broker.start()), indent=2))
+            broker.serve_forever()
+            return 0
+        raise ValueError(
+            f"Unknown crawl worker broker command: {subcommand}"
+        )
     if args.crawl_worker_command == "service":
         subcommand = args.crawl_worker_service_command
         if subcommand == "status":
@@ -1019,15 +1083,15 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             print(json.dumps(asdict(service_manager.uninstall()), indent=2))
             return 0
         if subcommand == "start":
-            service_record = service_manager.start(
-                task_name=args.task_name or None
-            )
+            service_record = service_manager.start(task_name=args.task_name or None)
             print(json.dumps(asdict(service_record), indent=2))
             return 0
         if subcommand == "install":
             service_record = service_manager.install(
                 worker_count=args.workers,
                 queue_db_path=args.queue_db or None,
+                broker_url=args.broker_url or None,
+                broker_token=args.broker_token or None,
                 poll_interval_seconds=args.poll_interval,
                 batch_size=args.batch_size,
                 claim_ttl_seconds=args.claim_ttl,
@@ -1037,12 +1101,8 @@ def _crawl_worker(args: argparse.Namespace) -> int:
             )
             print(json.dumps(asdict(service_record), indent=2))
             return 0
-        raise ValueError(
-            f"Unknown crawl worker service command: {subcommand}"
-        )
-    raise ValueError(
-        f"Unknown crawl worker command: {args.crawl_worker_command}"
-    )
+        raise ValueError(f"Unknown crawl worker service command: {subcommand}")
+    raise ValueError(f"Unknown crawl worker command: {args.crawl_worker_command}")
 
 
 def _json_or_text(value: str) -> object:
