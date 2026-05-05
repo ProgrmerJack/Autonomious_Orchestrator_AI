@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import io
 import inspect
 import json
 import os
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from PIL import Image, ImageDraw
 
 from .authorization import AuthorizationMiddleware
 from .approvals import ApprovalRequired
 from .checkpoint import CheckpointStore
 from .events import EventBus
 from .types import ActionRequest, TaskSpec, WorkerResult, new_id
+from agentos_orchestrator.cognition.frontier_api import (
+    FrontierClient,
+    FrontierPrompt,
+    default_provider_from_env,
+)
 from agentos_orchestrator.os_control import WindowsUiaBackend
 from agentos_orchestrator.os_control.base import (
     BackendUnavailable,
@@ -45,6 +55,48 @@ class SupervisorAgent:
 
     agent_id = "supervisor"
 
+    def _normalize_selected_roles(
+        self,
+        proposed_roles: list[str],
+        objective: str,
+        effort: str,
+        needs_pc_context: bool,
+    ) -> list[str]:
+        allowed = {
+            "planning",
+            "pc-control",
+            "pc-research",
+            "literature",
+            "data",
+            "synthesis",
+        }
+        roles: list[str] = []
+        for role in proposed_roles:
+            if role in allowed and role not in roles:
+                roles.append(role)
+
+        def _insert_before(anchor: str, role: str) -> None:
+            if role in roles:
+                return
+            try:
+                index = roles.index(anchor)
+            except ValueError:
+                roles.append(role)
+            else:
+                roles.insert(index, role)
+
+        if self._needs_planning_role(objective, effort, needs_pc_context):
+            if "planning" not in roles:
+                roles.insert(0, "planning")
+        if needs_pc_context and "pc-control" not in roles:
+            _insert_before("literature", "pc-control")
+        if self._needs_active_pc_research(objective, effort, needs_pc_context):
+            _insert_before("literature", "pc-research")
+        for role in ("literature", "data", "synthesis"):
+            if role not in roles:
+                roles.append(role)
+        return roles
+
     def _adaptive_plan_roles(
         self, objective: str, effort: str, needs_pc_context: bool
     ) -> list[str]:
@@ -53,7 +105,9 @@ class SupervisorAgent:
             "determine which agent roles are needed to accomplish it. The available "
             "roles are: 'planning' (for complex strategy), 'pc-control' "
             "(if pulling live host data, interacting with a local application, or running a local script), "
-            "'pc-research' (for sandbox browser research to find and analyze websites), "
+            "'pc-research' (for sandbox browser and terminal research whenever live websites, official docs, "
+            "vendor pages, product pages, rankings, current web evidence, or direct browser exploration would "
+            "materially improve coverage or reduce source monoculture), "
             "'literature' (for scholarly APIs and general search), "
             "'data' (for constraint extraction), and 'synthesis' (for merging outputs). "
             "Respond ONLY with a valid JSON array of role strings in execution order."
@@ -66,31 +120,29 @@ class SupervisorAgent:
             if start >= 0 and end > start:
                 roles = json.loads(raw[start:end])
                 if isinstance(roles, list) and roles:
-                    return [
-                        r
-                        for r in roles
-                        if r
-                        in {
-                            "planning",
-                            "pc-control",
-                            "pc-research",
-                            "literature",
-                            "data",
-                            "synthesis",
-                        }
-                    ]
+                    return self._normalize_selected_roles(
+                        list(roles),
+                        objective,
+                        effort,
+                        needs_pc_context,
+                    )
         except Exception:
             pass
 
         roles = []
-        if effort == "multi-hour":
+        if self._needs_planning_role(objective, effort, needs_pc_context):
             roles.append("planning")
         if needs_pc_context:
             roles.append("pc-control")
         if self._needs_active_pc_research(objective, effort, needs_pc_context):
             roles.append("pc-research")
         roles.extend(["literature", "data", "synthesis"])
-        return roles
+        return self._normalize_selected_roles(
+            roles,
+            objective,
+            effort,
+            needs_pc_context,
+        )
 
     def plan(self, objective: str) -> list[TaskSpec]:
         planning_id = new_id("task_planning")
@@ -317,6 +369,26 @@ class SupervisorAgent:
             )
         )
 
+    def _needs_planning_role(
+        self,
+        objective: str,
+        effort: str,
+        needs_pc_context: bool,
+    ) -> bool:
+        if effort == "multi-hour" or needs_pc_context:
+            return True
+        if self._needs_active_pc_research(objective, effort, needs_pc_context):
+            return True
+        analysis = WorkerAgent._heuristic_objective_analysis(objective)
+        profile = analysis.get("profile") or {}
+        try:
+            complexity = int(analysis.get("complexity_score") or 0)
+        except (TypeError, ValueError):
+            complexity = 0
+        return complexity >= 7 and any(
+            bool(profile.get(key)) for key in ("comparison", "risk", "current")
+        )
+
     @staticmethod
     def _needs_pc_context(objective: str) -> bool:
         lower = objective.lower()
@@ -347,15 +419,44 @@ class SupervisorAgent:
         return DeepResearchEngine.research_depth_for_objective(objective)
 
     @staticmethod
+    def _has_explicit_current_web_cues(objective: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(as of now|right now|current(?:ly)?|latest|today|recent|near-term|newest|this week|this month|this year|live|breaking|ongoing)\b",
+                objective,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
     def _needs_active_pc_research(
         objective: str,
         effort: str,
         needs_pc_context: bool,
     ) -> bool:
+        score = SupervisorAgent._pc_research_signal_score(
+            objective,
+            effort,
+            needs_pc_context,
+        )
+        if score >= 3:
+            return True
         lower = objective.lower()
-        current_web_mode = DeepResearchEngine._looks_like_current_evidence_query(
+        current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
             objective
         ) and not DeepResearchEngine._looks_like_academic_query(objective)
+        comparison_mode = bool(
+            re.search(
+                r"\b(compare|comparison|versus|vs\.?|rank|ranking|best|alternatives)\b",
+                lower,
+            )
+        )
+        risk_mode = bool(
+            re.search(
+                r"\b(risk|risks|downside|uncertaint|failure|vulnerab|hazard|trade[- ]?off)\b",
+                lower,
+            )
+        )
         strong_signals = {
             "browser research",
             "pc research",
@@ -387,18 +488,70 @@ class SupervisorAgent:
         }
         strong_hits = sum(1 for token in strong_signals if token in lower)
         weak_hits = sum(1 for token in weak_signals if token in lower)
-        effort_boost = 1 if effort == "multi-hour" else 0
-        context_boost = 1 if needs_pc_context else 0
-        score = strong_hits * 2 + weak_hits + effort_boost + context_boost
         has_explicit_browser_intent = any(
             token in lower for token in explicit_sandbox_signals
         )
-        if effort == "multi-hour" and current_web_mode:
-            # Deep market/web research always benefits from a live browser pass.
+        if current_web_mode:
+            # Time-sensitive web research should always get an active browser pass.
             return True
-        if not has_explicit_browser_intent and strong_hits == 0:
-            return False
-        return score >= 3
+        if comparison_mode and not DeepResearchEngine._looks_like_academic_query(
+            objective
+        ):
+            return True
+        if effort == "multi-hour" and risk_mode and not DeepResearchEngine._looks_like_academic_query(
+            objective
+        ):
+            return True
+        if has_explicit_browser_intent and (strong_hits > 0 or weak_hits > 0):
+            return True
+        return False
+
+    @staticmethod
+    def _pc_research_signal_score(
+        objective: str,
+        effort: str,
+        needs_pc_context: bool,
+    ) -> int:
+        lower = objective.lower()
+        analysis = WorkerAgent._heuristic_objective_analysis(objective)
+        profile = analysis.get("profile") or {}
+        try:
+            complexity = int(analysis.get("complexity_score") or 0)
+        except (TypeError, ValueError):
+            complexity = 0
+
+        score = 0
+        if effort == "multi-hour":
+            score += 3
+        if needs_pc_context:
+            score += 2
+        if complexity >= 7:
+            score += 2
+        elif complexity >= 5:
+            score += 1
+        if bool(profile.get("comparison")):
+            score += 2
+        if bool(profile.get("risk")):
+            score += 2
+        if not bool(profile.get("academic")):
+            score += 1
+        if SupervisorAgent._needs_implementation_constraints(objective):
+            score += 1
+        if DeepResearchEngine._looks_like_software_agent_query(objective):
+            score += 3
+        if re.search(
+            r"\b(evidence|source-backed|sources|official|documentation|docs|vendor|release notes|benchmark|report|filing|specification|website|web data|primary source)\b",
+            lower,
+            flags=re.IGNORECASE,
+        ):
+            score += 1
+        if re.search(
+            r"\b(sandbox|sandboxed|browser automation|browse the web|search online|open website|visit website|navigate to)\b",
+            lower,
+            flags=re.IGNORECASE,
+        ):
+            score += 2
+        return score
 
 
 class WorkerAgent:
@@ -411,12 +564,18 @@ class WorkerAgent:
         research_engine: DeepResearchEngine | None = None,
         pc_backend: Any | None = None,
         authorization: AuthorizationMiddleware | None = None,
+        frontier_client: FrontierClient | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.checkpoints = checkpoints
         self.research_engine = research_engine or DeepResearchEngine()
         self.pc_backend = pc_backend
         self.authorization = authorization
+        self.frontier_client = (
+            frontier_client
+            if frontier_client is not None
+            else default_provider_from_env()
+        )
 
     def run(
         self,
@@ -579,6 +738,7 @@ class WorkerAgent:
             "Following citations and perspective-specific leads surfaces non-obvious evidence.",
             "Claim-level trace constraints reduce unsupported synthesis.",
         ]
+        browser_research = self._planning_browser_research(objective, analysis)
 
         plan = {
             "objective": objective,
@@ -587,6 +747,7 @@ class WorkerAgent:
             "hypotheses": hypotheses,
             "created_by": "planning-worker",
             "ai_analysis": analysis,
+            "browser_research": browser_research,
         }
         artifact = self._write_planning_artifact(run_id, plan)
         return WorkerResult(
@@ -606,6 +767,75 @@ class WorkerAgent:
             ],
             confidence=0.9,
         )
+
+    def _planning_browser_research(
+        self,
+        objective: str,
+        analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        depth = DeepResearchEngine.research_depth_for_objective(objective)
+        core_query = DeepResearchEngine._query_from_objective(objective)
+        ai_strategy: dict[str, Any] = {}
+        strategy_builder = getattr(self.research_engine, "_ai_research_strategy", None)
+        if callable(strategy_builder):
+            try:
+                ai_strategy = strategy_builder(objective, core_query, depth) or {}
+            except Exception:
+                ai_strategy = {}
+
+        search_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for candidate in list(ai_strategy.get("reasoning_queries") or []) + list(
+            self._browser_objective_queries(objective)
+        ) + [core_query]:
+            query_text = str(candidate or "").strip()[:240]
+            if not query_text:
+                continue
+            normalized = DeepResearchEngine._normalize_title(query_text)
+            if not normalized or normalized in seen_queries:
+                continue
+            seen_queries.add(normalized)
+            search_queries.append(query_text)
+
+        seed_urls: list[str] = []
+        seen_seed_urls: set[str] = set()
+        for candidate in ai_strategy.get("authoritative_domains") or []:
+            normalized_url = self._planning_seed_url(candidate)
+            if not normalized_url or normalized_url in seen_seed_urls:
+                continue
+            seen_seed_urls.add(normalized_url)
+            seed_urls.append(normalized_url)
+
+        current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
+            objective
+        ) and not DeepResearchEngine._looks_like_academic_query(objective)
+        query_limit = 12 if depth == "multi-hour" or current_web_mode else 6
+        return {
+            "enabled": SupervisorAgent._needs_active_pc_research(
+                objective,
+                depth,
+                False,
+            ),
+            "search_queries": search_queries[:query_limit],
+            "seed_urls": seed_urls[:8],
+            "authoritative_domains": list(ai_strategy.get("authoritative_domains") or [])[
+                :12
+            ],
+            "profile": analysis.get("profile") or {},
+        }
+
+    @staticmethod
+    def _planning_seed_url(candidate: Any) -> str | None:
+        text = str(candidate or "").strip().rstrip("/")
+        if not text:
+            return None
+        if not re.match(r"^[a-z]+://", text, flags=re.IGNORECASE):
+            text = f"https://{text.lstrip('/')}"
+        if not DeepResearchEngine._is_safe_public_url(text):
+            return None
+        if DeepResearchEngine._is_search_result_url(text):
+            return None
+        return text
 
     def _ai_analyze_objective(self, objective: str) -> dict[str, Any]:
         """Ask AI to reason about the objective's complexity, requirements, and profile."""
@@ -784,7 +1014,7 @@ class WorkerAgent:
         complexity = max(1, min(complexity, 10))
 
         multi_hour = "[multi-hour]" in lower
-        max_passes = 48 if multi_hour else (10 if complexity >= 7 else 6)
+        max_passes = 120 if multi_hour else (18 if complexity >= 7 else 8)
         min_sources = 20 if multi_hour else (12 if complexity >= 7 else 8)
         min_providers = 3 if complexity >= 7 else 2
         min_scholarly = 0 if current else (3 if complexity >= 7 else 2)
@@ -816,7 +1046,8 @@ class WorkerAgent:
 
     @staticmethod
     def _multi_hour_max_retrieval_passes(min_runtime_seconds: int) -> int:
-        return 48
+        del min_runtime_seconds
+        return 120
 
     @staticmethod
     def _multi_hour_min_depth_passes() -> int:
@@ -878,9 +1109,16 @@ class WorkerAgent:
         prior_results: list[WorkerResult],
     ) -> WorkerResult:
         backend = self._sandbox_pc_backend()
+        planning_context = self._latest_planning_context(prior_results) or {}
+        browser_plan = planning_context.get("browser_research") or {}
         urls = self._candidate_urls_from_sources(prior_results)
         if not urls:
             urls = self._planning_urls_from_objective(task.objective)
+        navigation_limit = self._pc_browser_navigation_limit(
+            task.objective,
+            urls,
+            browser_plan,
+        )
 
         action = ActionRequest(
             agent_id="pc-research-agent",
@@ -888,7 +1126,10 @@ class WorkerAgent:
             target="sandbox://virtual-desktop/browser-research",
             payload={
                 "action": "browse",
-                "urls": urls[:3],
+                "urls": urls[:navigation_limit],
+                "max_navigation_urls": navigation_limit,
+                "search_queries": list(browser_plan.get("search_queries") or [])[:12],
+                "seed_urls": list(browser_plan.get("seed_urls") or [])[:8],
             },
         )
         # When the active backend is already a virtual/sandboxed environment, no
@@ -929,10 +1170,14 @@ class WorkerAgent:
                 backend_name,
                 interrupt_report,
                 workspace_report,
-            ) = self._run_pc_browser_actions(
+                browser_findings,
+            ) = self._run_pc_browser_frontier_session(
+                run_id,
+                task.objective,
                 backend,
                 urls,
-                run_id=run_id,
+                browser_plan,
+                navigation_limit,
             )
         except (BackendUnavailable, OSError, RuntimeError, ValueError) as exc:
             artifact = self._write_pc_findings_artifact(
@@ -961,11 +1206,6 @@ class WorkerAgent:
 
         names = [node.name for node in post_nodes if node.name][:10]
         panel_summary = self._panel_region_summary(post_nodes)
-        browser_findings = self._reasoned_browser_findings(
-            task.objective,
-            urls,
-            backend=backend,
-        )
         direct_urls = list(browser_findings.get("direct_urls") or [])
         if not direct_urls:
             direct_urls = list(urls[:3])
@@ -1021,10 +1261,944 @@ class WorkerAgent:
             confidence=0.78 if direct_urls else 0.68,
         )
 
+    @staticmethod
+    def _pc_browser_navigation_limit(
+        objective: str,
+        urls: list[str],
+        browser_plan: dict[str, Any] | None = None,
+    ) -> int:
+        safe_urls = [
+            str(url).strip()
+            for url in urls
+            if isinstance(url, str) and str(url).strip()
+        ]
+        candidate_count = len(safe_urls)
+        if candidate_count == 0:
+            return 5
+        query_count = 0
+        if isinstance(browser_plan, dict):
+            query_count = len(
+                [
+                    str(item).strip()
+                    for item in (browser_plan.get("search_queries") or [])
+                    if str(item).strip()
+                ]
+            )
+        if WorkerAgent._pc_browser_expansive_mode(objective, browser_plan):
+            adaptive_target = max(candidate_count, query_count * 2, 12)
+            return max(12, min(adaptive_target, 24))
+        if candidate_count >= 8 or query_count >= 5:
+            return min(candidate_count, 8)
+        return min(candidate_count, 5)
+
+    @staticmethod
+    def _pc_browser_cycle_count(
+        objective: str,
+        browser_plan: dict[str, Any] | None = None,
+    ) -> int:
+        query_count = 0
+        if isinstance(browser_plan, dict):
+            query_count = len(browser_plan.get("search_queries") or [])
+        if WorkerAgent._pc_browser_expansive_mode(objective, browser_plan):
+            return max(4, min(10, 2 + max(1, query_count // 4)))
+        if query_count >= 6:
+            return min(4, 1 + (query_count // 4))
+        return 1
+
+    @staticmethod
+    def _pc_parallel_browser_worker_count(
+        objective: str,
+        backend: Any,
+        frontier_urls: list[str],
+    ) -> int:
+        if not isinstance(backend, VirtualDesktopSandboxBackend):
+            return 1
+        if WorkerAgent._pc_browser_expansive_mode(objective):
+            return max(1, min(6, len(frontier_urls) // 4 or 1))
+        if len(frontier_urls) >= 8:
+            return min(3, max(2, len(frontier_urls) // 5))
+        return 1
+
+    @staticmethod
+    def _pc_browser_batch_limit(
+        objective: str,
+        navigation_limit: int,
+    ) -> int:
+        if WorkerAgent._pc_browser_expansive_mode(objective):
+            return max(6, min(int(navigation_limit or 1), 16))
+        return max(2, min(int(navigation_limit or 1), 8))
+
+    @staticmethod
+    def _pc_browser_expansive_mode(
+        objective: str,
+        browser_plan: dict[str, Any] | None = None,
+    ) -> bool:
+        current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
+            objective
+        ) and not DeepResearchEngine._looks_like_academic_query(objective)
+        depth = DeepResearchEngine.research_depth_for_objective(objective)
+        if depth == "multi-hour" or current_web_mode:
+            return True
+        if DeepResearchEngine._looks_like_software_agent_query(objective):
+            return True
+        browser_enabled = bool((browser_plan or {}).get("enabled"))
+        query_count = len((browser_plan or {}).get("search_queries") or [])
+        signal_score = SupervisorAgent._pc_research_signal_score(
+            objective,
+            depth,
+            False,
+        )
+        return browser_enabled or query_count >= 6 or signal_score >= 5
+
+    @staticmethod
+    def _empty_browser_findings() -> dict[str, Any]:
+        return {
+            "search_queries": [],
+            "judged_results": [],
+            "direct_urls": [],
+            "discovered_domains": [],
+            "candidate_urls": [],
+            "search_result_count": 0,
+            "frontier": {},
+            "terminal_verifications": [],
+        }
+
+    def _run_pc_browser_frontier_session(
+        self,
+        run_id: str,
+        objective: str,
+        backend: Any,
+        urls: list[str],
+        browser_plan: dict[str, Any],
+        navigation_limit: int,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[UiNode],
+        str,
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        frontier_graph = self._load_frontier_graph(run_id)
+        frontier_queue = self._frontier_session_seed_urls(
+            urls,
+            browser_plan,
+            frontier_graph,
+        )
+        receipts: list[dict[str, Any]] = []
+        post_nodes = backend.snapshot()
+        backend_name = getattr(backend, "name", "virtual-desktop-sandbox")
+        interrupt_report: dict[str, Any] = {
+            "triggered": False,
+            "navigated_urls": [],
+            "reports": [],
+        }
+        workspace_report: dict[str, Any] = {"triggered": False}
+        combined_findings = self._empty_browser_findings()
+        checkpoints: list[dict[str, Any]] = []
+        worker_sessions: list[dict[str, Any]] = []
+        visited_urls: set[str] = set()
+        cycle_count = self._pc_browser_cycle_count(objective, browser_plan)
+        worker_count = self._pc_parallel_browser_worker_count(
+            objective,
+            backend,
+            frontier_queue,
+        )
+
+        for cycle_index in range(cycle_count):
+            cycle_batch_limit = self._pc_browser_batch_limit(
+                objective,
+                navigation_limit,
+            )
+            frontier_batch = [
+                url
+                for url in frontier_queue
+                if str(url).strip() and str(url).strip() not in visited_urls
+            ][: max(1, worker_count) * cycle_batch_limit]
+            if not frontier_batch:
+                break
+
+            batches = self._partition_frontier_urls(frontier_batch, worker_count)
+            worker_backends = self._pc_browser_worker_backends(
+                backend,
+                run_id,
+                len(batches),
+            )
+            batch_results: list[dict[str, Any]] = []
+            if len(batches) > 1:
+                with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+                    futures = [
+                        pool.submit(
+                            self._execute_browser_frontier_batch,
+                            worker_backends[index],
+                            objective,
+                            batch,
+                            browser_plan,
+                            run_id,
+                            cycle_index,
+                            f"worker-{index + 1}",
+                        )
+                        for index, batch in enumerate(batches)
+                    ]
+                    for future in futures:
+                        batch_results.append(future.result())
+            else:
+                batch_results.append(
+                    self._execute_browser_frontier_batch(
+                        worker_backends[0],
+                        objective,
+                        batches[0],
+                        browser_plan,
+                        run_id,
+                        cycle_index,
+                        "worker-1",
+                    )
+                )
+
+            cycle_findings = self._empty_browser_findings()
+            session_summary = {
+                "cycle": cycle_index + 1,
+                "worker_count": len(batch_results),
+                "batch_sizes": [len(result.get("batch_urls") or []) for result in batch_results],
+                "direct_urls": 0,
+                "judged_results": 0,
+            }
+            for result in batch_results:
+                receipts.extend(result.get("receipts") or [])
+                if result.get("post_nodes"):
+                    post_nodes = list(result["post_nodes"])
+                backend_name = str(result.get("backend_name") or backend_name)
+                if (result.get("workspace_report") or {}).get("triggered"):
+                    workspace_report = dict(result["workspace_report"])
+                batch_interrupt = result.get("interrupt_report") or {}
+                interrupt_report["triggered"] = bool(
+                    interrupt_report.get("triggered")
+                    or batch_interrupt.get("triggered")
+                )
+                interrupt_report.setdefault("reports", []).extend(
+                    list(batch_interrupt.get("reports") or [])
+                )
+                interrupt_report.setdefault("navigated_urls", []).extend(
+                    list(batch_interrupt.get("navigated_urls") or [])
+                )
+                cycle_findings = self._merge_browser_findings(
+                    cycle_findings,
+                    result.get("findings") or {},
+                )
+                combined_findings = self._merge_browser_findings(
+                    combined_findings,
+                    result.get("findings") or {},
+                )
+                visited_urls.update(
+                    str(url).strip() for url in (result.get("batch_urls") or [])
+                )
+            session_summary["direct_urls"] = len(
+                cycle_findings.get("direct_urls") or []
+            )
+            session_summary["judged_results"] = len(
+                cycle_findings.get("judged_results") or []
+            )
+            worker_sessions.append(session_summary)
+
+            frontier_graph = self._merge_browser_findings_into_frontier_graph(
+                frontier_graph,
+                cycle_findings,
+                run_id,
+                cycle_index,
+            )
+            checkpoint = self._browser_reasoning_checkpoint(
+                objective,
+                frontier_graph,
+                cycle_findings,
+                cycle_index,
+            )
+            checkpoints.append(checkpoint)
+            frontier_graph.setdefault("reasoning_checkpoints", []).append(
+                checkpoint
+            )
+            frontier_graph = self._merge_browser_checkpoint_into_frontier_graph(
+                frontier_graph,
+                checkpoint,
+                run_id,
+                cycle_index,
+            )
+            frontier_queue.extend(self._urls_from_browser_checkpoint(checkpoint))
+            frontier_queue.extend(
+                self._frontier_graph_seed_urls(
+                    frontier_graph,
+                    limit=max(16, cycle_batch_limit * 2),
+                )
+            )
+            frontier_queue = self._dedupe_public_urls(frontier_queue)
+            if not checkpoint.get("continue_research", True):
+                break
+
+        interrupt_report["navigated_urls"] = self._dedupe_public_urls(
+            list(interrupt_report.get("navigated_urls") or [])
+        )
+        graph_summary = self._frontier_graph_summary(frontier_graph)
+        combined_findings["frontier_graph"] = {
+            "path": str(self._run_frontier_graph_path(run_id)).replace("\\", "/"),
+            "summary": graph_summary,
+        }
+        combined_findings["frontier_checkpoints"] = checkpoints
+        combined_findings["worker_sessions"] = worker_sessions
+        combined_findings.setdefault("frontier", {}).update(
+            {
+                "persistent_graph": True,
+                "worker_count": worker_count,
+                "cycles": len(worker_sessions),
+                "graph_url_count": graph_summary.get("url_count", 0),
+                "graph_domain_count": graph_summary.get("domain_count", 0),
+            }
+        )
+        self._save_frontier_graph(run_id, frontier_graph)
+        return (
+            receipts,
+            post_nodes,
+            backend_name,
+            interrupt_report,
+            workspace_report,
+            combined_findings,
+        )
+
+    def _execute_browser_frontier_batch(
+        self,
+        backend: Any,
+        objective: str,
+        batch_urls: list[str],
+        browser_plan: dict[str, Any],
+        run_id: str,
+        cycle_index: int,
+        worker_label: str,
+    ) -> dict[str, Any]:
+        batch_run_id = (
+            f"{run_id}/pc-browser-{worker_label}-cycle-{cycle_index + 1}"
+            if run_id
+            else ""
+        )
+        batch_limit = max(
+            1,
+            min(
+                len(batch_urls),
+                self._pc_browser_batch_limit(objective, len(batch_urls)),
+            ),
+        )
+        frontier_state = {
+            "cycle": cycle_index + 1,
+            "worker": worker_label,
+            "batch_urls": batch_urls[:12],
+        }
+        (
+            receipts,
+            post_nodes,
+            backend_name,
+            interrupt_report,
+            workspace_report,
+        ) = self._run_pc_browser_actions(
+            backend,
+            batch_urls,
+            run_id=batch_run_id,
+            navigation_limit=batch_limit,
+            objective=objective,
+            frontier_state=frontier_state,
+        )
+        findings = self._reasoned_browser_findings(
+            objective,
+            batch_urls,
+            browser_plan=browser_plan,
+            backend=backend,
+        )
+        return {
+            "batch_urls": list(batch_urls),
+            "receipts": receipts,
+            "post_nodes": post_nodes,
+            "backend_name": backend_name,
+            "interrupt_report": interrupt_report,
+            "workspace_report": workspace_report,
+            "findings": findings,
+        }
+
+    def _persistent_frontier_graph_path(self) -> Path:
+        path = Path(".agentos") / "browser_frontier_graph.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _run_frontier_graph_path(run_id: str) -> Path:
+        path = Path("runs") / run_id / "pc" / "frontier_graph.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _empty_frontier_graph() -> dict[str, Any]:
+        return {
+            "version": 1,
+            "urls": {},
+            "domains": {},
+            "claims": {},
+            "contradictions": [],
+            "reasoning_checkpoints": [],
+            "runs": {},
+            "last_updated": "",
+        }
+
+    def _load_frontier_graph(self, run_id: str) -> dict[str, Any]:
+        path = self._persistent_frontier_graph_path()
+        if not path.exists():
+            graph = self._empty_frontier_graph()
+        else:
+            try:
+                graph = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                graph = self._empty_frontier_graph()
+        graph.setdefault("runs", {}).setdefault(run_id, {})
+        return graph
+
+    def _save_frontier_graph(self, run_id: str, graph: dict[str, Any]) -> None:
+        graph["last_updated"] = datetime.now(UTC).isoformat()
+        persistent_path = self._persistent_frontier_graph_path()
+        persistent_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+        self._run_frontier_graph_path(run_id).write_text(
+            json.dumps(graph, indent=2),
+            encoding="utf-8",
+        )
+
+    def _frontier_session_seed_urls(
+        self,
+        urls: list[str],
+        browser_plan: dict[str, Any],
+        frontier_graph: dict[str, Any],
+    ) -> list[str]:
+        seeds: list[str] = []
+        seeds.extend(str(url) for url in (browser_plan.get("seed_urls") or []))
+        seeds.extend(urls)
+        seeds.extend(
+            self._planning_browser_urls({"browser_research": browser_plan})
+        )
+        seed_limit = max(
+            16,
+            min(
+                48,
+                len(seeds) + (len(browser_plan.get("search_queries") or []) * 2),
+            ),
+        )
+        seeds.extend(self._frontier_graph_seed_urls(frontier_graph, limit=seed_limit))
+        return self._dedupe_public_urls(seeds)
+
+    def _frontier_graph_seed_urls(
+        self,
+        frontier_graph: dict[str, Any],
+        limit: int = 8,
+    ) -> list[str]:
+        ranked = sorted(
+            list((frontier_graph.get("urls") or {}).values()),
+            key=lambda item: (
+                float(item.get("priority") or 0.0),
+                -int(item.get("visits") or 0),
+            ),
+            reverse=True,
+        )
+        urls: list[str] = []
+        for item in ranked:
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            if int(item.get("visits") or 0) > 0 and str(item.get("status") or "") == "judged":
+                continue
+            urls.append(url)
+            if len(urls) >= limit:
+                break
+        return self._dedupe_public_urls(urls)
+
+    def _merge_browser_checkpoint_into_frontier_graph(
+        self,
+        frontier_graph: dict[str, Any],
+        checkpoint: dict[str, Any],
+        run_id: str,
+        cycle_index: int,
+    ) -> dict[str, Any]:
+        contradictions = frontier_graph.setdefault("contradictions", [])
+        runs = frontier_graph.setdefault("runs", {})
+        run_entry = runs.setdefault(run_id, {})
+        run_entry.setdefault("checkpoint_cycles", []).append(cycle_index + 1)
+
+        for contradiction in checkpoint.get("contradictions") or []:
+            text = str(contradiction or "").strip()
+            if not text:
+                continue
+            normalized = DeepResearchEngine._normalize_title(text)
+            if any(
+                DeepResearchEngine._normalize_title(str(item.get("text") or ""))
+                == normalized
+                for item in contradictions
+                if isinstance(item, dict)
+            ):
+                continue
+            contradictions.append(
+                {
+                    "text": text[:320],
+                    "run_id": run_id,
+                    "cycle": cycle_index + 1,
+                }
+            )
+
+        frontier_urls = frontier_graph.setdefault("urls", {})
+        frontier_domains = frontier_graph.setdefault("domains", {})
+        for url in checkpoint.get("url_leads") or []:
+            clean_url = str(url or "").strip()
+            if not DeepResearchEngine._is_safe_public_url(clean_url):
+                continue
+            domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
+            entry = frontier_urls.setdefault(
+                clean_url,
+                {"url": clean_url, "domain": domain, "visits": 0},
+            )
+            entry["last_run"] = run_id
+            entry["last_cycle"] = cycle_index + 1
+            entry["status"] = "checkpoint-lead"
+            entry["priority"] = max(float(entry.get("priority") or 0.0), 0.72)
+            if domain:
+                domain_entry = frontier_domains.setdefault(
+                    domain,
+                    {"urls": [], "observations": 0},
+                )
+                if clean_url not in domain_entry["urls"]:
+                    domain_entry["urls"].append(clean_url)
+
+        for domain in checkpoint.get("domain_leads") or []:
+            clean_domain = str(domain or "").strip().lower().lstrip("www.")
+            if not clean_domain:
+                continue
+            domain_entry = frontier_domains.setdefault(
+                clean_domain,
+                {"urls": [], "observations": 0},
+            )
+            domain_entry["last_run"] = run_id
+            domain_entry["priority"] = max(
+                float(domain_entry.get("priority") or 0.0),
+                0.7,
+            )
+            if checkpoint.get("missing_evidence"):
+                domain_entry["missing_evidence"] = self._dedupe_list(
+                    list(domain_entry.get("missing_evidence") or [])
+                    + [
+                        str(item).strip()[:240]
+                        for item in (checkpoint.get("missing_evidence") or [])
+                        if str(item).strip()
+                    ]
+                )
+        return frontier_graph
+
+    @staticmethod
+    def _dedupe_public_urls(urls: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            clean = str(url or "").strip().rstrip(").,;]}>'\"")
+            if not clean:
+                continue
+            if not DeepResearchEngine._is_safe_public_url(clean):
+                continue
+            if clean in seen:
+                continue
+            seen.add(clean)
+            deduped.append(clean)
+        return deduped
+
+    @staticmethod
+    def _partition_frontier_urls(
+        urls: list[str],
+        worker_count: int,
+    ) -> list[list[str]]:
+        buckets: list[list[str]] = [[] for _ in range(max(1, worker_count))]
+        for index, url in enumerate(urls):
+            buckets[index % len(buckets)].append(url)
+        return [bucket for bucket in buckets if bucket]
+
+    def _pc_browser_worker_backends(
+        self,
+        backend: Any,
+        run_id: str,
+        worker_count: int,
+    ) -> list[Any]:
+        if worker_count <= 1 or not isinstance(backend, VirtualDesktopSandboxBackend):
+            return [backend]
+        workers: list[Any] = [backend]
+        for index in range(1, worker_count):
+            workers.append(
+                VirtualDesktopSandboxBackend(
+                    Path(".agentos")
+                    / f"virtual_browser_worker_{run_id}_{index + 1}.json"
+                )
+            )
+        return workers
+
+    def _merge_browser_findings(
+        self,
+        current: dict[str, Any],
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(current)
+        for key in (
+            "search_queries",
+            "direct_urls",
+            "candidate_urls",
+            "discovered_domains",
+            "terminal_verifications",
+        ):
+            merged[key] = self._dedupe_list(
+                list(current.get(key) or []) + list(update.get(key) or [])
+            )
+        merged["judged_results"] = self._dedupe_judged_results(
+            list(current.get("judged_results") or [])
+            + list(update.get("judged_results") or [])
+        )
+        merged["search_result_count"] = int(current.get("search_result_count") or 0) + int(
+            update.get("search_result_count") or 0
+        )
+        merged_frontier = dict(current.get("frontier") or {})
+        merged_frontier.update(update.get("frontier") or {})
+        merged["frontier"] = merged_frontier
+        return merged
+
+    @staticmethod
+    def _dedupe_list(items: list[Any]) -> list[Any]:
+        result: list[Any] = []
+        seen: set[str] = set()
+        for item in items:
+            key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else str(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _dedupe_judged_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            result.append(item)
+        return result
+
+    def _merge_browser_findings_into_frontier_graph(
+        self,
+        frontier_graph: dict[str, Any],
+        findings: dict[str, Any],
+        run_id: str,
+        cycle_index: int,
+    ) -> dict[str, Any]:
+        urls = frontier_graph.setdefault("urls", {})
+        domains = frontier_graph.setdefault("domains", {})
+        claims = frontier_graph.setdefault("claims", {})
+        run_entry = frontier_graph.setdefault("runs", {}).setdefault(run_id, {})
+        run_entry["last_cycle"] = cycle_index + 1
+        run_entry["last_updated"] = datetime.now(UTC).isoformat()
+
+        direct_urls = {
+            str(url).strip() for url in (findings.get("direct_urls") or []) if str(url).strip()
+        }
+        candidate_urls = [
+            str(url).strip()
+            for url in (findings.get("candidate_urls") or [])
+            if str(url).strip()
+        ]
+        judged_index = {
+            str(item.get("url") or "").strip(): item
+            for item in (findings.get("judged_results") or [])
+            if str(item.get("url") or "").strip()
+        }
+        verified_claims = {
+            DeepResearchEngine._normalize_title(str(item.get("claim") or ""))
+            for item in (findings.get("terminal_verifications") or [])
+            if str(item.get("claim") or "").strip()
+            and int(item.get("exit_code") or 1) == 0
+        }
+
+        for url in candidate_urls:
+            domain = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+            entry = urls.setdefault(url, {"url": url, "domain": domain, "visits": 0})
+            entry["last_run"] = run_id
+            entry["last_cycle"] = cycle_index + 1
+            entry["status"] = "direct" if url in direct_urls else "candidate"
+            entry["priority"] = max(
+                float(entry.get("priority") or 0.0),
+                0.9 if url in direct_urls else 0.55,
+            )
+            if url in direct_urls:
+                entry["visits"] = int(entry.get("visits") or 0) + 1
+            judged = judged_index.get(url) or {}
+            if judged:
+                entry["title"] = str(judged.get("title") or entry.get("title") or "")[:200]
+                entry["judgment"] = str(judged.get("judgment") or "")[:400]
+                entry["quality_flags"] = self._dedupe_list(
+                    list(entry.get("quality_flags") or [])
+                    + list(judged.get("quality_flags") or [])
+                )
+                evidence_claims = [
+                    str(claim).strip()[:400]
+                    for claim in (judged.get("evidence_claims") or [])
+                    if str(claim).strip()
+                ]
+                entry["evidence_claims"] = self._dedupe_list(
+                    list(entry.get("evidence_claims") or []) + evidence_claims
+                )
+                contradiction_risk = self.research_engine._contradiction_risk(
+                    f"{judged.get('judgment') or ''} {' '.join(evidence_claims[:3])}"
+                )
+                entry["contradiction_risk"] = max(
+                    float(entry.get("contradiction_risk") or 0.0),
+                    float(contradiction_risk),
+                )
+                for claim in evidence_claims:
+                    claim_key = DeepResearchEngine._normalize_title(claim)
+                    if not claim_key:
+                        continue
+                    claim_entry = claims.setdefault(
+                        claim_key,
+                        {"claim": claim, "sources": [], "verified_count": 0},
+                    )
+                    if url not in claim_entry["sources"]:
+                        claim_entry["sources"].append(url)
+                    if claim_key in verified_claims:
+                        claim_entry["verified_count"] = int(
+                            claim_entry.get("verified_count") or 0
+                        ) + 1
+            if domain:
+                domain_entry = domains.setdefault(domain, {"urls": [], "observations": 0})
+                if url not in domain_entry["urls"]:
+                    domain_entry["urls"].append(url)
+                domain_entry["observations"] = int(domain_entry.get("observations") or 0) + 1
+                domain_entry["last_run"] = run_id
+        return frontier_graph
+
+    def _browser_reasoning_checkpoint(
+        self,
+        objective: str,
+        frontier_graph: dict[str, Any],
+        findings: dict[str, Any],
+        cycle_index: int,
+    ) -> dict[str, Any]:
+        summary = {
+            "cycle": cycle_index + 1,
+            "frontier": self._frontier_graph_summary(frontier_graph),
+            "judged_results": [
+                {
+                    "title": str(item.get("title") or "")[:160],
+                    "url": str(item.get("url") or "")[:240],
+                    "judgment": str(item.get("judgment") or "")[:280],
+                    "evidence_claims": list(item.get("evidence_claims") or [])[:2],
+                }
+                for item in list(findings.get("judged_results") or [])[:16]
+            ],
+            "terminal_verifications": list(findings.get("terminal_verifications") or [])[:12],
+            "prior_contradictions": list(frontier_graph.get("contradictions") or [])[:12],
+        }
+        system = (
+            "You are a browser research coordinator. Based on the browser findings, "
+            "identify missing evidence, contradiction leads, and the best next "
+            "queries or URLs to pursue. Respond only with JSON."
+        )
+        user = (
+            f"Objective: {objective}\n"
+            f"Browser findings JSON: {json.dumps(summary, ensure_ascii=True)}\n\n"
+            "Return JSON with keys follow_up_queries, domain_leads, url_leads, "
+            "missing_evidence, contradictions, continue_research."
+        )
+        raw = self.research_engine._call_ai_text(system, user)
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(raw[start:end])
+                return {
+                    "cycle": cycle_index + 1,
+                    "follow_up_queries": self._dedupe_list(
+                        [str(item)[:240] for item in (parsed.get("follow_up_queries") or []) if str(item).strip()]
+                    )[:18],
+                    "domain_leads": self._dedupe_list(
+                        [str(item).strip() for item in (parsed.get("domain_leads") or []) if str(item).strip()]
+                    )[:16],
+                    "url_leads": self._dedupe_public_urls(
+                        [str(item).strip() for item in (parsed.get("url_leads") or []) if str(item).strip()]
+                    )[:16],
+                    "missing_evidence": self._dedupe_list(
+                        [str(item)[:240] for item in (parsed.get("missing_evidence") or []) if str(item).strip()]
+                    )[:16],
+                    "contradictions": self._dedupe_list(
+                        [str(item)[:280] for item in (parsed.get("contradictions") or []) if str(item).strip()]
+                    )[:16],
+                    "continue_research": bool(parsed.get("continue_research", True)),
+                }
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return self._browser_reasoning_checkpoint_fallback(
+            objective,
+            frontier_graph,
+            findings,
+            cycle_index,
+        )
+
+    def _browser_reasoning_checkpoint_fallback(
+        self,
+        objective: str,
+        frontier_graph: dict[str, Any],
+        findings: dict[str, Any],
+        cycle_index: int,
+    ) -> dict[str, Any]:
+        judged_results = list(findings.get("judged_results") or [])
+        direct_domains = {
+            urllib.parse.urlparse(str(url)).netloc.lower().lstrip("www.")
+            for url in (findings.get("direct_urls") or [])
+            if str(url).strip()
+        }
+        candidate_urls = [
+            str(url).strip()
+            for url in (findings.get("candidate_urls") or [])
+            if str(url).strip()
+        ]
+        url_leads = [
+            url
+            for url in candidate_urls
+            if url not in (findings.get("direct_urls") or [])
+        ][:8]
+        domain_leads = self._dedupe_list(
+            [
+                urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+                for url in url_leads
+                if urllib.parse.urlparse(url).netloc
+                and urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+                not in direct_domains
+            ]
+        )[:6]
+
+        missing_evidence: list[str] = []
+        if len(direct_domains) < 2:
+            missing_evidence.append("Need broader domain coverage beyond the current browser pages.")
+        if not findings.get("terminal_verifications"):
+            missing_evidence.append("Need independent verification of browser-derived claims.")
+        if len(judged_results) < 3:
+            missing_evidence.append("Need more direct pages with substantive evidence extraction.")
+
+        contradictions: list[str] = []
+        follow_up_queries: list[str] = []
+        for result in judged_results[:6]:
+            title = str(result.get("title") or "").strip()
+            judgment = str(result.get("judgment") or "").strip()
+            evidence_claims = [
+                str(claim).strip()
+                for claim in (result.get("evidence_claims") or [])
+                if str(claim).strip()
+            ]
+            contradiction_risk = self.research_engine._contradiction_risk(
+                f"{judgment} {' '.join(evidence_claims[:3])}"
+            )
+            if contradiction_risk >= 0.3:
+                contradictions.append(
+                    f"Potential contradiction or unresolved uncertainty from {title[:80] or result.get('url')}."
+                )
+                follow_up_queries.append(
+                    (self.research_engine._query_core_terms(f"{title} counterevidence {objective}") or objective)[:240]
+                )
+            for claim in evidence_claims[:1]:
+                query_text = self.research_engine._query_core_terms(
+                    f"{title} {claim}"
+                )
+                if query_text and len(query_text.split()) >= 3:
+                    follow_up_queries.append(query_text[:240])
+        if not follow_up_queries and missing_evidence:
+            follow_up_queries.append(
+                (self.research_engine._query_core_terms(f"{objective} independent verification") or objective)[:240]
+            )
+        graph_contradictions = [
+            str(item.get("text") or "").strip()
+            for item in (frontier_graph.get("contradictions") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        for contradiction in graph_contradictions[:6]:
+            follow_up_queries.append(
+                (
+                    self.research_engine._query_core_terms(
+                        f"{objective} {contradiction} independent evidence"
+                    )
+                    or f"{objective} {contradiction}"
+                )[:240]
+            )
+        return {
+            "cycle": cycle_index + 1,
+            "follow_up_queries": self._dedupe_list(follow_up_queries)[:18],
+            "domain_leads": domain_leads[:16],
+            "url_leads": self._dedupe_public_urls(url_leads)[:16],
+            "missing_evidence": missing_evidence[:16],
+            "contradictions": self._dedupe_list(contradictions)[:16],
+            "continue_research": bool(
+                url_leads
+                or follow_up_queries
+                or missing_evidence
+                or graph_contradictions
+            ),
+        }
+
+    def _urls_from_browser_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> list[str]:
+        urls: list[str] = []
+        urls.extend(
+            self._dedupe_public_urls(
+                [str(url).strip() for url in (checkpoint.get("url_leads") or [])]
+            )
+        )
+        for domain in checkpoint.get("domain_leads") or []:
+            candidate = self._planning_seed_url(domain)
+            if candidate:
+                urls.append(candidate)
+        for query in checkpoint.get("follow_up_queries") or []:
+            query_text = str(query).strip()
+            if not query_text:
+                continue
+            urls.append(
+                "https://html.duckduckgo.com/html/?q="
+                + urllib.parse.quote_plus(query_text[:240])
+            )
+        return self._dedupe_public_urls(urls)
+
+    @staticmethod
+    def _frontier_graph_summary(frontier_graph: dict[str, Any]) -> dict[str, Any]:
+        urls = list((frontier_graph.get("urls") or {}).values())
+        ranked_urls = sorted(
+            urls,
+            key=lambda item: float(item.get("priority") or 0.0),
+            reverse=True,
+        )
+        domains = list((frontier_graph.get("domains") or {}).items())
+        ranked_domains = sorted(
+            domains,
+            key=lambda item: (
+                float((item[1] or {}).get("priority") or 0.0),
+                int((item[1] or {}).get("observations") or 0),
+            ),
+            reverse=True,
+        )
+        return {
+            "url_count": len(urls),
+            "domain_count": len(frontier_graph.get("domains") or {}),
+            "claim_count": len(frontier_graph.get("claims") or {}),
+            "contradiction_count": len(frontier_graph.get("contradictions") or []),
+            "top_urls": [str(item.get("url") or "") for item in ranked_urls[:6]],
+            "top_domains": [str(domain) for domain, _payload in ranked_domains[:10]],
+        }
+
     def _reasoned_browser_findings(
         self,
         objective: str,
         urls: list[str],
+        browser_plan: dict[str, Any] | None = None,
         backend: Any | None = None,
     ) -> dict[str, Any]:
         """Perform scientist-grade browser-based research.
@@ -1038,7 +2212,11 @@ class WorkerAgent:
         5. Extracts specific evidence claims from the content.
         6. Records an AI-reasoned judgment explaining WHY each source matters.
         """
-        queries = self._browser_search_queries(objective, urls)
+        queries = self._browser_search_queries(
+            objective,
+            urls,
+            list((browser_plan or {}).get("search_queries") or []),
+        )
         core_query = DeepResearchEngine._query_from_objective(objective)
 
         source_strategy = self._ai_browser_source_strategy(objective)
@@ -1086,12 +2264,47 @@ class WorkerAgent:
             except Exception:
                 continue
 
-        deduped_results = self.research_engine._dedupe_sources(raw_results)
+        navigation_seed_sources: list[ResearchSource] = []
+        seen_navigation_urls: set[str] = set()
+        navigation_seed_limit = max(4, int(budget["max_direct_urls"]) // 8)
+        for url in urls[:navigation_seed_limit]:
+            clean_url = str(url or "").strip()
+            if not DeepResearchEngine._is_safe_public_url(clean_url):
+                continue
+            if DeepResearchEngine._is_search_result_url(clean_url):
+                continue
+            if clean_url in seen_navigation_urls:
+                continue
+            seen_navigation_urls.add(clean_url)
+            domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
+            navigation_seed_sources.append(
+                ResearchSource(
+                    provider="pc-browser-research",
+                    title=self.research_engine._label_from_url(clean_url)[:160],
+                    url=clean_url,
+                    authors=[domain] if domain else [],
+                    abstract=(
+                        "Sandbox browser navigation seed captured from the active "
+                        "browser research context."
+                    ),
+                    score=96.0,
+                    evidence_grade="tool-observation",
+                    quality_flags=["browser-navigation-seed"],
+                )
+            )
+
+        deduped_results = self.research_engine._dedupe_sources(
+            navigation_seed_sources + raw_results
+        )
         ranked = self.research_engine._rank_sources(
             deduped_results,
             core_query,
         )
-        exploration_sources = list(ranked)
+        prioritized_navigation_urls = {source.url for source in navigation_seed_sources}
+        exploration_sources = list(navigation_seed_sources)
+        exploration_sources.extend(
+            source for source in ranked if source.url not in prioritized_navigation_urls
+        )
         minimum_frontier = 4 if int(budget["max_direct_urls"]) >= 40 else 2
         if len(exploration_sources) < minimum_frontier and deduped_results:
             ranked_urls = {
@@ -1184,6 +2397,7 @@ class WorkerAgent:
                     "evidence_claims": evidence_claims[:4],
                     "content_quality": quality,
                     "judgment": judgment,
+                    "quality_flags": list(source.quality_flags or []),
                 }
             )
             direct_urls.append(clean_url)
@@ -1269,19 +2483,19 @@ class WorkerAgent:
         is_market_query = DeepResearchEngine._looks_like_market_query(core_query)
         expansive_mode = is_multi_hour or current_web_mode
 
-        max_queries = min(query_count, 24 if expansive_mode else 12)
-        web_results_per_query = 12 if expansive_mode else 8
-        max_direct_urls = 80 if expansive_mode else 40
-        max_per_domain = 4 if expansive_mode or is_market_query else 2
-        returned_query_count = min(query_count, 12 if expansive_mode else 8)
-        candidate_urls = min(max(max_direct_urls * 2, 40), 240)
+        max_queries = min(query_count, 64 if expansive_mode else 16)
+        web_results_per_query = 16 if expansive_mode else 8
+        max_direct_urls = 180 if expansive_mode else 40
+        max_per_domain = 6 if expansive_mode or is_market_query else 2
+        returned_query_count = min(query_count, 32 if expansive_mode else 8)
+        candidate_urls = min(max(max_direct_urls * 4, 80), 960)
 
         return {
             "mode": "expansive" if expansive_mode else "standard",
             "max_queries": max(1, max_queries),
             "web_results_per_query": web_results_per_query,
-            "financial_results_per_query": 16 if expansive_mode else 10,
-            "sec_results_per_query": 10 if expansive_mode else 6,
+            "financial_results_per_query": 24 if expansive_mode else 10,
+            "sec_results_per_query": 16 if expansive_mode else 6,
             "max_direct_urls": max_direct_urls,
             "max_per_domain": max_per_domain,
             "returned_query_count": max(1, returned_query_count),
@@ -1292,8 +2506,13 @@ class WorkerAgent:
     def _browser_search_queries(
         objective: str,
         urls: list[str],
+        plan_queries: list[str] | None = None,
     ) -> list[str]:
         queries: list[str] = []
+        for query in plan_queries or []:
+            query_text = str(query or "").strip()
+            if query_text:
+                queries.append(query_text[:240])
         for url in urls:
             parsed = urllib.parse.urlparse(url)
             query_value = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
@@ -1319,12 +2538,19 @@ class WorkerAgent:
         fallback = DeepResearchEngine._query_from_objective(cleaned)
         if fallback:
             queries.append(fallback)
+        current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
+            cleaned
+        ) and not DeepResearchEngine._looks_like_academic_query(cleaned)
+        query_limit = 20 if "multi-hour" in objective.lower() or current_web_mode else 12
         deduped: list[str] = []
+        seen: set[str] = set()
         for query in queries:
             normalized = DeepResearchEngine._normalize_title(query)
-            if normalized and query not in deduped:
-                deduped.append(query[:240])
-        return deduped[:8]
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(query[:240])
+        return deduped[:query_limit]
 
     @staticmethod
     def _browser_objective_queries(cleaned: str) -> list[str]:
@@ -1568,7 +2794,7 @@ class WorkerAgent:
                     str(q)[:240]
                     for q in (parsed.get("targeted_queries") or [])
                     if str(q).strip()
-                ][:8]
+                ][:12]
                 return {
                     "authoritative_source_types": parsed.get(
                         "authoritative_source_types"
@@ -2046,11 +3272,36 @@ class WorkerAgent:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
+                urls.extend(WorkerAgent._planning_browser_urls(payload))
+                if urls:
+                    return urls
                 objective = str(payload.get("objective") or "")
                 urls.extend(WorkerAgent._planning_urls_from_objective(objective))
                 if urls:
                     return urls
         return urls
+
+    @staticmethod
+    def _planning_browser_urls(payload: dict[str, Any]) -> list[str]:
+        browser_plan = payload.get("browser_research") or {}
+        urls: list[str] = []
+        for item in browser_plan.get("seed_urls") or []:
+            normalized_url = WorkerAgent._planning_seed_url(item)
+            if normalized_url:
+                urls.append(normalized_url)
+        for item in browser_plan.get("search_queries") or []:
+            query_text = str(item or "").strip()
+            if not query_text:
+                continue
+            urls.append(
+                "https://html.duckduckgo.com/html/?q="
+                + urllib.parse.quote_plus(query_text[:240])
+            )
+        deduped: list[str] = []
+        for item in urls:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped[:40]
 
     @staticmethod
     def _planning_urls_from_objective(objective: str) -> list[str]:
@@ -2073,12 +3324,33 @@ class WorkerAgent:
         if cleaned:
             query = DeepResearchEngine._query_from_objective(cleaned)
             depth = DeepResearchEngine.research_depth_for_objective(cleaned)
-            variants = DeepResearchEngine._query_variants(query, depth) or [query]
-            for variant in variants[:2]:
+            current_web_mode = SupervisorAgent._has_explicit_current_web_cues(
+                cleaned
+            ) and not DeepResearchEngine._looks_like_academic_query(cleaned)
+            query_candidates = WorkerAgent._browser_objective_queries(cleaned)
+            if query:
+                query_candidates.append(query)
+            query_candidates.extend(DeepResearchEngine._query_variants(query, depth) or [query])
+            variants: list[str] = []
+            seen_variants: set[str] = set()
+            for candidate in query_candidates:
+                query_text = str(candidate or "").strip()[:240]
+                if not query_text:
+                    continue
+                normalized = DeepResearchEngine._normalize_title(query_text)
+                if not normalized or normalized in seen_variants:
+                    continue
+                seen_variants.add(normalized)
+                variants.append(query_text)
+            search_variant_limit = (
+                12 if depth == "multi-hour" or current_web_mode else 4
+            )
+            for variant in variants[:search_variant_limit]:
                 encoded = urllib.parse.quote_plus(variant)
                 urls.append(f"https://html.duckduckgo.com/html/?q={encoded}")
             if WorkerAgent._looks_like_repository_research(cleaned):
-                for variant in variants[:2]:
+                repo_limit = 6 if search_variant_limit > 6 else 2
+                for variant in variants[:repo_limit]:
                     encoded = urllib.parse.quote_plus(variant)
                     urls.append(
                         f"https://github.com/search?type=repositories&q={encoded}"
@@ -2087,7 +3359,8 @@ class WorkerAgent:
         for item in urls:
             if item not in deduped:
                 deduped.append(item)
-        return deduped[:8]
+        url_limit = 40 if depth == "multi-hour" or current_web_mode else 12
+        return deduped[:url_limit]
 
     @staticmethod
     def _looks_like_repository_research(objective: str) -> bool:
@@ -2240,6 +3513,9 @@ class WorkerAgent:
         backend: Any,
         urls: list[str],
         run_id: str = "",
+        navigation_limit: int = 5,
+        objective: str = "",
+        frontier_state: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[UiNode], str, dict[str, Any], dict[str, Any]]:
         receipts: list[dict[str, Any]] = []
         pre_nodes = backend.snapshot()
@@ -2256,11 +3532,22 @@ class WorkerAgent:
                 }
             )
 
-        focus_result, focus_attempts = self._perform_with_selector_fallback(
+        frontier_focus = self._perform_frontier_browser_action(
             backend,
+            pre_nodes,
+            objective,
+            "window",
             "focus",
-            self._browser_region_selectors(pre_nodes, "window"),
+            frontier_state=frontier_state,
         )
+        if frontier_focus is not None:
+            focus_result, focus_attempts = frontier_focus
+        else:
+            focus_result, focus_attempts = self._perform_with_selector_fallback(
+                backend,
+                "focus",
+                self._browser_region_selectors(pre_nodes, "window"),
+            )
         receipts.append(
             {
                 "step": "focus-browser-window",
@@ -2269,47 +3556,116 @@ class WorkerAgent:
             }
         )
 
-        navigate_result, navigate_attempts = self._perform_with_selector_fallback(
-            backend,
-            "set_text",
-            self._browser_region_selectors(pre_nodes, "address"),
-            value=urls[0],
-        )
-        receipts.append(
-            {
-                "step": "navigate-candidate",
-                "result": navigate_result,
-                "attempts": navigate_attempts,
-            }
-        )
+        navigation_urls = [
+            url
+            for url in urls
+            if isinstance(url, str)
+            and DeepResearchEngine._is_safe_public_url(url)
+            and not DeepResearchEngine._is_search_result_url(url)
+        ]
+        if not navigation_urls:
+            navigation_urls = [url for url in urls if isinstance(url, str) and url]
+        navigation_urls = navigation_urls[: max(1, int(navigation_limit or 5))]
 
-        content_focus_result, content_attempts = self._perform_with_selector_fallback(
-            backend,
-            "focus",
-            self._browser_region_selectors(pre_nodes, "content"),
-        )
-        receipts.append(
-            {
-                "step": "focus-content-region",
-                "result": content_focus_result,
-                "attempts": content_attempts,
-            }
-        )
-
-        post_nodes = backend.snapshot()
-        interrupt_report = self._resolve_ephemeral_blockers(
-            backend,
-            post_nodes,
-            urls[0] if urls else "",
-        )
-        if interrupt_report.get("triggered"):
+        post_nodes = pre_nodes
+        interrupt_reports: list[dict[str, Any]] = []
+        if not navigation_urls:
             receipts.append(
                 {
-                    "step": "interrupt-handler",
-                    "result": interrupt_report,
+                    "step": "navigate-candidate",
+                    "result": {"status": "no-url-candidates"},
+                    "attempts": [],
                 }
             )
+        for index, url in enumerate(navigation_urls, start=1):
+            frontier_navigation = self._perform_frontier_browser_action(
+                backend,
+                post_nodes,
+                objective,
+                "address",
+                "set_text",
+                value=url,
+                frontier_state={
+                    **(frontier_state or {}),
+                    "step": "navigate-candidate",
+                    "url": url,
+                    "index": index,
+                },
+            )
+            if frontier_navigation is not None:
+                navigate_result, navigate_attempts = frontier_navigation
+            else:
+                navigate_result, navigate_attempts = self._perform_with_selector_fallback(
+                    backend,
+                    "set_text",
+                    self._browser_region_selectors(post_nodes, "address"),
+                    value=url,
+                )
+            receipts.append(
+                {
+                    "step": "navigate-candidate",
+                    "index": index,
+                    "url": url,
+                    "result": navigate_result,
+                    "attempts": navigate_attempts,
+                }
+            )
+
             post_nodes = backend.snapshot()
+            frontier_content_focus = self._perform_frontier_browser_action(
+                backend,
+                post_nodes,
+                objective,
+                "content",
+                "focus",
+                frontier_state={
+                    **(frontier_state or {}),
+                    "step": "focus-content-region",
+                    "url": url,
+                    "index": index,
+                },
+            )
+            if frontier_content_focus is not None:
+                content_focus_result, content_attempts = frontier_content_focus
+            else:
+                content_focus_result, content_attempts = self._perform_with_selector_fallback(
+                    backend,
+                    "focus",
+                    self._browser_region_selectors(post_nodes, "content"),
+                )
+            receipts.append(
+                {
+                    "step": "focus-content-region",
+                    "index": index,
+                    "url": url,
+                    "result": content_focus_result,
+                    "attempts": content_attempts,
+                }
+            )
+
+            post_nodes = backend.snapshot()
+            interrupt_report = self._resolve_ephemeral_blockers(
+                backend,
+                post_nodes,
+                url,
+            )
+            interrupt_reports.append(interrupt_report)
+            if interrupt_report.get("triggered"):
+                receipts.append(
+                    {
+                        "step": "interrupt-handler",
+                        "index": index,
+                        "url": url,
+                        "result": interrupt_report,
+                    }
+                )
+                post_nodes = backend.snapshot()
+
+        interrupt_report = {
+            "triggered": any(item.get("triggered") for item in interrupt_reports),
+            "navigated_urls": navigation_urls,
+            "reports": interrupt_reports,
+        }
 
         return (
             receipts,
@@ -2544,6 +3900,275 @@ class WorkerAgent:
             if status != "selector-not-found":
                 return result, attempts
         return last_result, attempts
+
+    def _perform_frontier_browser_action(
+        self,
+        backend: Any,
+        nodes: list[UiNode],
+        objective: str,
+        region: str,
+        action_type: str,
+        value: str | None = None,
+        frontier_state: dict[str, Any] | None = None,
+    ) -> tuple[Any, list[dict[str, Any]]] | None:
+        selectors, attempt = self._resolve_frontier_browser_selector(
+            nodes,
+            objective,
+            region,
+            frontier_state=frontier_state,
+        )
+        if not selectors or attempt is None:
+            return None
+        attempts: list[dict[str, Any]] = []
+        for selector in selectors:
+            result = self._json_or_text(
+                backend.perform(UiAction(action_type, selector, value=value))
+            )
+            status = ""
+            if isinstance(result, dict):
+                status = str(result.get("status") or "")
+            frontier_attempt = dict(attempt)
+            frontier_attempt["selector"] = selector
+            frontier_attempt["status"] = status or "unknown"
+            attempts.append(frontier_attempt)
+            if status != "selector-not-found":
+                return result, attempts
+        return None
+
+    def _resolve_frontier_browser_selector(
+        self,
+        nodes: list[UiNode],
+        objective: str,
+        region: str,
+        frontier_state: dict[str, Any] | None = None,
+    ) -> tuple[list[str] | None, dict[str, Any] | None]:
+        if self.frontier_client is None:
+            return None, None
+        prompt_payload = self._build_browser_frontier_prompt(
+            nodes,
+            objective,
+            region,
+            frontier_state=frontier_state,
+        )
+        if prompt_payload is None:
+            return None, None
+        prompt, selector_map = prompt_payload
+        try:
+            decision = self.frontier_client.choose_action(prompt)
+        except Exception as exc:
+            return None, {"strategy": "frontier", "error": str(exc)[:240]}
+        selectors = selector_map.get(int(decision.target_id or 0))
+        if not selectors:
+            return None, {
+                "strategy": "frontier",
+                "action": decision.action,
+                "target_id": decision.target_id,
+                "confidence": decision.confidence,
+                "rationale": decision.rationale,
+                "status": "no-selector",
+            }
+        return selectors, {
+            "strategy": "frontier",
+            "action": decision.action,
+            "target_id": decision.target_id,
+            "confidence": decision.confidence,
+            "rationale": decision.rationale,
+        }
+
+    def _build_browser_frontier_prompt(
+        self,
+        nodes: list[UiNode],
+        objective: str,
+        region: str,
+        frontier_state: dict[str, Any] | None = None,
+    ) -> tuple[FrontierPrompt, dict[int, list[str]]] | None:
+        candidates = self._browser_frontier_candidate_nodes(nodes, region)
+        if not candidates:
+            return None
+        annotated_png, mark_payload, selector_map = self._render_browser_frontier_frame(
+            candidates,
+            region,
+        )
+        state_context = {
+            "target_region": region,
+            "frontier_state": frontier_state or {},
+            "candidate_nodes": [
+                {
+                    "node_id": node.node_id,
+                    "role": node.role,
+                    "name": node.name,
+                    "bounds": list(node.bounds) if node.bounds else None,
+                }
+                for node in candidates[:10]
+            ],
+        }
+        prompt = FrontierPrompt(
+            objective=(
+                f"{objective}\n"
+                f"Select the browser {region} control that best advances the current research step."
+            ),
+            annotated_png=annotated_png,
+            mark_payload=mark_payload,
+            tool_context=(
+                "Choose the correct browser node for the requested region. "
+                "The local executor will map the chosen tag to a real selector."
+            ),
+            state_context=state_context,
+            confidence_floor=0.35,
+        )
+        return prompt, selector_map
+
+    @staticmethod
+    def _browser_frontier_candidate_nodes(
+        nodes: list[UiNode],
+        region: str,
+    ) -> list[UiNode]:
+        matches: list[UiNode] = []
+        for node in nodes:
+            node_id = node.node_id.lower()
+            role = node.role.lower()
+            name = node.name.lower()
+            panel = str((node.metadata or {}).get("panel_type") or "").lower()
+            if region == "window" and (
+                node_id == "window-browser"
+                or role == "window"
+                or "browser" in name
+            ):
+                matches.append(node)
+            elif region == "address" and (
+                node_id == "browser-address-bar"
+                or (role == "edit" and "address" in name)
+                or panel == "toolbar"
+            ):
+                matches.append(node)
+            elif region == "content" and (
+                node_id == "browser-main-doc"
+                or role == "document"
+                or panel in {"primary", "document"}
+            ):
+                matches.append(node)
+        if matches:
+            return matches[:12]
+        enabled_nodes = [node for node in nodes if node.enabled]
+        return enabled_nodes[:12]
+
+    def _render_browser_frontier_frame(
+        self,
+        nodes: list[UiNode],
+        region: str,
+    ) -> tuple[bytes, dict[str, Any], dict[int, list[str]]]:
+        normalized_bounds = [self._frontier_node_bounds(node, index) for index, node in enumerate(nodes)]
+        canvas_width = max(1280, max((x + width + 40) for x, _, width, _ in normalized_bounds))
+        canvas_height = max(900, max((y + height + 40) for _, y, _, height in normalized_bounds))
+        image = Image.new("RGB", (canvas_width, canvas_height), (244, 240, 232))
+        draw = ImageDraw.Draw(image)
+        selector_map: dict[int, list[str]] = {}
+        marks: list[dict[str, Any]] = []
+        palette = {
+            "window": ((32, 80, 129), (225, 236, 248)),
+            "address": ((138, 82, 24), (250, 239, 220)),
+            "content": ((34, 105, 74), (226, 244, 236)),
+        }
+        outline_color, fill_color = palette.get(region, ((70, 70, 70), (245, 245, 245)))
+        for index, node in enumerate(nodes, start=1):
+            x, y, width, height = normalized_bounds[index - 1]
+            draw.rectangle(
+                [x, y, x + width, y + height],
+                fill=fill_color,
+                outline=outline_color,
+                width=3,
+            )
+            tag_top = max(4, y - 26)
+            draw.rectangle(
+                [x, tag_top, x + 34, tag_top + 22],
+                fill=outline_color,
+                outline=outline_color,
+            )
+            draw.text((x + 8, tag_top + 4), str(index), fill=(255, 255, 255))
+            label = (node.name or node.node_id or node.role)[:56]
+            subtitle = f"{node.role} | {node.node_id}"[:64]
+            draw.text((x + 10, y + 10), label, fill=(24, 24, 24))
+            draw.text((x + 10, y + 30), subtitle, fill=(72, 72, 72))
+            selectors = self._frontier_selectors_for_node(node, region)
+            if selectors:
+                selector_map[index] = selectors
+            marks.append(
+                {
+                    "id": index,
+                    "label": label,
+                    "role": node.role,
+                    "node_id": node.node_id,
+                    "selectors": selectors,
+                    "bounds": {
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                    },
+                    "metadata": dict(node.metadata or {}),
+                }
+            )
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue(), {"region": region, "marks": marks}, selector_map
+
+    @staticmethod
+    def _frontier_node_bounds(node: UiNode, index: int) -> tuple[int, int, int, int]:
+        if node.bounds:
+            x, y, width, height = node.bounds
+            return max(x, 12), max(y, 12), max(width, 140), max(height, 56)
+        return 40, 40 + (index * 88), 760, 64
+
+    @staticmethod
+    def _frontier_selector_for_node(node: UiNode) -> str | None:
+        if node.node_id:
+            return f"node_id={node.node_id}"
+        if node.role and node.name:
+            return f"role={node.role};name={node.name}"
+        if node.name:
+            return f"name={node.name}"
+        return WorkerAgent._point_selector_for_node(node)
+
+    @classmethod
+    def _frontier_selectors_for_node(
+        cls,
+        node: UiNode,
+        region: str,
+    ) -> list[str]:
+        selectors: list[str] = []
+        name = node.name.lower().strip()
+        role = node.role.lower().strip()
+        if region == "window":
+            if name:
+                selectors.append(f"name={name}")
+            if role == "window":
+                selectors.append("role=window;name=browser")
+        elif region == "address":
+            if role == "edit" and name:
+                selectors.append(f"role=edit;name={name}")
+            if name:
+                selectors.append(f"name={name}")
+        elif region == "content":
+            if role == "document":
+                selectors.append("role=document")
+            panel = str((node.metadata or {}).get("panel_type") or "").lower()
+            if panel in {"primary", "document"}:
+                selectors.append(f"panel_type={panel}")
+            if name:
+                selectors.append(f"name={name}")
+        if node.role and node.name:
+            selectors.append(f"role={role};name={name}")
+        point_selector = cls._point_selector_for_node(node)
+        if point_selector:
+            selectors.append(point_selector)
+        node_selector = cls._frontier_selector_for_node(node)
+        if node_selector:
+            selectors.append(node_selector)
+        deduped: list[str] = []
+        for selector in selectors:
+            if selector and selector not in deduped:
+                deduped.append(selector)
+        return deduped
 
     def _browser_region_selectors(
         self,

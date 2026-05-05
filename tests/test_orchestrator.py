@@ -7,6 +7,10 @@ import urllib.parse
 import unittest
 from pathlib import Path
 
+from agentos_orchestrator.cognition.frontier_api import (
+    FrontierDecision,
+    FrontierPrompt,
+)
 from agentos_orchestrator.core.agents import (
     SupervisorAgent,
     VerificationAgent,
@@ -15,6 +19,9 @@ from agentos_orchestrator.core.agents import (
 from agentos_orchestrator.core.orchestrator import ResearchOrchestrator
 from agentos_orchestrator.core.types import WorkerResult
 from agentos_orchestrator.os_control.base import UiNode
+from agentos_orchestrator.os_control.virtual_desktop_sandbox_backend import (
+    VirtualDesktopSandboxBackend,
+)
 from agentos_orchestrator.research import (
     DeepResearchEngine,
     ResearchBrief,
@@ -129,12 +136,38 @@ class FakeTerminalBackend:
         )
 
 
+class RegionAwareFrontierClient:
+    def __init__(self) -> None:
+        self.calls: list[FrontierPrompt] = []
+
+    def choose_action(self, prompt: FrontierPrompt) -> FrontierDecision:
+        self.calls.append(prompt)
+        region = str(prompt.state_context.get("target_region") or "").strip()
+        target_node_id = {
+            "window": "window-browser",
+            "address": "browser-address-bar",
+            "content": "browser-main-doc",
+        }.get(region, "")
+        marks = prompt.mark_payload.get("marks") or []
+        target_id = 1
+        for mark in marks:
+            if str(mark.get("node_id") or "") == target_node_id:
+                target_id = int(mark.get("id") or 1)
+                break
+        return FrontierDecision(
+            action="focus",
+            target_id=target_id,
+            rationale=f"Select {target_node_id or region}",
+            confidence=0.92,
+        )
+
+
 class OrchestratorTests(unittest.TestCase):
-    def test_general_research_does_not_schedule_pc_steps(self) -> None:
+    def test_general_research_adds_pc_research(self) -> None:
         tasks = SupervisorAgent().plan("research market evidence with sources")
 
         self.assertFalse(any(task.role == "pc-control" for task in tasks))
-        self.assertFalse(any(task.role == "pc-research" for task in tasks))
+        self.assertTrue(any(task.role == "pc-research" for task in tasks))
 
     def test_sandbox_objective_does_not_infer_host_pc_context(self) -> None:
         tasks = SupervisorAgent().plan(
@@ -142,6 +175,43 @@ class OrchestratorTests(unittest.TestCase):
         )
 
         self.assertFalse(any(task.role == "pc-control" for task in tasks))
+        self.assertTrue(any(task.role == "pc-research" for task in tasks))
+
+    def test_software_agent_objective_adds_pc_research(self) -> None:
+        tasks = SupervisorAgent().plan(
+            "Analyze why a deep research agent is not using sandbox, browser, "
+            "and pc control effectively across general topics"
+        )
+
+        roles = [task.role for task in tasks]
+        self.assertIn("planning", roles)
+        self.assertIn("pc-research", roles)
+        self.assertFalse(any(task.role == "pc-control" for task in tasks))
+
+    def test_software_agent_objective_gets_expanded_browser_frontier_budget(
+        self,
+    ) -> None:
+        objective = (
+            "Analyze why a deep research agent is not using sandbox, browser, "
+            "and pc control effectively across general topics"
+        )
+        browser_plan = {
+            "enabled": True,
+            "search_queries": [f"query {index}" for index in range(8)],
+        }
+
+        self.assertGreater(
+            WorkerAgent._pc_browser_navigation_limit(
+                objective,
+                [f"https://example.com/{index}" for index in range(12)],
+                browser_plan,
+            ),
+            8,
+        )
+        self.assertGreater(
+            WorkerAgent._pc_browser_cycle_count(objective, browser_plan),
+            1,
+        )
 
     def test_current_web_multi_hour_sandbox_enables_pc_research(self) -> None:
         tasks = SupervisorAgent().plan(
@@ -150,6 +220,19 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertTrue(any(task.role == "pc-research" for task in tasks))
         self.assertFalse(any(task.role == "pc-control" for task in tasks))
+
+    def test_current_web_standard_objective_adds_planning_and_pc_research(
+        self,
+    ) -> None:
+        tasks = SupervisorAgent().plan(
+            "Research semiconductor pricing and supply chain risks as of now with source-backed evidence"
+        )
+
+        roles = [task.role for task in tasks]
+        self.assertIn("planning", roles)
+        self.assertIn("pc-research", roles)
+        self.assertLess(roles.index("planning"), roles.index("pc-research"))
+        self.assertLess(roles.index("pc-research"), roles.index("literature"))
 
     def test_coverage_targets_prefer_literature_effective_targets(self) -> None:
         planning = WorkerResult(
@@ -293,6 +376,264 @@ class OrchestratorTests(unittest.TestCase):
             )
         )
 
+    def test_browser_search_queries_expand_for_current_web_frontier(self) -> None:
+        urls = [
+            f"https://html.duckduckgo.com/html/?q=semiconductor+pricing+signal+{index}"
+            for index in range(14)
+        ]
+
+        queries = WorkerAgent._browser_search_queries(
+            "Research semiconductor pricing and supply chain risks as of now with live current-web evidence",
+            urls,
+        )
+
+        self.assertGreaterEqual(len(queries), 12)
+        self.assertTrue(any("signal 13" in query for query in queries))
+
+    def test_browser_search_queries_prioritize_planner_queries(self) -> None:
+        queries = WorkerAgent._browser_search_queries(
+            "Analyze deep research agent shortcomings",
+            [],
+            [
+                "agentos sandbox browser frontier gaps",
+                "pc control evidence failures in deep research agents",
+            ],
+        )
+
+        self.assertEqual(queries[0], "agentos sandbox browser frontier gaps")
+        self.assertIn(
+            "pc control evidence failures in deep research agents",
+            queries,
+        )
+
+    def test_planning_browser_urls_preserve_seed_urls_and_queries(self) -> None:
+        urls = WorkerAgent._planning_browser_urls(
+            {
+                "browser_research": {
+                    "seed_urls": [
+                        "https://sec.gov",
+                        "investor.example.com/filings",
+                    ],
+                    "search_queries": [
+                        "nvidia latest 10-Q guidance",
+                        "semiconductor supply chain recent pricing",
+                    ],
+                }
+            }
+        )
+
+        decoded_urls = [urllib.parse.unquote_plus(url) for url in urls]
+        self.assertIn("https://sec.gov", urls)
+        self.assertIn("https://investor.example.com/filings", urls)
+        self.assertTrue(
+            any("nvidia latest 10-Q guidance" in url for url in decoded_urls)
+        )
+        self.assertTrue(
+            any("semiconductor supply chain recent pricing" in url for url in decoded_urls)
+        )
+
+    def test_planning_browser_urls_allow_deeper_frontier(self) -> None:
+        urls = WorkerAgent._planning_browser_urls(
+            {
+                "browser_research": {
+                    "seed_urls": [
+                        "https://sec.gov",
+                        "https://example.com/ir",
+                    ],
+                    "search_queries": [
+                        f"semiconductor pricing current evidence query {index}"
+                        for index in range(20)
+                    ],
+                }
+            }
+        )
+
+        self.assertGreaterEqual(len(urls), 22)
+        self.assertIn("https://sec.gov", urls)
+
+    def test_pc_browser_navigation_limit_expands_for_current_web(self) -> None:
+        urls = [f"https://example.com/report-{index}" for index in range(12)]
+
+        limit = WorkerAgent._pc_browser_navigation_limit(
+            "Research semiconductor pricing and supplier risk as of now",
+            urls,
+            {
+                "search_queries": [
+                    f"query {index} current evidence" for index in range(8)
+                ]
+            },
+        )
+
+        self.assertGreaterEqual(limit, 16)
+
+    def test_run_pc_browser_actions_honors_expanded_navigation_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend = VirtualDesktopSandboxBackend(Path(temp_dir) / "sandbox.json")
+            worker = WorkerAgent(None, None, FakeResearchEngine())
+            urls = [f"https://example.com/report-{index}" for index in range(9)]
+
+            receipts, post_nodes, backend_name, interrupt_report, workspace = (
+                worker._run_pc_browser_actions(
+                    backend,
+                    urls,
+                    run_id="run_browser_depth",
+                    navigation_limit=9,
+                )
+            )
+
+            navigate_receipts = [
+                receipt
+                for receipt in receipts
+                if receipt.get("step") == "navigate-candidate" and receipt.get("url")
+            ]
+
+            self.assertEqual(len(navigate_receipts), 9)
+            self.assertEqual(len(interrupt_report.get("navigated_urls") or []), 9)
+            self.assertEqual(backend_name, "virtual-desktop-sandbox")
+            self.assertTrue(workspace.get("triggered"))
+            self.assertTrue(post_nodes)
+
+    def test_run_pc_browser_actions_uses_frontier_selected_browser_nodes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend = VirtualDesktopSandboxBackend(Path(temp_dir) / "sandbox.json")
+            frontier_client = RegionAwareFrontierClient()
+            worker = WorkerAgent(
+                None,
+                None,
+                FakeResearchEngine(),
+                frontier_client=frontier_client,
+            )
+
+            receipts, post_nodes, _, _, _ = worker._run_pc_browser_actions(
+                backend,
+                ["https://example.com/frontier-report"],
+                run_id="run_browser_frontier",
+                navigation_limit=1,
+                objective="Research semiconductor pricing as of now",
+                frontier_state={"cycle": 1},
+            )
+
+            window_receipt = next(
+                receipt
+                for receipt in receipts
+                if receipt.get("step") == "focus-browser-window"
+            )
+            navigate_receipt = next(
+                receipt
+                for receipt in receipts
+                if receipt.get("step") == "navigate-candidate"
+            )
+            content_receipt = next(
+                receipt
+                for receipt in receipts
+                if receipt.get("step") == "focus-content-region"
+            )
+
+            self.assertEqual(window_receipt["attempts"][0]["strategy"], "frontier")
+            self.assertEqual(
+                window_receipt["result"]["matched_node_id"],
+                "window-browser",
+            )
+            self.assertEqual(
+                navigate_receipt["result"]["matched_node_id"],
+                "browser-address-bar",
+            )
+            self.assertEqual(
+                content_receipt["result"]["matched_node_id"],
+                "browser-main-doc",
+            )
+            self.assertGreaterEqual(len(frontier_client.calls), 3)
+            self.assertTrue(post_nodes)
+
+    def test_browser_frontier_session_persists_graph_and_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backend = VirtualDesktopSandboxBackend(root / "sandbox.json")
+            frontier_client = RegionAwareFrontierClient()
+            worker = WorkerAgent(
+                None,
+                None,
+                FakeResearchEngine(),
+                frontier_client=frontier_client,
+            )
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                (
+                    receipts,
+                    post_nodes,
+                    backend_name,
+                    interrupt_report,
+                    workspace_report,
+                    findings,
+                ) = worker._run_pc_browser_frontier_session(
+                    "run_frontier_graph",
+                    "Research semiconductor pricing and supplier risk as of now",
+                    backend,
+                    ["https://example.com/seed"],
+                    {
+                        "seed_urls": ["https://example.com/seed"],
+                        "search_queries": [
+                            f"query {index} current evidence" for index in range(8)
+                        ],
+                    },
+                    4,
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+            graph_path = root / ".agentos/browser_frontier_graph.json"
+            run_graph_path = root / "runs/run_frontier_graph/pc/frontier_graph.json"
+            graph = json.loads(run_graph_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(receipts)
+            self.assertTrue(post_nodes)
+            self.assertEqual(backend_name, "virtual-desktop-sandbox")
+            self.assertTrue(interrupt_report.get("navigated_urls"))
+            self.assertTrue(workspace_report.get("triggered"))
+            self.assertTrue(graph_path.exists())
+            self.assertTrue(run_graph_path.exists())
+            self.assertTrue(findings.get("frontier_checkpoints"))
+            self.assertTrue(findings.get("worker_sessions"))
+            self.assertTrue(graph.get("urls"))
+            self.assertGreaterEqual(
+                findings.get("frontier_graph", {})
+                .get("summary", {})
+                .get("url_count", 0),
+                1,
+            )
+
+    def test_browser_checkpoint_contradictions_compound_in_frontier_graph(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        graph = worker._empty_frontier_graph()
+
+        graph = worker._merge_browser_checkpoint_into_frontier_graph(
+            graph,
+            {
+                "contradictions": [
+                    "Potential contradiction between channel checks and company guidance."
+                ],
+                "domain_leads": ["sec.gov"],
+                "url_leads": ["https://sec.gov/Archives/example-filings"],
+                "missing_evidence": [
+                    "Need independent verification of management guidance assumptions."
+                ],
+            },
+            "run_contradictions",
+            0,
+        )
+
+        summary = worker._frontier_graph_summary(graph)
+        seed_urls = worker._frontier_graph_seed_urls(graph, limit=10)
+
+        self.assertEqual(summary["contradiction_count"], 1)
+        self.assertIn("sec.gov", summary["top_domains"])
+        self.assertIn("https://sec.gov/Archives/example-filings", seed_urls)
+
     def test_supervisor_data_task_adapts_to_research_domain(self) -> None:
         tasks = SupervisorAgent().plan(
             "Research highest-potential public companies as of now"
@@ -372,6 +713,67 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(findings["frontier"]["mode"], "expansive")
         self.assertGreaterEqual(findings["frontier"]["candidate_urls"], 5)
         self.assertGreaterEqual(example_hits, 2)
+
+    def test_browser_findings_prioritize_explicit_navigation_urls(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        seed_url = "https://seed.example.com/live-brief"
+
+        def fake_search_results(
+            query: str,
+            limit: int | None = None,
+        ) -> list[ResearchSource]:
+            del query, limit
+            return [
+                ResearchSource(
+                    provider="web-search",
+                    title="Searched result one",
+                    url="https://search.example.com/result-one",
+                    abstract="Search-derived page.",
+                    year=2026,
+                    score=90.0,
+                ),
+                ResearchSource(
+                    provider="web-search",
+                    title="Searched result two",
+                    url="https://search.example.com/result-two",
+                    abstract="Search-derived page.",
+                    year=2026,
+                    score=88.0,
+                ),
+            ]
+
+        worker.research_engine._search_web_results = fake_search_results
+        worker.research_engine._search_financial_portals = lambda query, limit=10: []
+        worker.research_engine._search_sec_edgar = lambda query, limit=6: []
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: [
+            source
+            for source in sources
+            if "search.example.com" in source.url
+        ]
+        worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
+        worker._deep_page_read = lambda url: f"signal from {url} " * 40
+        worker._content_block_quality = lambda content: {"quality_score": 0.8}
+        worker._browser_preview_is_blocked = lambda preview: False
+        worker._extract_page_evidence = lambda content, title, query: [
+            "browser seed evidence"
+        ]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: (
+            "high signal"
+        )
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] Research live browser evidence",
+            [seed_url],
+        )
+
+        self.assertEqual(findings["direct_urls"][0], seed_url)
+        self.assertIn(seed_url, findings["candidate_urls"])
+        self.assertEqual(findings["judged_results"][0]["url"], seed_url)
+        self.assertIn(
+            "browser-navigation-seed",
+            findings["judged_results"][0].get("quality_flags") or [],
+        )
 
     def test_terminal_verification_uses_terminal_selector_and_json_receipt(
         self,

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from agentos_orchestrator.product import CrawlWorkerServiceRecord
 from agentos_orchestrator.research import DeepResearchEngine, ResearchSource
+from agentos_orchestrator.research.crawl_worker import (
+    CrawlWorkerLoopConfig,
+    ResearchCrawlWorker,
+)
 
 
 class FakeDeepResearchEngine(DeepResearchEngine):
@@ -132,6 +140,57 @@ class FakeWebSearchResearchEngine(DeepResearchEngine):
         return ""
 
 
+class FakeBrowserPoolResearchEngine(DeepResearchEngine):
+    def __init__(self, workspace_root: str | Path = ".") -> None:
+        super().__init__(workspace_root=workspace_root)
+        self.pool_calls: list[list[str]] = []
+
+    def _needs_browser(self, url: str) -> bool:
+        del url
+        return True
+
+    def _headless_browser_pool_fetch(
+        self,
+        urls: list[str],
+        max_chars: int = 80_000,
+        timeout_ms: int = 18_000,
+    ) -> dict[str, str]:
+        del max_chars, timeout_ms
+        self.pool_calls.append(list(urls))
+        return {
+            url: (
+                "Browser rendered evidence describing planner worker browser "
+                "grounding, tool execution, retrieval coordination, contradiction "
+                "handling, evidence index reuse, crawl queue fanout, headless "
+                "rendering, benchmark safety approvals, semantic navigation, "
+                "source validation, and cross run orchestration behavior across "
+                "general purpose research agents."
+            )
+            for url in urls
+        }
+
+    def _get_text(
+        self,
+        url: str,
+        accept: str = "text/html,application/xhtml+xml,*/*",
+        max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
+    ) -> str:
+        del (
+            url,
+            accept,
+            max_bytes,
+            timeout_seconds,
+            range_start,
+            range_end,
+            extra_headers,
+        )
+        return ""
+
+
 class SeedUrlResearchEngine(FakeDeepResearchEngine):
     def _get_text(
         self,
@@ -149,6 +208,44 @@ class SeedUrlResearchEngine(FakeDeepResearchEngine):
                 "<html><head><title>AgentOS benchmark safety approvals</title></head>"
                 "<body>AgentOS benchmark safety approvals desktop workflow "
                 "reliability notes and operator guidance.</body></html>"
+            )
+        return ""
+
+
+class FakeCrawlWorkerResearchEngine(DeepResearchEngine):
+    def _get_json(self, url: str) -> dict[str, Any]:
+        del url
+        return {}
+
+    def _get_text(
+        self,
+        url: str,
+        accept: str = "text/html,application/xhtml+xml,*/*",
+        max_bytes: int = 40_000,
+        timeout_seconds: int | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        extra_headers: dict | None = None,
+    ) -> str:
+        del accept, max_bytes, timeout_seconds, range_start, range_end, extra_headers
+        if "docs.example.org/root" in url:
+            return (
+                "<html><body>"
+                "AgentOS semantic browser research coordination covers frontier "
+                "graph routing, contradiction review, crawl queue fanout, "
+                "evidence reuse, and reliability controls for general purpose "
+                "deep research systems. "
+                '<a href="https://docs.example.org/articles/agentos-semantic-browser-worker-pool">'
+                "Worker pool article</a>"
+                "</body></html>"
+            )
+        if "agentos-semantic-browser-worker-pool" in url:
+            return (
+                "<html><body>"
+                "AgentOS worker pools maintain browser grounded evidence, queue "
+                "draining, semantic navigation, contradiction tracking, and "
+                "persistent cross run observations for deep research workloads."
+                "</body></html>"
             )
         return ""
 
@@ -220,6 +317,80 @@ class CapturingSynthesisEngine(FakeDeepResearchEngine):
         return "SYNTHESIS"
 
 
+class StableLowNoveltyEngine(DeepResearchEngine):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.search_calls: list[str] = []
+
+    def _search_query_across_providers(
+        self,
+        search_query: str,
+        allowed_providers: set[str],
+        per_provider_limit: int,
+    ) -> list[ResearchSource]:
+        del allowed_providers, per_provider_limit
+        self.search_calls.append(search_query)
+        return [
+            ResearchSource(
+                provider="google-news-rss",
+                title="NVIDIA (NVDA) stock earnings guidance catalyst",
+                url="https://finance.example.com/nvda-earnings",
+                year=2026,
+                abstract=(
+                    "NVIDIA stock earnings guidance showed revenue growth, "
+                    "EPS upside, valuation debate, and catalyst timing."
+                ),
+                score=5.0,
+            )
+        ]
+
+    def _search_gemini_observation(
+        self,
+        query: str,
+        depth: str,
+    ) -> list[ResearchSource]:
+        del query, depth
+        return []
+
+    def _enrich_top_sources(
+        self,
+        selected: list[ResearchSource],
+        query: str,
+    ) -> list[str]:
+        del selected, query
+        return []
+
+    def _citation_chase(
+        self,
+        sources: list[ResearchSource],
+        query: str,
+        citation_depth: int = 1,
+    ) -> list[ResearchSource]:
+        del sources, query, citation_depth
+        return []
+
+    def _append_durable_claim_notes(
+        self,
+        report_path: Path,
+        pass_index: int,
+        sources: list[ResearchSource],
+        query: str,
+    ) -> None:
+        del report_path, pass_index, sources, query
+
+    def _ai_evidence_gap_analysis(
+        self,
+        objective: str,
+        selected: list[ResearchSource],
+        pass_index: int,
+        force_new_domains: bool = False,
+        existing_domains: list[str] | None = None,
+        coverage: dict[str, Any] | None = None,
+    ) -> list[str]:
+        del selected, pass_index, force_new_domains, existing_domains, coverage
+        return [f"{objective} SEC filing revenue growth catalyst"]
+
+
 class ResearchTests(unittest.TestCase):
     def test_deep_research_engine_writes_evidence_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -235,6 +406,14 @@ class ResearchTests(unittest.TestCase):
             self.assertIn("analysis_report.md", " ".join(brief.artifacts))
             self.assertIn("findings.json", " ".join(brief.artifacts))
             self.assertIn("claim_trace.json", " ".join(brief.artifacts))
+            self.assertIn(
+                "evidence_index_snapshot.json",
+                " ".join(brief.artifacts),
+            )
+            self.assertIn(
+                "crawl_queue_snapshot.json",
+                " ".join(brief.artifacts),
+            )
             self.assertIn(
                 "provider_diagnostics.json",
                 " ".join(brief.artifacts),
@@ -268,6 +447,224 @@ class ResearchTests(unittest.TestCase):
             findings = json.loads(findings_path.read_text(encoding="utf-8"))
             self.assertTrue(findings)
             self.assertIn("perspective", findings[0])
+
+            evidence_snapshot_path = (
+                Path(temp_dir) / "runs/run_1/research/evidence_index_snapshot.json"
+            )
+            evidence_snapshot = json.loads(
+                evidence_snapshot_path.read_text(encoding="utf-8")
+            )
+            self.assertTrue(evidence_snapshot["claims"])
+
+    def test_persistent_evidence_index_reuses_claims_and_seed_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            engine.run("accessibility tree desktop agents", "run_1")
+
+            followup = FakeDeepResearchEngine(workspace_root=temp_dir)
+            query = followup._query_from_objective(
+                "accessibility tree desktop agents"
+            )
+            hints = followup._persistent_evidence_query_hints(
+                query,
+                "accessibility tree desktop agents",
+                limit=8,
+            )
+            seeds = followup._persistent_seed_urls(
+                query,
+                "accessibility tree desktop agents",
+                limit=8,
+            )
+
+            self.assertTrue(hints)
+            self.assertTrue(seeds)
+
+            db_path = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            with closing(sqlite3.connect(db_path)) as connection:
+                claim_count = connection.execute(
+                    "SELECT COUNT(*) FROM evidence_claims"
+                ).fetchone()[0]
+                domain_count = connection.execute(
+                    "SELECT COUNT(*) FROM evidence_domains"
+                ).fetchone()[0]
+
+            self.assertGreater(claim_count, 0)
+            self.assertGreater(domain_count, 0)
+
+    def test_persistent_crawl_queue_claims_sources_across_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+            engine._ensure_research_state_store()
+            urls = [
+                "https://docs.example.org/agentos/frontier",
+                "https://research.example.org/agentos/worker-pool",
+            ]
+            engine._enqueue_url_batch(
+                urls,
+                "agentos frontier graph deep research",
+                "run_1",
+                source_url="https://seed.example.org/objective",
+                priority=13.0,
+            )
+
+            followup = DeepResearchEngine(workspace_root=temp_dir)
+            claimed = followup._claim_persistent_crawl_sources(
+                "agentos frontier graph deep research",
+                "agentos frontier graph deep research",
+                limit=4,
+            )
+            claimed_urls = {source.url for source in claimed}
+
+            self.assertEqual(claimed_urls, set(urls))
+
+            snapshot = followup._persistent_crawl_queue_snapshot(limit=8)
+            statuses = {item["url"]: item["status"] for item in snapshot["queued"]}
+            self.assertEqual(statuses[urls[0]], "claimed")
+            self.assertEqual(statuses[urls[1]], "claimed")
+
+    def test_detached_crawl_worker_processes_queue_and_records_observations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            objective = "agentos semantic browser deep research reliability"
+            root_url = "https://docs.example.org/root"
+            child_url = (
+                "https://docs.example.org/articles/"
+                "agentos-semantic-browser-worker-pool"
+            )
+            engine = FakeCrawlWorkerResearchEngine(workspace_root=temp_dir)
+            engine._ensure_research_state_store()
+            engine._enqueue_url_batch(
+                [root_url],
+                objective,
+                "run_1",
+                source_url="https://seed.example.org/objective",
+                priority=12.0,
+            )
+
+            worker = ResearchCrawlWorker(
+                engine,
+                worker_id="worker-1",
+                config=CrawlWorkerLoopConfig(
+                    batch_size=2,
+                    claim_ttl_seconds=60,
+                    once=True,
+                ),
+            )
+            result = worker.run_once()
+
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(result["failed_count"], 0)
+            self.assertGreaterEqual(result["enqueued_count"], 1)
+
+            db_path = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            with closing(sqlite3.connect(db_path)) as connection:
+                observation_count = connection.execute(
+                    "SELECT COUNT(*) FROM crawl_observations"
+                ).fetchone()[0]
+                root_status = connection.execute(
+                    "SELECT status FROM crawl_queue WHERE url = ?",
+                    (root_url,),
+                ).fetchone()[0]
+                child_status = connection.execute(
+                    "SELECT status FROM crawl_queue WHERE url = ?",
+                    (child_url,),
+                ).fetchone()[0]
+
+            self.assertEqual(observation_count, 1)
+            self.assertEqual(root_status, "processed")
+            self.assertEqual(child_status, "queued")
+
+            followup = FakeCrawlWorkerResearchEngine(workspace_root=temp_dir)
+            query = followup._query_from_objective(objective)
+            hints = followup._persistent_evidence_query_hints(
+                query,
+                objective,
+                limit=8,
+            )
+            seeds = followup._persistent_seed_urls(query, objective, limit=8)
+
+            self.assertTrue(hints)
+            self.assertIn(root_url, seeds)
+            self.assertIn(child_url, seeds)
+
+    def test_auto_start_prefers_installed_crawl_worker_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+            service_status = CrawlWorkerServiceRecord(
+                status="installed",
+                task_name="AgentOS Test Crawl Service",
+                supported=True,
+                installed=True,
+                backend="windows-task-scheduler",
+                workspace_root=str(Path(temp_dir).resolve()),
+                config_path=str(Path(temp_dir) / ".agentos/crawl_worker_service.json"),
+                worker_count=2,
+                queue_db_path=str(queue_db),
+                poll_interval_seconds=15.0,
+                batch_size=6,
+                claim_ttl_seconds=900,
+                reconcile_interval_seconds=30.0,
+                detail="installed",
+            )
+
+            with patch.object(
+                engine,
+                "_auto_start_crawl_workers_enabled",
+                return_value=True,
+            ), patch(
+                "agentos_orchestrator.product.CrawlWorkerServiceManager"
+            ) as service_manager_cls, patch(
+                "agentos_orchestrator.product.CrawlWorkerManager"
+            ) as worker_manager_cls:
+                service_manager = service_manager_cls.return_value
+                service_manager.status.return_value = service_status
+                engine._maybe_start_detached_crawl_workers()
+
+            service_manager.start.assert_called_once_with(
+                task_name="AgentOS Test Crawl Service"
+            )
+            worker_manager_cls.return_value.start.assert_not_called()
+            self.assertTrue(engine._crawl_worker_auto_started)
+
+    def test_enrich_top_sources_uses_headless_browser_pool_for_js_sources(
+        self,
+    ) -> None:
+        engine = FakeBrowserPoolResearchEngine()
+        sources = [
+            ResearchSource(
+                provider="web-search",
+                title="Planner worker article",
+                url="https://js-heavy.example.org/article-1",
+                abstract="generic web result for planner worker article",
+                score=10.0,
+            ),
+            ResearchSource(
+                provider="web-search",
+                title="Browser grounding article",
+                url="https://js-heavy.example.org/article-2",
+                abstract="generic web result for browser grounding article",
+                score=9.5,
+            ),
+        ]
+
+        engine._enrich_top_sources(
+            sources,
+            query="browser grounded deep research agent architecture",
+        )
+
+        self.assertEqual(len(engine.pool_calls), 1)
+        self.assertEqual(
+            set(engine.pool_calls[0]),
+            {
+                "https://js-heavy.example.org/article-1",
+                "https://js-heavy.example.org/article-2",
+            },
+        )
+        self.assertTrue(
+            all("Browser rendered evidence" in source.abstract for source in sources)
+        )
 
     def test_pc_browser_frontier_seeds_expand_queries_and_sources(self) -> None:
         engine = FakeDeepResearchEngine()
@@ -315,6 +712,142 @@ class ResearchTests(unittest.TestCase):
                 for source in sources
             )
         )
+
+    def test_terminal_verified_browser_findings_become_tool_observations(self) -> None:
+        engine = FakeDeepResearchEngine()
+        pc_context = {
+            "pc_findings": {
+                "judged_results": [
+                    {
+                        "title": "NVIDIA judged source",
+                        "url": "https://example.com/nvda-report",
+                        "page_excerpt": "signal " * 40,
+                        "judgment": "important source",
+                        "evidence_claims": [
+                            "nvidia revenue growth acceleration data center demand"
+                        ],
+                        "content_quality": {"quality_score": 0.7},
+                    }
+                ],
+                "terminal_verifications": [
+                    {
+                        "claim": "nvidia revenue growth acceleration data center demand",
+                        "expression": "20/10",
+                        "status": "process-executed",
+                        "exit_code": 0,
+                    }
+                ],
+            }
+        }
+
+        sources = engine._pc_finding_seed_sources(pc_context)
+        ranked = DeepResearchEngine._rank_sources(
+            sources,
+            "nvidia revenue growth outlook",
+        )
+
+        self.assertEqual(len(sources), 1)
+        self.assertIn("browser-terminal-verified", sources[0].quality_flags)
+        self.assertIn("Terminal verification:", sources[0].abstract)
+        self.assertEqual(ranked[0].evidence_grade, "tool-observation")
+
+    def test_terminal_verified_claims_expand_pc_query_seeds(self) -> None:
+        engine = FakeDeepResearchEngine()
+        pc_context = {
+            "pc_findings": {
+                "judged_results": [
+                    {
+                        "title": "Sandbox page",
+                        "url": "https://example.com/sandbox-page",
+                        "page_excerpt": "signal " * 10,
+                        "judgment": "important source",
+                        "evidence_claims": [],
+                        "content_quality": {"quality_score": 0.7},
+                    }
+                ],
+                "terminal_verifications": [
+                    {
+                        "claim": "nvidia revenue growth data center demand acceleration",
+                        "expression": "20/10",
+                        "status": "process-executed",
+                        "exit_code": 0,
+                    }
+                ],
+            }
+        }
+
+        queries = engine._pc_query_seeds(pc_context, "nvidia valuation outlook")
+
+        self.assertTrue(
+            any(
+                "revenue growth" in query.lower()
+                and "nvidia" in query.lower()
+                for query in queries
+            )
+        )
+
+    def test_frontier_checkpoint_queries_expand_pc_query_seeds(self) -> None:
+        engine = FakeDeepResearchEngine()
+        pc_context = {
+            "pc_findings": {
+                "frontier_checkpoints": [
+                    {
+                        "follow_up_queries": [
+                            "nvidia supplier concentration current evidence"
+                        ],
+                        "domain_leads": ["sec.gov"],
+                        "contradictions": [
+                            "margin compression contradiction from channel checks"
+                        ],
+                        "missing_evidence": [
+                            "independent verification of capex and backlog assumptions"
+                        ],
+                    }
+                ]
+            }
+        }
+
+        queries = engine._pc_query_seeds(pc_context, "nvidia valuation outlook")
+
+        self.assertTrue(
+            any(
+                "supplier concentration" in query.lower()
+                for query in queries
+            )
+        )
+        self.assertTrue(any("site:sec.gov" in query.lower() for query in queries))
+        self.assertTrue(
+            any(
+                "margin compression" in query.lower()
+                or "capex" in query.lower()
+                for query in queries
+            )
+        )
+
+    def test_frontier_checkpoint_urls_become_seed_sources(self) -> None:
+        engine = SeedUrlResearchEngine()
+        pc_context = {
+            "pc_findings": {
+                "frontier_checkpoints": [
+                    {"url_leads": ["https://docs.example.org/agentos"]}
+                ],
+                "frontier_graph": {
+                    "summary": {
+                        "top_urls": ["https://docs.example.org/agentos"]
+                    }
+                },
+                "frontier": {"mode": "expansive"},
+            }
+        }
+
+        sources = engine._pc_finding_seed_sources(pc_context)
+        matching = [
+            source for source in sources if source.url == "https://docs.example.org/agentos"
+        ]
+
+        self.assertTrue(matching)
+        self.assertIn("browser-checkpoint-url-lead", matching[0].quality_flags)
+        self.assertIn("browser-fetched-seed", matching[0].quality_flags)
 
     def test_standard_depth_defaults_to_multi_pass_retrieval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -553,6 +1086,145 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(overridden["min_scholarly_sources"], 0)
         self.assertEqual(overridden["min_novelty_rate"], 0.0)
         self.assertEqual(overridden["max_retrieval_passes"], 120)
+        self.assertGreater(
+            DeepResearchEngine._effective_novelty_threshold(
+                "multi-hour",
+                overridden,
+            ),
+            0.0,
+        )
+
+    def test_generic_market_words_do_not_make_source_on_topic(self) -> None:
+        query = "public stocks with highest potential to soar as of now"
+        generic = ResearchSource(
+            provider="google-news-rss",
+            title="Public market uncertainty timeline report",
+            url="https://news.example.com/public-market-timeline",
+            year=2026,
+            abstract="Current public evidence and uncertainty timeline update.",
+            score=25.0,
+        )
+        actionable = ResearchSource(
+            provider="google-news-rss",
+            title="NVIDIA (NVDA) stock earnings guidance catalyst",
+            url="https://news.example.com/nvda-earnings",
+            year=2026,
+            abstract="Revenue growth, EPS upside, valuation, and price target revisions.",
+            score=25.0,
+        )
+        promo = ResearchSource(
+            provider="google-news-rss",
+            title="3 Stocks to Buy ASAP Before a Private Company Goes Public",
+            url="https://news.example.com/stocks-to-buy",
+            year=2026,
+            abstract="Generic stocks to buy list with no company-specific evidence.",
+            score=25.0,
+        )
+
+        ranked = DeepResearchEngine._rank_sources(
+            [generic, actionable, promo],
+            query,
+        )
+
+        self.assertFalse(DeepResearchEngine._source_is_on_topic(generic, query))
+        self.assertIn(actionable.url, {source.url for source in ranked})
+        self.assertNotIn(generic.url, {source.url for source in ranked})
+        self.assertNotIn(promo.url, {source.url for source in ranked})
+
+    def test_generic_axis_query_variants_are_rejected(self) -> None:
+        query = "public stocks with highest potential to soar as of now"
+        cleaned = DeepResearchEngine._sanitize_query_variants(
+            [
+                "stocks public timeline",
+                "stocks public uncertainty",
+                "stocks earnings catalyst revisions",
+            ],
+            query,
+        )
+
+        self.assertNotIn("stocks public timeline", cleaned)
+        self.assertNotIn("stocks public uncertainty", cleaned)
+        self.assertIn("stocks earnings catalyst revisions", cleaned)
+
+    def test_current_web_low_novelty_stops_before_full_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = StableLowNoveltyEngine(workspace_root=temp_dir)
+            retrieval = engine._iterative_retrieval(
+                query="public stocks with highest potential to soar as of now",
+                settings=DeepResearchEngine._settings_for_depth("multi-hour"),
+                plan={
+                    "core_question": (
+                        "public stocks with highest potential to soar as of now"
+                    ),
+                    "query_plan": ["stocks earnings catalyst revisions"],
+                    "perspectives": [],
+                },
+                targets={
+                    "max_retrieval_passes": 40,
+                    "depth_pass_floor": 3,
+                    "max_low_novelty_streak": 2,
+                    "min_source_count": 50,
+                },
+                pc_context=None,
+                run_id="run_low_novelty",
+            )
+
+        self.assertEqual(retrieval["stop_reason"], "novelty_below_threshold")
+        self.assertLess(len(retrieval["passes"]), 40)
+        self.assertIn(
+            "SEC filing revenue growth catalyst".lower(),
+            " ".join(retrieval["query_variants"]).lower(),
+        )
+
+    def test_general_complex_objective_expands_standard_settings(self) -> None:
+        settings = DeepResearchEngine._settings_for_general_complex_objective(
+            DeepResearchEngine._settings_for_depth("standard"),
+            (
+                "Analyze why a deep research agent is not using sandbox, "
+                "browser, and pc control effectively across general topics"
+            ),
+        )
+
+        self.assertEqual(settings.depth, "standard")
+        self.assertGreaterEqual(settings.max_sources, 72)
+        self.assertGreaterEqual(settings.per_provider, 24)
+        self.assertGreaterEqual(settings.max_query_variants, 24)
+
+    def test_academic_query_keeps_standard_settings(self) -> None:
+        baseline = DeepResearchEngine._settings_for_depth("standard")
+        settings = DeepResearchEngine._settings_for_general_complex_objective(
+            baseline,
+            "Compare peer-reviewed literature and citation evidence for membrane transporters",
+        )
+
+        self.assertEqual(settings, baseline)
+
+    def test_pc_browser_urls_are_prioritized_and_fetched_as_seeds(self) -> None:
+        pc_context = {
+            "pc_findings": {
+                "direct_urls": ["https://docs.example.org/agentos"],
+                "candidate_urls": [
+                    "https://html.duckduckgo.com/html/?q=agentos",
+                    "https://example.com/other",
+                ],
+            }
+        }
+        urls = DeepResearchEngine._source_seed_urls(
+            "Use https://example.com/requested as context",
+            None,
+            pc_context,
+        )
+
+        self.assertEqual(urls[0], "https://docs.example.org/agentos")
+        self.assertNotIn("https://html.duckduckgo.com/html/?q=agentos", urls)
+
+        engine = SeedUrlResearchEngine()
+        sources = engine._pc_finding_seed_sources(pc_context)
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].provider, "pc-browser-research")
+        self.assertIn("AgentOS benchmark safety approvals", sources[0].abstract)
+        self.assertIn("browser-fetched-seed", sources[0].quality_flags)
 
     def test_search_result_pages_are_not_seeded_as_sources(self) -> None:
         urls = DeepResearchEngine._source_seed_urls(
@@ -1070,6 +1742,31 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("current-signals", names)
         self.assertIn("drivers", names)
         self.assertIn("risk", names)
+
+    def test_entity_queries_stay_grounded_for_explicit_software_entities(self) -> None:
+        queries = DeepResearchEngine._entity_queries(
+            "compare OpenCode OpenClaw local PC agents",
+            "compare OpenCode OpenClaw local PC agents",
+        )
+
+        self.assertTrue(
+            any(
+                "comparison" in query.lower()
+                and "opencode" in query.lower()
+                and "openclaw" in query.lower()
+                for query in queries
+            )
+        )
+        self.assertFalse(
+            any(
+                query in {
+                    "LLM agent benchmark evaluation",
+                    "autonomous agent task planning execution",
+                    "AI agent computer use evaluation",
+                }
+                for query in queries
+            )
+        )
 
     def test_collatz_ranking_demotes_speculative_recent_zero_citation_claims(
         self,

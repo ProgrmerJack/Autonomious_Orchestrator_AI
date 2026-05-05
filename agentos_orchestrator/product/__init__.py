@@ -1,5 +1,11 @@
 """Product readiness and operations helpers for AgentOS."""
 
+from .crawl_worker import (
+    CrawlWorkerManager,
+    CrawlWorkerRecord,
+    CrawlWorkerServiceManager,
+    CrawlWorkerServiceRecord,
+)
 from .daemon import DaemonManager, DaemonRecord
 from .commands import CommandRegistry, WorkflowCommand
 from .status import (
@@ -10,6 +16,10 @@ from .status import (
 )
 
 __all__ = [
+    "CrawlWorkerManager",
+    "CrawlWorkerRecord",
+    "CrawlWorkerServiceManager",
+    "CrawlWorkerServiceRecord",
     "DaemonManager",
     "DaemonRecord",
     "CommandRegistry",

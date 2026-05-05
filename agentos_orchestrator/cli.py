@@ -43,7 +43,14 @@ from .os_control import (
     VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
 )
-from .product import DaemonManager, collect_product_status
+from .product import (
+    CrawlWorkerManager,
+    CrawlWorkerServiceManager,
+    DaemonManager,
+    collect_product_status,
+)
+from .research import DeepResearchEngine
+from .research.crawl_worker import CrawlWorkerLoopConfig, ResearchCrawlWorker
 
 
 def _configure_dashboard_event_loop_policy() -> None:
@@ -186,6 +193,129 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_start.add_argument("--ui-port", type=int, default=5173)
     daemon_start.add_argument("--skip-npm-install", action="store_true")
     daemon_start.add_argument("--open-browser", action="store_true")
+
+    crawl_worker_parser = subparsers.add_parser(
+        "crawl-worker",
+        help="Manage long-lived research crawl workers.",
+        parents=[runtime_parent],
+    )
+    crawl_worker_subparsers = crawl_worker_parser.add_subparsers(
+        dest="crawl_worker_command",
+        required=True,
+    )
+    crawl_worker_subparsers.add_parser(
+        "status",
+        help="Show crawl worker status.",
+    )
+    crawl_worker_subparsers.add_parser("stop", help="Stop crawl workers.")
+    crawl_worker_subparsers.add_parser(
+        "restart",
+        help="Restart crawl workers.",
+    )
+    crawl_worker_start = crawl_worker_subparsers.add_parser(
+        "start",
+        help="Start crawl workers in the background.",
+    )
+    crawl_worker_start.add_argument("--workers", type=int, default=1)
+    crawl_worker_start.add_argument("--queue-db", default="")
+    crawl_worker_start.add_argument(
+        "--poll-interval",
+        type=float,
+        default=15.0,
+    )
+    crawl_worker_start.add_argument("--batch-size", type=int, default=6)
+    crawl_worker_start.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_supervise = crawl_worker_subparsers.add_parser(
+        "supervise",
+        help="Run a long-lived supervisor for the crawl worker pool.",
+    )
+    crawl_worker_supervise.add_argument("--workspace-root", default=".")
+    crawl_worker_supervise.add_argument("--workers", type=int, default=1)
+    crawl_worker_supervise.add_argument("--queue-db", default="")
+    crawl_worker_supervise.add_argument(
+        "--poll-interval",
+        type=float,
+        default=15.0,
+    )
+    crawl_worker_supervise.add_argument("--batch-size", type=int, default=6)
+    crawl_worker_supervise.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_supervise.add_argument(
+        "--supervisor-interval",
+        type=float,
+        default=30.0,
+    )
+    crawl_worker_supervise.add_argument("--once", action="store_true")
+    crawl_worker_run = crawl_worker_subparsers.add_parser(
+        "run",
+        help="Run a crawl worker loop in the foreground.",
+    )
+    crawl_worker_run.add_argument("--workspace-root", default=".")
+    crawl_worker_run.add_argument("--queue-db", default="")
+    crawl_worker_run.add_argument("--worker-id", default="crawl-worker")
+    crawl_worker_run.add_argument("--poll-interval", type=float, default=15.0)
+    crawl_worker_run.add_argument("--batch-size", type=int, default=6)
+    crawl_worker_run.add_argument("--claim-ttl", type=int, default=900)
+    crawl_worker_run.add_argument("--once", action="store_true")
+    crawl_worker_service = crawl_worker_subparsers.add_parser(
+        "service",
+        help="Manage the OS service wrapper for crawl workers.",
+    )
+    crawl_worker_service_subparsers = crawl_worker_service.add_subparsers(
+        dest="crawl_worker_service_command",
+        required=True,
+    )
+    crawl_worker_service_subparsers.add_parser(
+        "status",
+        help="Show crawl worker service wrapper status.",
+    )
+    crawl_worker_service_subparsers.add_parser(
+        "stop",
+        help="Stop the crawl worker service wrapper task.",
+    )
+    crawl_worker_service_subparsers.add_parser(
+        "restart",
+        help="Restart the crawl worker service wrapper task.",
+    )
+    crawl_worker_service_subparsers.add_parser(
+        "uninstall",
+        help="Remove the crawl worker service wrapper task.",
+    )
+    crawl_worker_service_start = crawl_worker_service_subparsers.add_parser(
+        "start",
+        help="Start the crawl worker service wrapper task.",
+    )
+    crawl_worker_service_start.add_argument("--task-name", default="")
+    crawl_worker_service_install = crawl_worker_service_subparsers.add_parser(
+        "install",
+        help="Install a Windows scheduled-task wrapper for crawl workers.",
+    )
+    crawl_worker_service_install.add_argument("--workers", type=int, default=1)
+    crawl_worker_service_install.add_argument("--queue-db", default="")
+    crawl_worker_service_install.add_argument(
+        "--poll-interval",
+        type=float,
+        default=15.0,
+    )
+    crawl_worker_service_install.add_argument(
+        "--batch-size",
+        type=int,
+        default=6,
+    )
+    crawl_worker_service_install.add_argument(
+        "--claim-ttl",
+        type=int,
+        default=900,
+    )
+    crawl_worker_service_install.add_argument(
+        "--supervisor-interval",
+        type=float,
+        default=30.0,
+    )
+    crawl_worker_service_install.add_argument("--task-name", default="")
+    crawl_worker_service_install.add_argument(
+        "--no-start",
+        action="store_true",
+    )
 
     dashboard_parser = subparsers.add_parser(
         "serve-dashboard",
@@ -402,6 +532,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "daemon":
         return _daemon(args)
+    if args.command == "crawl-worker":
+        return _crawl_worker(args)
 
     policy_path = Path(args.policy)
 
@@ -805,6 +937,112 @@ def _daemon(args: argparse.Namespace) -> int:
         print(json.dumps(asdict(record), indent=2))
         return 0
     raise ValueError(f"Unknown daemon command: {args.daemon_command}")
+
+
+def _crawl_worker(args: argparse.Namespace) -> int:
+    workspace_root = Path(
+        getattr(args, "workspace_root", Path.cwd())
+    ).resolve()
+    manager = CrawlWorkerManager(workspace_root, sys.executable)
+    service_manager = CrawlWorkerServiceManager(workspace_root, sys.executable)
+    if args.crawl_worker_command == "status":
+        print(json.dumps(asdict(manager.status()), indent=2))
+        return 0
+    if args.crawl_worker_command == "stop":
+        print(json.dumps(asdict(manager.stop()), indent=2))
+        return 0
+    if args.crawl_worker_command == "restart":
+        manager.stop()
+        args.crawl_worker_command = "start"
+        if not hasattr(args, "workers"):
+            args.workers = 1
+            args.queue_db = ""
+            args.poll_interval = 15.0
+            args.batch_size = 6
+            args.claim_ttl = 900
+    if args.crawl_worker_command == "start":
+        record = manager.start(
+            worker_count=args.workers,
+            queue_db_path=args.queue_db or None,
+            poll_interval_seconds=args.poll_interval,
+            batch_size=args.batch_size,
+            claim_ttl_seconds=args.claim_ttl,
+        )
+        print(json.dumps(asdict(record), indent=2))
+        return 0
+    if args.crawl_worker_command == "supervise":
+        os.environ["AGENTOS_DISABLE_AUTO_CRAWL_WORKERS"] = "1"
+        record = manager.supervise(
+            worker_count=args.workers,
+            queue_db_path=args.queue_db or None,
+            poll_interval_seconds=args.poll_interval,
+            batch_size=args.batch_size,
+            claim_ttl_seconds=args.claim_ttl,
+            reconcile_interval_seconds=args.supervisor_interval,
+            once=bool(args.once),
+        )
+        if args.once:
+            print(json.dumps(asdict(record), indent=2))
+        return 0
+    if args.crawl_worker_command == "run":
+        engine = DeepResearchEngine(
+            workspace_root=args.workspace_root,
+            research_state_path=(args.queue_db or None),
+        )
+        worker = ResearchCrawlWorker(
+            engine,
+            worker_id=args.worker_id,
+            config=CrawlWorkerLoopConfig(
+                batch_size=args.batch_size,
+                poll_interval_seconds=args.poll_interval,
+                claim_ttl_seconds=args.claim_ttl,
+                once=bool(args.once),
+            ),
+        )
+        if args.once:
+            print(json.dumps(worker.run_once(), indent=2))
+            return 0
+        worker.run_forever()
+        return 0
+    if args.crawl_worker_command == "service":
+        subcommand = args.crawl_worker_service_command
+        if subcommand == "status":
+            print(json.dumps(asdict(service_manager.status()), indent=2))
+            return 0
+        if subcommand == "stop":
+            print(json.dumps(asdict(service_manager.stop()), indent=2))
+            return 0
+        if subcommand == "restart":
+            print(json.dumps(asdict(service_manager.restart()), indent=2))
+            return 0
+        if subcommand == "uninstall":
+            print(json.dumps(asdict(service_manager.uninstall()), indent=2))
+            return 0
+        if subcommand == "start":
+            service_record = service_manager.start(
+                task_name=args.task_name or None
+            )
+            print(json.dumps(asdict(service_record), indent=2))
+            return 0
+        if subcommand == "install":
+            service_record = service_manager.install(
+                worker_count=args.workers,
+                queue_db_path=args.queue_db or None,
+                poll_interval_seconds=args.poll_interval,
+                batch_size=args.batch_size,
+                claim_ttl_seconds=args.claim_ttl,
+                reconcile_interval_seconds=args.supervisor_interval,
+                task_name=args.task_name or None,
+                start_now=not args.no_start,
+            )
+            print(json.dumps(asdict(service_record), indent=2))
+            return 0
+        raise ValueError(
+            f"Unknown crawl worker service command: {subcommand}"
+        )
+    raise ValueError(
+        f"Unknown crawl worker command: {args.crawl_worker_command}"
+    )
 
 
 def _json_or_text(value: str) -> object:

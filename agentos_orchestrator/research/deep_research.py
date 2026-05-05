@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import html
 import ipaddress
 import os
 import re
+import sqlite3
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +41,9 @@ def _extract_ticker_candidates(text: str) -> list[str]:
         "STOCKS",
         "LIVE",
         "ANY",
-        "LIST",
-        "BEST",
+        "ASAP",
+        "BUY",
         "RIGHT",
-        "NOW",
         "BULLISH",
         "USA",
         "US",
@@ -183,6 +188,89 @@ class ResearchSettings:
     max_query_variants: int
 
 
+class _HeadlessBrowserWorkerPool:
+    def __init__(
+        self,
+        worker_count: int,
+        bundle_factory: Any,
+        render_with_context: Any,
+        bundle_cleanup: Any,
+    ) -> None:
+        self.worker_count = max(1, worker_count)
+        self._bundle_factory = bundle_factory
+        self._render_with_context = render_with_context
+        self._bundle_cleanup = bundle_cleanup
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._bundles: list[dict[str, Any]] = []
+
+    def _bundle(self) -> dict[str, Any] | None:
+        bundle = getattr(self._local, "bundle", None)
+        if bundle is not None:
+            return bundle
+        bundle = self._bundle_factory()
+        if not bundle:
+            return None
+        self._local.bundle = bundle
+        with self._lock:
+            self._bundles.append(bundle)
+        return bundle
+
+    def _render_one(self, url: str, max_chars: int, timeout_ms: int) -> str:
+        bundle = self._bundle()
+        if not bundle:
+            return ""
+        return self._render_with_context(
+            bundle["context"],
+            url,
+            max_chars,
+            timeout_ms,
+        )
+
+    def render_many(
+        self,
+        urls: list[str],
+        max_chars: int,
+        timeout_ms: int,
+    ) -> dict[str, str]:
+        if not urls:
+            return {}
+        results: dict[str, str] = {}
+        try:
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(self.worker_count, len(urls)))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._render_one,
+                        url,
+                        max_chars,
+                        timeout_ms,
+                    ): url
+                    for url in urls
+                }
+                for future in as_completed(futures):
+                    url = futures[future]
+                    try:
+                        text = future.result()
+                    except Exception:
+                        text = ""
+                    if text:
+                        results[url] = text
+        finally:
+            self.close()
+        return results
+
+    def close(self) -> None:
+        bundles = list(self._bundles)
+        self._bundles.clear()
+        for bundle in bundles:
+            try:
+                self._bundle_cleanup(bundle)
+            except Exception:
+                continue
+
+
 class DeepResearchEngine:
     """MCP-friendly live research fallback using public scholarly APIs."""
 
@@ -195,15 +283,25 @@ class DeepResearchEngine:
         workspace_root: str | Path = ".",
         limit_per_provider: int = 6,
         timeout_seconds: int = 20,
+        research_state_path: str | Path | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.limit_per_provider = limit_per_provider
         self.timeout_seconds = timeout_seconds
+        self._research_state_path_override = (
+            Path(research_state_path)
+            if research_state_path is not None
+            else None
+        )
         self.provider_diagnostics: list[dict[str, Any]] = []
         self._durable_note_urls: set[str] = set()
         self._durable_note_passes: set[int] = set()
         self._dotenv_loaded = False
         self._semantic_gate_cache: dict[str, bool] = {}
+        self._active_run_id = ""
+        self._active_objective = ""
+        self._research_state_ready = False
+        self._crawl_worker_auto_started = False
 
     def run(
         self,
@@ -217,10 +315,13 @@ class DeepResearchEngine:
         self._durable_note_urls = set()
         self._durable_note_passes = set()
         self._semantic_gate_cache = {}
+        self._active_run_id = run_id
         self._load_env_from_dotenv()
+        self._ensure_research_state_store()
         self._record_provider_preflight()
         depth, cleaned_objective = self._split_depth(objective)
         research_objective = self._clean_objective(cleaned_objective)
+        self._active_objective = research_objective
         settings = self._settings_for_depth(depth)
         query = self._query_from_objective(research_objective)
         self._write_progress_checkpoint(
@@ -241,6 +342,10 @@ class DeepResearchEngine:
         ) and not self._looks_like_academic_query(research_objective)
         if current_web_mode:
             settings = self._settings_for_current_web(settings)
+        settings = self._settings_for_general_complex_objective(
+            settings,
+            research_objective,
+        )
         pc_context_info = self._pc_context_summary(pc_context)
         plan = self._build_research_plan(
             research_objective,
@@ -248,19 +353,43 @@ class DeepResearchEngine:
             settings.depth,
             pc_context_info,
         )
+        persistent_query_hints = self._persistent_evidence_query_hints(
+            query,
+            research_objective,
+            limit=32,
+        )
+        if persistent_query_hints:
+            plan["query_plan"] = self._sanitize_query_variants(
+                persistent_query_hints + list(plan.get("query_plan") or []),
+                query,
+            )
         pc_query_seeds = self._pc_query_seeds(pc_context, query)
         if pc_query_seeds:
             plan["query_plan"] = self._sanitize_query_variants(
                 pc_query_seeds + list(plan.get("query_plan") or []),
                 query,
             )
+        persistent_seed_urls = self._persistent_seed_urls(
+            query,
+            research_objective,
+            limit=32,
+        )
         seed_urls = self._source_seed_urls(
             research_objective,
             planning_context,
             pc_context,
         )
+        if persistent_seed_urls:
+            seed_urls = self._persistent_unique_urls(persistent_seed_urls + seed_urls)
         if seed_urls:
             plan["source_seeds"] = seed_urls
+            self._enqueue_url_batch(
+                seed_urls,
+                query,
+                run_id,
+                source_url="seed-plan",
+                priority=12.0,
+            )
         merged_targets = (
             dict(planning_context.get("coverage_targets") or {})
             if planning_context
@@ -387,6 +516,971 @@ class DeepResearchEngine:
             },
         )
 
+    def _research_state_path(self) -> Path:
+        override = self._research_state_path_override
+        if override is None:
+            env_override = os.environ.get(
+                "AGENTOS_RESEARCH_STATE_DB",
+                "",
+            ).strip()
+            if env_override:
+                override = Path(env_override)
+        if override is not None:
+            path = Path(override)
+        else:
+            path = self.workspace_root / ".agentos" / "research_state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _connect_research_state(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._research_state_path())
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+
+    def _ensure_research_state_store(self) -> None:
+        if self._research_state_ready:
+            return
+        with closing(self._connect_research_state()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_queue (
+                        url TEXT PRIMARY KEY,
+                        domain TEXT NOT NULL,
+                        priority REAL NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        source_query TEXT NOT NULL DEFAULT '',
+                        source_url TEXT NOT NULL DEFAULT '',
+                        run_id TEXT NOT NULL DEFAULT '',
+                        js_required INTEGER NOT NULL DEFAULT 0,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_claimed_by TEXT NOT NULL DEFAULT '',
+                        last_claimed_at TEXT NOT NULL DEFAULT '',
+                        last_error TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_crawl_queue_status_priority
+                    ON crawl_queue(status, priority DESC, updated_at DESC)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_observations (
+                        url TEXT PRIMARY KEY,
+                        domain TEXT NOT NULL,
+                        title TEXT NOT NULL DEFAULT '',
+                        excerpt TEXT NOT NULL DEFAULT '',
+                        source_query TEXT NOT NULL DEFAULT '',
+                        query_hints_json TEXT NOT NULL DEFAULT '[]',
+                        outbound_urls_json TEXT NOT NULL DEFAULT '[]',
+                        content_hash TEXT NOT NULL DEFAULT '',
+                        signal_score REAL NOT NULL DEFAULT 0,
+                        used_browser INTEGER NOT NULL DEFAULT 0,
+                        worker_id TEXT NOT NULL DEFAULT '',
+                        fetched_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_crawl_observations_domain_signal
+                    ON crawl_observations(domain, signal_score DESC, updated_at DESC)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_claims (
+                        claim_key TEXT PRIMARY KEY,
+                        claim_text TEXT NOT NULL,
+                        support_count INTEGER NOT NULL DEFAULT 0,
+                        contradiction_count INTEGER NOT NULL DEFAULT 0,
+                        confidence_rank INTEGER NOT NULL DEFAULT 0,
+                        source_urls_json TEXT NOT NULL DEFAULT '[]',
+                        providers_json TEXT NOT NULL DEFAULT '[]',
+                        perspectives_json TEXT NOT NULL DEFAULT '[]',
+                        last_seen_run TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_domains (
+                        domain TEXT PRIMARY KEY,
+                        score REAL NOT NULL DEFAULT 0,
+                        observation_count INTEGER NOT NULL DEFAULT 0,
+                        urls_json TEXT NOT NULL DEFAULT '[]',
+                        claim_keys_json TEXT NOT NULL DEFAULT '[]',
+                        contradiction_keys_json TEXT NOT NULL DEFAULT '[]',
+                        last_seen_run TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_contradictions (
+                        contradiction_key TEXT PRIMARY KEY,
+                        contradiction_text TEXT NOT NULL,
+                        count INTEGER NOT NULL DEFAULT 0,
+                        claim_keys_json TEXT NOT NULL DEFAULT '[]',
+                        source_urls_json TEXT NOT NULL DEFAULT '[]',
+                        last_seen_run TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+        self._research_state_ready = True
+
+    @staticmethod
+    def _load_json_text_list(raw: Any) -> list[str]:
+        if not raw:
+            return []
+        parsed = raw
+        if not isinstance(parsed, list):
+            try:
+                parsed = json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        if not isinstance(parsed, list):
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in parsed:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    @staticmethod
+    def _merge_text_lists(*groups: list[str], limit: int = 64) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                text = str(item or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                result.append(text)
+                if len(result) >= limit:
+                    return result
+        return result
+
+    def _persistent_unique_urls(self, urls: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            clean = str(url or "").strip()
+            if not clean or clean in seen:
+                continue
+            if not self._is_safe_public_url(clean):
+                continue
+            seen.add(clean)
+            result.append(clean)
+        return result
+
+    def _persistent_match_score(
+        self,
+        text: str,
+        query: str,
+        objective: str,
+    ) -> float:
+        alignment = max(
+            self._objective_alignment_score(text, query),
+            self._objective_alignment_score(text, objective),
+        )
+        entity_hits = max(
+            self._entity_hit_count(text, query),
+            self._entity_hit_count(text, objective),
+        )
+        if entity_hits > 0:
+            alignment += 0.15
+        return min(alignment, 1.0)
+
+    def _enqueue_url_batch(
+        self,
+        urls: list[str],
+        source_query: str,
+        run_id: str,
+        source_url: str = "",
+        priority: float = 0.0,
+    ) -> None:
+        safe_urls = self._persistent_unique_urls(urls)
+        if not safe_urls:
+            return
+        self._ensure_research_state_store()
+        now = datetime.now(UTC).isoformat()
+        with closing(self._connect_research_state()) as connection:
+            with connection:
+                for url in safe_urls:
+                    connection.execute(
+                        """
+                        INSERT INTO crawl_queue(
+                            url,
+                            domain,
+                            priority,
+                            status,
+                            source_query,
+                            source_url,
+                            run_id,
+                            js_required,
+                            attempts,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?)
+                        ON CONFLICT(url) DO UPDATE SET
+                            priority = CASE
+                                WHEN excluded.priority > crawl_queue.priority
+                                THEN excluded.priority
+                                ELSE crawl_queue.priority
+                            END,
+                            source_query = CASE
+                                WHEN length(crawl_queue.source_query) = 0
+                                THEN excluded.source_query
+                                ELSE crawl_queue.source_query
+                            END,
+                            source_url = CASE
+                                WHEN length(crawl_queue.source_url) = 0
+                                THEN excluded.source_url
+                                ELSE crawl_queue.source_url
+                            END,
+                            run_id = excluded.run_id,
+                            status = CASE
+                                WHEN crawl_queue.status IN ('failed', 'stale')
+                                THEN 'queued'
+                                ELSE crawl_queue.status
+                            END,
+                            js_required = CASE
+                                WHEN excluded.js_required > crawl_queue.js_required
+                                THEN excluded.js_required
+                                ELSE crawl_queue.js_required
+                            END,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            url,
+                            self._source_domain(url),
+                            float(priority),
+                            str(source_query or "")[:320],
+                            str(source_url or "")[:320],
+                            run_id,
+                            1 if self._needs_browser(url) else 0,
+                            now,
+                            now,
+                        ),
+                    )
+        self._maybe_start_detached_crawl_workers()
+
+    def _auto_start_crawl_workers_enabled(self) -> bool:
+        if os.environ.get("AGENTOS_CRAWL_WORKER_PROCESS") == "1":
+            return False
+        if os.environ.get("AGENTOS_DISABLE_AUTO_CRAWL_WORKERS") == "1":
+            return False
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return False
+        return True
+
+    def _detached_crawl_worker_count(self) -> int:
+        configured = os.environ.get("AGENTOS_CRAWL_WORKER_COUNT", "").strip()
+        if configured:
+            try:
+                return max(0, min(int(configured), 8))
+            except ValueError:
+                return 0
+        cpu_count = os.cpu_count() or 2
+        return max(1, min(4, cpu_count // 4 or 1))
+
+    @staticmethod
+    def _detached_crawl_batch_size() -> int:
+        configured = os.environ.get("AGENTOS_CRAWL_WORKER_BATCH_SIZE", "").strip()
+        if configured:
+            try:
+                return max(1, min(int(configured), 24))
+            except ValueError:
+                return 6
+        return 6
+
+    @staticmethod
+    def _detached_crawl_poll_interval() -> float:
+        configured = os.environ.get(
+            "AGENTOS_CRAWL_WORKER_POLL_INTERVAL",
+            "",
+        ).strip()
+        if configured:
+            try:
+                return max(2.0, min(float(configured), 300.0))
+            except ValueError:
+                return 15.0
+        return 15.0
+
+    @staticmethod
+    def _detached_crawl_claim_ttl() -> int:
+        configured = os.environ.get("AGENTOS_CRAWL_WORKER_CLAIM_TTL", "").strip()
+        if configured:
+            try:
+                return max(60, min(int(configured), 7200))
+            except ValueError:
+                return 900
+        return 900
+
+    def _maybe_start_detached_crawl_workers(self) -> None:
+        if self._crawl_worker_auto_started:
+            return
+        if not self._auto_start_crawl_workers_enabled():
+            return
+        worker_count = self._detached_crawl_worker_count()
+        if worker_count <= 0:
+            return
+        try:
+            from agentos_orchestrator.product import (
+                CrawlWorkerManager,
+                CrawlWorkerServiceManager,
+            )
+
+            service_manager = CrawlWorkerServiceManager(
+                self.workspace_root,
+                python_executable=sys.executable,
+            )
+            service_status = service_manager.status()
+            if service_status.installed:
+                if service_status.status != "running":
+                    service_manager.start(task_name=service_status.task_name)
+                self._crawl_worker_auto_started = True
+                return
+
+            manager = CrawlWorkerManager(
+                self.workspace_root,
+                python_executable=sys.executable,
+            )
+            status = manager.status()
+            if status.status != "running":
+                manager.start(
+                    worker_count=worker_count,
+                    queue_db_path=self._research_state_path(),
+                    poll_interval_seconds=self._detached_crawl_poll_interval(),
+                    batch_size=self._detached_crawl_batch_size(),
+                    claim_ttl_seconds=self._detached_crawl_claim_ttl(),
+                )
+            self._crawl_worker_auto_started = True
+        except Exception:
+            return
+
+    def _requeue_stale_crawl_claims(
+        self,
+        stale_after_seconds: int = 900,
+    ) -> int:
+        self._ensure_research_state_store()
+        cutoff = datetime.now(UTC) - timedelta(seconds=max(stale_after_seconds, 60))
+        with closing(self._connect_research_state()) as connection:
+            with connection:
+                result = connection.execute(
+                    """
+                    UPDATE crawl_queue
+                    SET status = 'queued',
+                        last_error = 'claim-expired',
+                        updated_at = ?
+                    WHERE status = 'claimed'
+                      AND last_claimed_at != ''
+                      AND last_claimed_at < ?
+                    """,
+                    (
+                        datetime.now(UTC).isoformat(),
+                        cutoff.isoformat(),
+                    ),
+                )
+        return int(result.rowcount or 0)
+
+    def _claim_crawl_queue_batch(
+        self,
+        limit: int,
+        worker_id: str,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        self._ensure_research_state_store()
+        claimed: list[dict[str, Any]] = []
+        with closing(self._connect_research_state()) as connection:
+            rows = connection.execute(
+                """
+                SELECT url, domain, priority, source_query, source_url,
+                       run_id, js_required, attempts
+                FROM crawl_queue
+                WHERE status = 'queued'
+                ORDER BY priority DESC, js_required DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 4, limit),),
+            ).fetchall()
+            now = datetime.now(UTC).isoformat()
+            with connection:
+                for row in rows:
+                    updated = connection.execute(
+                        """
+                        UPDATE crawl_queue
+                        SET status = 'claimed',
+                            last_claimed_by = ?,
+                            last_claimed_at = ?,
+                            attempts = attempts + 1,
+                            updated_at = ?
+                        WHERE url = ? AND status = 'queued'
+                        """,
+                        (
+                            worker_id,
+                            now,
+                            now,
+                            str(row["url"] or ""),
+                        ),
+                    ).rowcount
+                    if not updated:
+                        continue
+                    claimed.append(dict(row))
+                    if len(claimed) >= limit:
+                        break
+        return claimed
+
+    def _claim_persistent_crawl_sources(
+        self,
+        query: str,
+        objective: str,
+        limit: int,
+        exclude_urls: list[str] | None = None,
+    ) -> list[ResearchSource]:
+        if limit <= 0:
+            return []
+        self._ensure_research_state_store()
+        excluded = set(self._persistent_unique_urls(exclude_urls or []))
+        worker_seed = (
+            f"{os.getpid()}:{threading.get_ident()}:"
+            f"{time.monotonic_ns()}:{query[:64]}"
+        )
+        worker_id = hashlib.sha1(worker_seed.encode("utf-8")).hexdigest()[:12]
+        rows_to_claim: list[tuple[sqlite3.Row, float]] = []
+        with closing(self._connect_research_state()) as connection:
+            rows = connection.execute(
+                """
+                SELECT url, domain, priority, source_query, source_url,
+                       js_required, attempts
+                FROM crawl_queue
+                WHERE status = 'queued'
+                ORDER BY priority DESC, js_required DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 24),),
+            ).fetchall()
+            now = datetime.now(UTC).isoformat()
+            with connection:
+                for row in rows:
+                    if str(row["url"] or "").strip() in excluded:
+                        continue
+                    label = " ".join(
+                        [
+                            str(row["url"] or ""),
+                            str(row["source_query"] or ""),
+                            str(row["source_url"] or ""),
+                        ]
+                    )
+                    match_score = self._persistent_match_score(
+                        label,
+                        query,
+                        objective,
+                    )
+                    if match_score < 0.2 and str(row["source_query"] or "").strip():
+                        continue
+                    updated = connection.execute(
+                        """
+                        UPDATE crawl_queue
+                        SET status = 'claimed',
+                            last_claimed_by = ?,
+                            last_claimed_at = ?,
+                            attempts = attempts + 1,
+                            updated_at = ?
+                        WHERE url = ? AND status = 'queued'
+                        """,
+                        (
+                            worker_id,
+                            now,
+                            now,
+                            str(row["url"] or ""),
+                        ),
+                    ).rowcount
+                    if not updated:
+                        continue
+                    rows_to_claim.append((row, match_score))
+                    if len(rows_to_claim) >= limit:
+                        break
+        claimed_sources: list[ResearchSource] = []
+        for row, match_score in rows_to_claim:
+            url = str(row["url"] or "").strip()
+            if not url:
+                continue
+            domain = str(row["domain"] or "").strip()
+            source_query = str(row["source_query"] or "").strip()
+            quality_flags = ["persistent-crawl-queue"]
+            if int(row["js_required"] or 0) == 1:
+                quality_flags.append("js-render-required")
+            abstract = (
+                source_query
+                or str(row["source_url"] or "").strip()
+                or self._label_from_url(url)
+            )
+            claimed_sources.append(
+                ResearchSource(
+                    provider="persistent-crawl-queue",
+                    title=self._label_from_url(url),
+                    url=url,
+                    authors=[domain] if domain else [],
+                    abstract=f"Persistent crawl candidate: {abstract}"[:320],
+                    citation_count=0,
+                    score=max(
+                        float(row["priority"] or 0.0),
+                        4.0 + (match_score * 20.0),
+                    ),
+                    quality_flags=quality_flags,
+                )
+            )
+        return claimed_sources
+
+    def _update_crawl_queue_status(
+        self,
+        url: str,
+        status: str,
+        error: str = "",
+    ) -> None:
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            return
+        self._ensure_research_state_store()
+        with closing(self._connect_research_state()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE crawl_queue
+                    SET status = ?,
+                        last_error = ?,
+                        updated_at = ?
+                    WHERE url = ?
+                    """,
+                    (
+                        status,
+                        str(error or "")[:320],
+                        datetime.now(UTC).isoformat(),
+                        clean_url,
+                    ),
+                )
+
+    def _fetch_source_content(
+        self,
+        source: ResearchSource,
+        query: str,
+        browser_prefetch: dict[str, str] | None = None,
+    ) -> tuple[str, str, str, bool]:
+        if not self._is_safe_public_url(source.url):
+            return "", "", "skipped", False
+        prefetched = browser_prefetch or {}
+        used_browser = False
+        raw_html = ""
+        if self._needs_browser(source.url):
+            browser_text = prefetched.get(source.url)
+            if not browser_text:
+                browser_text = self._get_text_browser(
+                    source.url,
+                    max_chars=80_000,
+                )
+            if browser_text and self._text_signal_score(browser_text) >= 0.1:
+                raw_html = browser_text
+                content = browser_text
+                used_browser = True
+            else:
+                raw_html = self._get_text(
+                    source.url,
+                    accept="text/html,application/xhtml+xml,*/*",
+                    max_bytes=60_000,
+                    timeout_seconds=10,
+                )
+                content = self._get_text_stitched(
+                    source.url,
+                    accept="text/html,application/xhtml+xml,*/*",
+                    page_bytes=60_000,
+                    max_pages=4,
+                    overlap_bytes=1_600,
+                    query=query,
+                )
+                if not content and raw_html:
+                    content = self._html_to_text(raw_html)
+        else:
+            raw_html = self._get_text(
+                source.url,
+                accept="text/html,application/xhtml+xml,*/*",
+                max_bytes=60_000,
+                timeout_seconds=10,
+            )
+            content = self._get_text_stitched(
+                source.url,
+                accept="text/html,application/xhtml+xml,*/*",
+                page_bytes=60_000,
+                max_pages=4,
+                overlap_bytes=1_600,
+                query=query,
+            )
+            if not raw_html and not content:
+                return "", "", "no-content", False
+            signal_before = self._text_signal_score(
+                self._html_to_text(raw_html) if raw_html else content
+            )
+            overlay_markers = (
+                self._overlay_marker_count(raw_html) if raw_html else 0
+            )
+            if signal_before < 0.16 and overlay_markers > 0:
+                resolved_html, status = self._interrupt_resolve_overlays(
+                    raw_html
+                )
+                if status != "resolved":
+                    if "unreachable-paywalled" not in source.quality_flags:
+                        source.quality_flags.append("unreachable-paywalled")
+                    return "", raw_html, "unreachable-paywalled", False
+                raw_html = resolved_html
+            if self._should_retry_with_browser(
+                source.url,
+                raw_html or content,
+                query,
+            ):
+                browser_text = prefetched.get(source.url)
+                if not browser_text:
+                    browser_text = self._get_text_browser(
+                        source.url,
+                        max_chars=80_000,
+                    )
+                if browser_text:
+                    raw_html = browser_text
+                    used_browser = True
+                    content = browser_text
+            if not content and raw_html:
+                content = self._html_to_text(raw_html)
+        if not content:
+            return "", raw_html, "no-content", used_browser
+        return content, raw_html, "processed", used_browser
+
+    def _record_crawl_observation(
+        self,
+        source: ResearchSource,
+        content: str,
+        source_query: str,
+        query_hints: list[str],
+        outbound_urls: list[str],
+        worker_id: str,
+        used_browser: bool,
+    ) -> None:
+        clean_url = str(source.url or "").strip()
+        if not clean_url:
+            return
+        self._ensure_research_state_store()
+        excerpt = re.sub(r"\s+", " ", content).strip()[:1600]
+        if not excerpt:
+            return
+        title = str(source.title or self._label_from_url(clean_url)).strip()[:200]
+        domain = self._source_domain(clean_url)
+        now = datetime.now(UTC).isoformat()
+        signal_score = self._text_signal_score(excerpt)
+        content_hash = hashlib.sha1(excerpt.encode("utf-8")).hexdigest()
+        merged_outbound = self._persistent_unique_urls(outbound_urls)[:32]
+        with closing(self._connect_research_state()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO crawl_observations(
+                        url,
+                        domain,
+                        title,
+                        excerpt,
+                        source_query,
+                        query_hints_json,
+                        outbound_urls_json,
+                        content_hash,
+                        signal_score,
+                        used_browser,
+                        worker_id,
+                        fetched_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        domain = excluded.domain,
+                        title = excluded.title,
+                        excerpt = excluded.excerpt,
+                        source_query = excluded.source_query,
+                        query_hints_json = excluded.query_hints_json,
+                        outbound_urls_json = excluded.outbound_urls_json,
+                        content_hash = excluded.content_hash,
+                        signal_score = excluded.signal_score,
+                        used_browser = excluded.used_browser,
+                        worker_id = excluded.worker_id,
+                        fetched_at = excluded.fetched_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        clean_url,
+                        domain,
+                        title,
+                        excerpt,
+                        str(source_query or "")[:320],
+                        json.dumps(query_hints[:16]),
+                        json.dumps(merged_outbound),
+                        content_hash,
+                        float(signal_score),
+                        1 if used_browser else 0,
+                        worker_id[:120],
+                        now,
+                        now,
+                    ),
+                )
+                if domain:
+                    existing_domain = connection.execute(
+                        """
+                        SELECT score, observation_count, urls_json,
+                               claim_keys_json, contradiction_keys_json
+                        FROM evidence_domains
+                        WHERE domain = ?
+                        """,
+                        (domain,),
+                    ).fetchone()
+                    merged_urls = self._merge_text_lists(
+                        self._load_json_text_list(existing_domain["urls_json"])
+                        if existing_domain
+                        else [],
+                        [clean_url],
+                        limit=64,
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO evidence_domains(
+                            domain,
+                            score,
+                            observation_count,
+                            urls_json,
+                            claim_keys_json,
+                            contradiction_keys_json,
+                            last_seen_run,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(domain) DO UPDATE SET
+                            score = excluded.score,
+                            observation_count = excluded.observation_count,
+                            urls_json = excluded.urls_json,
+                            claim_keys_json = excluded.claim_keys_json,
+                            contradiction_keys_json = excluded.contradiction_keys_json,
+                            last_seen_run = excluded.last_seen_run,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            domain,
+                            float(signal_score * 10.0)
+                            + float(existing_domain["score"] or 0.0)
+                            if existing_domain
+                            else float(signal_score * 10.0),
+                            1
+                            + int(existing_domain["observation_count"] or 0)
+                            if existing_domain
+                            else 1,
+                            json.dumps(merged_urls),
+                            json.dumps(
+                                self._load_json_text_list(
+                                    existing_domain["claim_keys_json"]
+                                )
+                                if existing_domain
+                                else []
+                            ),
+                            json.dumps(
+                                self._load_json_text_list(
+                                    existing_domain["contradiction_keys_json"]
+                                )
+                                if existing_domain
+                                else []
+                            ),
+                            self._active_run_id or worker_id[:120],
+                            now,
+                        ),
+                    )
+
+    def _persistent_evidence_query_hints(
+        self,
+        query: str,
+        objective: str,
+        limit: int = 16,
+    ) -> list[str]:
+        self._ensure_research_state_store()
+        candidates: list[str] = []
+        with closing(self._connect_research_state()) as connection:
+            claim_rows = connection.execute(
+                """
+                SELECT claim_text, contradiction_count, confidence_rank
+                FROM evidence_claims
+                ORDER BY support_count DESC, confidence_rank DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+            contradiction_rows = connection.execute(
+                """
+                SELECT contradiction_text
+                FROM evidence_contradictions
+                ORDER BY count DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 4, 24),),
+            ).fetchall()
+            domain_rows = connection.execute(
+                """
+                SELECT domain
+                FROM evidence_domains
+                ORDER BY score DESC, observation_count DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 3, 18),),
+            ).fetchall()
+            observation_rows = connection.execute(
+                """
+                SELECT excerpt, source_query, query_hints_json
+                FROM crawl_observations
+                ORDER BY signal_score DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+
+        for row in claim_rows:
+            claim_text = str(row["claim_text"] or "").strip()
+            if not claim_text:
+                continue
+            match_score = self._persistent_match_score(claim_text, query, objective)
+            if match_score < 0.28:
+                continue
+            if int(row["contradiction_count"] or 0) > 0:
+                candidate = self._query_core_terms(
+                    f"{objective} {claim_text} independent verification"
+                )
+            else:
+                candidate = self._query_core_terms(f"{query} {claim_text}")
+            if candidate:
+                candidates.append(candidate)
+
+        for row in contradiction_rows:
+            contradiction_text = str(row["contradiction_text"] or "").strip()
+            if not contradiction_text:
+                continue
+            match_score = self._persistent_match_score(
+                contradiction_text,
+                query,
+                objective,
+            )
+            if match_score < 0.24:
+                continue
+            candidate = self._query_core_terms(
+                f"{objective} {contradiction_text} counterevidence"
+            )
+            if candidate:
+                candidates.append(candidate)
+
+        for row in domain_rows[: max(4, limit // 2)]:
+            domain = str(row["domain"] or "").strip()
+            if not domain:
+                continue
+            candidate = self._query_core_terms(f"site:{domain} {query}")
+            if candidate:
+                candidates.append(candidate)
+
+        for row in observation_rows:
+            excerpt = str(row["excerpt"] or "").strip()
+            source_query = str(row["source_query"] or "").strip()
+            if self._persistent_match_score(excerpt, query, objective) < 0.22:
+                continue
+            candidates.extend(self._load_json_text_list(row["query_hints_json"]))
+            if source_query:
+                candidate = self._query_core_terms(f"{query} {source_query}")
+                if candidate:
+                    candidates.append(candidate)
+
+        return self._sanitize_query_variants(candidates, query)[:limit]
+
+    def _persistent_seed_urls(
+        self,
+        query: str,
+        objective: str,
+        limit: int = 16,
+    ) -> list[str]:
+        self._ensure_research_state_store()
+        urls: list[str] = []
+        with closing(self._connect_research_state()) as connection:
+            claim_rows = connection.execute(
+                """
+                SELECT claim_text, source_urls_json
+                FROM evidence_claims
+                ORDER BY support_count DESC, confidence_rank DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+            observation_rows = connection.execute(
+                """
+                SELECT url, excerpt, outbound_urls_json
+                FROM crawl_observations
+                ORDER BY signal_score DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+            queue_rows = connection.execute(
+                """
+                SELECT url, source_query
+                FROM crawl_queue
+                WHERE status IN ('processed', 'queued', 'claimed')
+                ORDER BY priority DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+
+        for row in claim_rows:
+            claim_text = str(row["claim_text"] or "").strip()
+            if self._persistent_match_score(claim_text, query, objective) < 0.28:
+                continue
+            urls.extend(self._load_json_text_list(row["source_urls_json"]))
+            if len(urls) >= limit * 3:
+                break
+
+        if len(urls) < limit:
+            for row in observation_rows:
+                excerpt = str(row["excerpt"] or "").strip()
+                label = f"{row['url']} {excerpt[:280]}".strip()
+                if self._persistent_match_score(label, query, objective) < 0.22:
+                    continue
+                urls.append(str(row["url"] or "").strip())
+                urls.extend(self._load_json_text_list(row["outbound_urls_json"]))
+                if len(urls) >= limit * 3:
+                    break
+
+        if len(urls) < limit:
+            for row in queue_rows:
+                source_query = str(row["source_query"] or "").strip()
+                label = f"{row['url']} {source_query}".strip()
+                if self._persistent_match_score(label, query, objective) < 0.22:
+                    continue
+                urls.append(str(row["url"] or "").strip())
+                if len(urls) >= limit * 3:
+                    break
+
+        return self._persistent_unique_urls(urls)[:limit]
     @classmethod
     def _source_seed_urls(
         cls,
@@ -395,6 +1489,8 @@ class DeepResearchEngine:
         pc_context: dict[str, Any] | None,
     ) -> list[str]:
         candidates: list[str] = []
+        if pc_context:
+            candidates.extend(cls._pc_context_priority_urls(pc_context))
         candidates.extend(cls._collect_urls(objective))
         if planning_context:
             candidates.extend(cls._collect_urls(planning_context))
@@ -413,7 +1509,40 @@ class DeepResearchEngine:
                 continue
             seen.add(cleaned)
             deduped.append(cleaned)
-        return deduped[:12]
+        return deduped[:48]
+
+    @classmethod
+    def _pc_context_priority_urls(
+        cls,
+        pc_context: dict[str, Any],
+    ) -> list[str]:
+        pc_findings = pc_context.get("pc_findings") or {}
+        if not isinstance(pc_findings, dict):
+            return []
+        candidates: list[str] = []
+        candidates.extend(
+            str(url) for url in (pc_findings.get("direct_urls") or [])
+        )
+        for result in pc_findings.get("judged_results") or []:
+            if not isinstance(result, dict):
+                continue
+            candidates.append(str(result.get("url") or ""))
+        candidates.extend(
+            str(url) for url in (pc_findings.get("candidate_urls") or [])
+        )
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in candidates:
+            cleaned = url.strip().rstrip(").,;]}>\"'")
+            if not cleaned or cleaned in seen:
+                continue
+            if not cls._is_safe_public_url(cleaned):
+                continue
+            if cls._is_search_result_url(cleaned):
+                continue
+            seen.add(cleaned)
+            deduped.append(cleaned)
+        return deduped
 
     @classmethod
     def _collect_urls(cls, value: Any) -> list[str]:
@@ -490,6 +1619,64 @@ class DeepResearchEngine:
             score=18.0,
         )
 
+    @staticmethod
+    def _verified_terminal_claims(
+        pc_findings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        verified: list[dict[str, Any]] = []
+        for item in (pc_findings.get("terminal_verifications") or [])[:24]:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or "").strip()
+            expression = str(item.get("expression") or "").strip()
+            status = str(item.get("status") or "").strip().lower()
+            try:
+                exit_code = int(item.get("exit_code") or 0)
+            except (TypeError, ValueError):
+                exit_code = 1
+            if not claim:
+                continue
+            verified.append(
+                {
+                    "claim": claim[:400],
+                    "expression": expression[:120],
+                    "status": status,
+                    "exit_code": exit_code,
+                    "verified": exit_code == 0
+                    and status in {"ok", "completed", "success", "process-executed"},
+                }
+            )
+        return verified
+
+    @classmethod
+    def _verification_matches_browser_result(
+        cls,
+        verification: dict[str, Any],
+        result: dict[str, Any],
+    ) -> bool:
+        claim = str(verification.get("claim") or "").strip().lower()
+        if not claim:
+            return False
+        result_text = " ".join(
+            [
+                str(result.get("title") or ""),
+                str(result.get("page_excerpt") or result.get("abstract") or ""),
+                " ".join(
+                    str(claim_text or "")
+                    for claim_text in (result.get("evidence_claims") or [])[:4]
+                ),
+            ]
+        ).lower()
+        if not result_text.strip():
+            return False
+        if claim in result_text:
+            return True
+        keywords = [token for token in cls._keywords(claim) if len(token) >= 4][:5]
+        if not keywords:
+            return False
+        overlap = sum(1 for token in keywords if token in result_text)
+        return overlap >= min(2, len(keywords))
+
     def _pc_finding_seed_sources(
         self,
         pc_context: dict[str, Any] | None,
@@ -500,11 +1687,12 @@ class DeepResearchEngine:
         judged_results = pc_findings.get("judged_results") or []
         candidate_urls = pc_findings.get("candidate_urls") or []
         frontier = pc_findings.get("frontier") or {}
+        terminal_verifications = self._verified_terminal_claims(pc_findings)
         sources: list[ResearchSource] = []
         seen_urls: set[str] = set()
         frontier_mode = str(frontier.get("mode") or "").strip().lower()
-        judged_limit = 60 if frontier_mode == "expansive" else 30
-        supplemental_limit = 40 if frontier_mode == "expansive" else 16
+        judged_limit = 180 if frontier_mode == "expansive" else 40
+        supplemental_limit = 120 if frontier_mode == "expansive" else 24
 
         for result in judged_results[:judged_limit]:
             if not isinstance(result, dict):
@@ -531,12 +1719,34 @@ class DeepResearchEngine:
                 quality_score = float(quality.get("quality_score") or 0.0)
             except (TypeError, ValueError):
                 quality_score = 0.0
+            quality_flags = ["browser-judged-source"]
+            matched_verifications = [
+                item
+                for item in terminal_verifications
+                if item.get("verified")
+                and self._verification_matches_browser_result(item, result)
+            ]
+            if matched_verifications:
+                quality_flags.append("browser-terminal-verified")
+                quality_score = max(quality_score, 0.85)
 
             abstract_parts: list[str] = []
             if judgment:
                 abstract_parts.append(judgment)
             if evidence_claims:
                 abstract_parts.append("Claims: " + "; ".join(evidence_claims[:3]))
+            if matched_verifications:
+                formatted = []
+                for item in matched_verifications[:2]:
+                    claim_text = str(item.get("claim") or "").strip()
+                    expression = str(item.get("expression") or "").strip()
+                    if expression:
+                        formatted.append(f"{claim_text} [terminal:{expression}]")
+                    else:
+                        formatted.append(claim_text)
+                abstract_parts.append(
+                    "Terminal verification: " + "; ".join(formatted)
+                )
             if excerpt:
                 abstract_parts.append(excerpt[:1400])
             if not abstract_parts:
@@ -553,12 +1763,20 @@ class DeepResearchEngine:
                     abstract=" ".join(abstract_parts)[:3000],
                     score=32.0 + min(max(quality_score, 0.0), 1.0) * 30.0,
                     evidence_grade="tool-observation",
-                    quality_flags=["browser-judged-source"],
+                    quality_flags=quality_flags,
                 )
             )
 
-        supplemental_urls = list(pc_findings.get("direct_urls") or []) + list(
-            candidate_urls
+        checkpoint_url_leads = self._pc_checkpoint_url_leads(pc_findings)
+        graph_url_leads = self._pc_frontier_graph_top_urls(pc_findings)
+        direct_url_count = len(pc_findings.get("direct_urls") or [])
+        candidate_url_count = len(candidate_urls)
+        checkpoint_url_count = len(checkpoint_url_leads)
+        supplemental_urls = (
+            list(pc_findings.get("direct_urls") or [])
+            + list(candidate_urls)
+            + checkpoint_url_leads
+            + graph_url_leads
         )
         for index, url in enumerate(supplemental_urls[:supplemental_limit]):
             clean_url = str(url or "").strip()
@@ -567,32 +1785,56 @@ class DeepResearchEngine:
             if clean_url in seen_urls:
                 continue
             seen_urls.add(clean_url)
-            domain = urllib.parse.urlparse(clean_url).netloc.lower().lstrip("www.")
-            is_candidate = index >= len(pc_findings.get("direct_urls") or [])
-            quality_flag = (
-                "browser-frontier-candidate"
-                if is_candidate
-                else "browser-discovered-url"
-            )
-            abstract = (
-                "Browser frontier candidate admitted as a retrieval seed from "
-                "sandbox research."
-                if is_candidate
-                else "Browser-discovered source collected during sandbox research "
-                "and admitted as a retrieval seed."
-            )
-            sources.append(
-                ResearchSource(
+            if index < direct_url_count:
+                quality_flag = "browser-discovered-url"
+                is_candidate = False
+            elif index < direct_url_count + candidate_url_count:
+                quality_flag = "browser-frontier-candidate"
+                is_candidate = True
+            elif index < direct_url_count + candidate_url_count + checkpoint_url_count:
+                quality_flag = "browser-checkpoint-url-lead"
+                is_candidate = True
+            else:
+                quality_flag = "browser-frontier-graph-lead"
+                is_candidate = True
+            fetched = self._seed_source(clean_url)
+            if fetched is None:
+                if frontier_mode != "expansive":
+                    continue
+                fetched = ResearchSource(
                     provider="pc-browser-research",
                     title=self._label_from_url(clean_url)[:160],
                     url=clean_url,
-                    authors=[domain] if domain else [],
-                    abstract=abstract,
-                    score=14.0 if is_candidate else 20.0,
-                    evidence_grade="tool-observation",
-                    quality_flags=[quality_flag],
+                    authors=[self._source_domain(clean_url)],
+                    abstract=(
+                        "Browser frontier URL retained as an unverified lead "
+                        "pending content fetch."
+                    ),
+                    score=0.1,
+                    evidence_grade="weak",
+                    quality_flags=[quality_flag, "unfetched-browser-lead"],
                 )
-            )
+            elif fetched.abstract.startswith(
+                "Seeded external source collected"
+            ):
+                if frontier_mode != "expansive":
+                    continue
+                fetched.provider = "pc-browser-research"
+                fetched.score = 0.1
+                fetched.evidence_grade = "weak"
+                fetched.quality_flags = [
+                    quality_flag,
+                    "unfetched-browser-lead",
+                ]
+            else:
+                fetched.provider = "pc-browser-research"
+                fetched.score = max(
+                    float(fetched.score or 0.0),
+                    18.0 if is_candidate else 24.0,
+                )
+                fetched.evidence_grade = "ungraded"
+                fetched.quality_flags = [quality_flag, "browser-fetched-seed"]
+            sources.append(fetched)
 
         if sources:
             self._record_provider_diagnostic(
@@ -601,6 +1843,44 @@ class DeepResearchEngine:
                 f"seeded {len(sources)} browser-judged sources",
             )
         return sources
+
+    @staticmethod
+    def _pc_frontier_checkpoints(pc_findings: dict[str, Any]) -> list[dict[str, Any]]:
+        checkpoints = pc_findings.get("frontier_checkpoints") or []
+        if not isinstance(checkpoints, list):
+            return []
+        return [item for item in checkpoints if isinstance(item, dict)]
+
+    @staticmethod
+    def _pc_unique_strings(items: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        return deduped
+
+    def _pc_checkpoint_url_leads(self, pc_findings: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for checkpoint in self._pc_frontier_checkpoints(pc_findings)[:48]:
+            for url in checkpoint.get("url_leads") or []:
+                clean_url = str(url or "").strip()
+                if clean_url:
+                    urls.append(clean_url)
+        return self._pc_unique_strings(urls)[:96]
+
+    def _pc_frontier_graph_top_urls(self, pc_findings: dict[str, Any]) -> list[str]:
+        frontier_graph = pc_findings.get("frontier_graph") or {}
+        summary = frontier_graph.get("summary") or {}
+        urls: list[str] = []
+        for url in summary.get("top_urls") or []:
+            clean_url = str(url or "").strip()
+            if clean_url:
+                urls.append(clean_url)
+        return self._pc_unique_strings(urls)[:48]
 
     def _pc_query_seeds(
         self,
@@ -611,11 +1891,22 @@ class DeepResearchEngine:
             return []
         pc_findings = pc_context.get("pc_findings") or {}
         candidates: list[str] = []
-        for item in (pc_findings.get("search_queries") or [])[:24]:
+        for item in (pc_findings.get("search_queries") or [])[:64]:
             text = str(item or "").strip()
             if text:
                 candidates.append(text[:240])
-        for result in (pc_findings.get("judged_results") or [])[:24]:
+        for verification in self._verified_terminal_claims(pc_findings)[:32]:
+            if not verification.get("verified"):
+                continue
+            claim_text = str(verification.get("claim") or "").strip()
+            if not claim_text:
+                continue
+            keywords = self._query_core_terms(claim_text)
+            if keywords and len(keywords.split()) >= 3:
+                candidates.append(keywords[:240])
+            else:
+                candidates.append(claim_text[:240])
+        for result in (pc_findings.get("judged_results") or [])[:64]:
             if not isinstance(result, dict):
                 continue
             title = str(result.get("title") or "").strip()
@@ -628,7 +1919,31 @@ class DeepResearchEngine:
                 keywords = self._query_core_terms(f"{title} {claim_text}".strip())
                 if keywords and len(keywords.split()) >= 3:
                     candidates.append(keywords[:240])
-        return self._sanitize_query_variants(candidates, query)[:48]
+        for checkpoint in self._pc_frontier_checkpoints(pc_findings)[:48]:
+            for follow_up in checkpoint.get("follow_up_queries") or []:
+                text = str(follow_up or "").strip()
+                if text:
+                    candidates.append(text[:240])
+            for contradiction in checkpoint.get("contradictions") or []:
+                text = str(contradiction or "").strip()
+                if not text:
+                    continue
+                keywords = self._query_core_terms(f"{query} {text}".strip())
+                if keywords and len(keywords.split()) >= 3:
+                    candidates.append(keywords[:240])
+            for evidence_gap in checkpoint.get("missing_evidence") or []:
+                text = str(evidence_gap or "").strip()
+                if not text:
+                    continue
+                keywords = self._query_core_terms(f"{query} {text}".strip())
+                if keywords and len(keywords.split()) >= 3:
+                    candidates.append(keywords[:240])
+            for domain in checkpoint.get("domain_leads") or []:
+                domain_text = str(domain or "").strip()
+                if not domain_text:
+                    continue
+                candidates.append(f"{query[:180]} site:{domain_text}"[:240])
+        return self._sanitize_query_variants(candidates, query)[:160]
 
     def _iterative_retrieval(
         self,
@@ -648,6 +1963,14 @@ class DeepResearchEngine:
             plan.get("source_seeds") or []
         )
         all_sources.extend(self._pc_finding_seed_sources(pc_context))
+        all_sources.extend(
+            self._claim_persistent_crawl_sources(
+                query,
+                plan.get("core_question") or query,
+                limit=min(24, settings.max_sources),
+                exclude_urls=list(plan.get("source_seeds") or []),
+            )
+        )
         # Seed AI-reasoned authoritative domains as sources so they are
         # considered from the very first pass.
         ai_domains = plan.get("ai_authoritative_domains") or []
@@ -665,7 +1988,6 @@ class DeepResearchEngine:
         # Artificial runtime floors removed — depth is driven by
         # information exhaustion (enrichment, citation chasing, gap analysis)
         # not wall-clock timers.
-        min_runtime_seconds = 0
         min_depth_passes = self._min_depth_passes(settings.depth, targets)
         max_low_novelty_streak = self._max_low_novelty_streak(
             settings.depth,
@@ -679,6 +2001,10 @@ class DeepResearchEngine:
         # No runtime-based pass floor — passes are information-driven.
         max_passes = max(max_passes, min_depth_passes)
         max_passes = max(1, min(max_passes, 240))
+        effective_novelty_threshold = self._effective_novelty_threshold(
+            settings.depth,
+            targets,
+        )
         started_at = time.monotonic()
         retrieval_passes: list[dict[str, Any]] = []
         previous_titles: set[str] = set()
@@ -871,6 +2197,15 @@ class DeepResearchEngine:
                         for cq in chain_eq:
                             if cq and cq not in all_variants:
                                 all_variants.append(cq)
+
+            queued_sources = self._claim_persistent_crawl_sources(
+                query,
+                plan.get("core_question") or query,
+                limit=min(12 if pass_index > 0 else 16, settings.max_sources),
+                exclude_urls=[source.url for source in all_sources if source.url],
+            )
+            if queued_sources:
+                all_sources.extend(queued_sources)
 
             unique_url_count = self._unique_source_url_count(all_sources)
 
@@ -1085,10 +2420,12 @@ class DeepResearchEngine:
                     pass
             previous_titles = current_titles
             # No artificial budget — depth is information-driven.
-            budget_met = True
             depth_met = (pass_index + 1) >= min_depth_passes
-            novelty_threshold = float(targets.get("min_novelty_rate") or 0.0)
-            if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
+            novelty_threshold = effective_novelty_threshold
+            low_novelty_pass = (
+                coverage["novelty_rate"] < novelty_threshold and pass_index > 0
+            )
+            if low_novelty_pass:
                 low_novelty_streak += 1
             else:
                 low_novelty_streak = 0
@@ -1127,9 +2464,11 @@ class DeepResearchEngine:
                     "stop_reason": stop_reason,
                     "query_variants": all_variants,
                 }
-            if coverage["novelty_rate"] < novelty_threshold and pass_index > 0:
-                if not depth_met or low_novelty_streak < max_low_novelty_streak:
-                    continue
+            if (
+                low_novelty_pass
+                and depth_met
+                and low_novelty_streak >= max_low_novelty_streak
+            ):
                 stop_reason = "novelty_below_threshold"
                 break
             if coverage["max_contradiction_risk"] > float(
@@ -1171,6 +2510,28 @@ class DeepResearchEngine:
                         query,
                     )
                 )
+            if low_novelty_pass:
+                pivot_queries = self._domain_diversification_queries(
+                    plan.get("core_question") or query,
+                    selected,
+                    pass_index,
+                    coverage,
+                )
+                if pivot_queries:
+                    self._record_provider_diagnostic(
+                        "low-novelty-pivot",
+                        "triggered",
+                        (
+                            f"pass {pass_index + 1}: "
+                            f"novelty_rate={coverage['novelty_rate']:.3f}"
+                        ),
+                    )
+                    all_variants.extend(
+                        self._sanitize_query_variants(
+                            pivot_queries,
+                            query,
+                        )
+                    )
             all_variants = self._sanitize_query_variants(all_variants, query)
 
         if passing_snapshot is not None:
@@ -1356,6 +2717,21 @@ class DeepResearchEngine:
         return max(streak, 6)
 
     @staticmethod
+    def _effective_novelty_threshold(
+        depth: str,
+        targets: dict[str, Any],
+    ) -> float:
+        try:
+            configured = float(targets.get("min_novelty_rate") or 0.0)
+        except (TypeError, ValueError):
+            configured = 0.0
+        if depth == "multi-hour":
+            return max(configured, 0.03)
+        if depth == "standard":
+            return max(configured, 0.0)
+        return max(configured, 0.0)
+
+    @staticmethod
     def _pass_variants(
         variants: list[str],
         pass_index: int,
@@ -1430,13 +2806,7 @@ class DeepResearchEngine:
         )
         weak_count = sum(1 for source in selected if source.evidence_grade == "weak")
         on_topic_count = sum(
-            1
-            for source in selected
-            if cls._objective_alignment_score(
-                f"{source.title} {source.abstract}",
-                query,
-            )
-            >= 0.35
+            1 for source in selected if cls._source_is_on_topic(source, query)
         )
         on_topic_ratio = on_topic_count / max(len(selected), 1)
         weak_ratio = weak_count / max(len(selected), 1)
@@ -1548,6 +2918,49 @@ class DeepResearchEngine:
         matched.sort(key=lambda item: item.score, reverse=True)
         return matched
 
+    @classmethod
+    def _source_is_on_topic(cls, source: ResearchSource, query: str) -> bool:
+        if not query:
+            return True
+        if "off-topic" in (source.quality_flags or []):
+            return False
+        if source.score <= 0.0 and source.provider != "gemini-flash":
+            return False
+        text = cls._strip_dom_noise_tokens(f"{source.title} {source.abstract}")
+        if not text:
+            return False
+        alignment = cls._objective_alignment_score(text, query)
+        entity_hits = cls._entity_hit_count(text, query)
+        deterministic = cls._passes_deterministic_semantic_gate(text, query)
+        if cls._looks_like_market_query(query):
+            market_signal = cls._has_market_signal(text)
+            actionable_market_signal = cls._has_actionable_market_signal(text)
+            if not market_signal and entity_hits == 0:
+                return False
+            if entity_hits > 0:
+                return deterministic or alignment >= 0.2
+            if cls._looks_like_public_security_query(query):
+                if not actionable_market_signal and alignment < 0.45:
+                    return False
+                if not actionable_market_signal and any(
+                    flag in (source.quality_flags or [])
+                    for flag in (
+                        "promo-market-listicle",
+                        "low-signal-market-host",
+                    )
+                ):
+                    return False
+            return (
+                deterministic and actionable_market_signal
+            ) or alignment >= 0.35
+        if source.provider == "gemini-flash":
+            return (
+                alignment >= 0.25
+                or entity_hits > 0
+                or source.relevance >= 0.55
+            )
+        return deterministic or alignment >= 0.35 or entity_hits > 0
+
     @staticmethod
     def _meets_targets(coverage: dict[str, Any], targets: dict[str, Any]) -> bool:
         if not targets:
@@ -1587,11 +3000,18 @@ class DeepResearchEngine:
 
         # Generate follow-ups from strongest current evidence terms.
         evidence_terms: list[str] = []
+        generic_terms = self._generic_query_terms()
+        query_anchor_terms = self._objective_anchor_terms(query)
         for source in selected[:10]:
             text = f"{source.title} {source.abstract}"
             for token in self._keywords(text):
                 if len(token) < 4:
                     continue
+                if token in generic_terms:
+                    continue
+                if query_anchor_terms and token not in query_anchor_terms:
+                    if self._objective_alignment_score(token, query) < 0.25:
+                        continue
                 if token in evidence_terms:
                     continue
                 evidence_terms.append(token)
@@ -4929,64 +6349,28 @@ class DeepResearchEngine:
             for source in self._chained_sources
             if str(source.url or "").strip()
         }
+        browser_prefetch = self._headless_browser_pool_fetch(
+            self._persistent_unique_urls(
+                [
+                    str(source.url or "")
+                    for source in sources
+                    if self._needs_browser(str(source.url or ""))
+                ]
+            ),
+            max_chars=80_000,
+            timeout_ms=18_000,
+        )
 
         def _enrich_one(
             source: ResearchSource,
-        ) -> tuple[list[str], list[ResearchSource]]:
-            if not self._is_safe_public_url(source.url):
-                return [], []
-
-            # Use real browser rendering for JS-heavy finance/news sites so we
-            # get actual article content instead of a blank or paywalled shell.
-            # For other URLs, use the standard multi-page stitcher.
-            if self._needs_browser(source.url):
-                browser_text = self._get_text_browser(source.url, max_chars=80_000)
-                if browser_text and self._text_signal_score(browser_text) >= 0.1:
-                    # Browser gave us clean plain text — use it directly.
-                    raw_html = browser_text
-                    content = browser_text
-                else:
-                    # Browser failed or gave noise — fall through to HTTP.
-                    raw_html = self._get_text_stitched(
-                        source.url,
-                        accept="text/html,application/xhtml+xml,*/*",
-                        page_bytes=60_000,
-                        max_pages=4,
-                        overlap_bytes=1_600,
-                        query=query,
-                    )
-                    content = self._html_to_text(raw_html) if raw_html else ""
-            else:
-                raw_html = self._get_text_stitched(
-                    source.url,
-                    accept="text/html,application/xhtml+xml,*/*",
-                    page_bytes=60_000,
-                    max_pages=4,
-                    overlap_bytes=1_600,
-                    query=query,
-                )
-                if not raw_html:
-                    return [], []
-                signal_before = self._text_signal_score(self._html_to_text(raw_html))
-                overlay_markers = self._overlay_marker_count(raw_html)
-                if signal_before < 0.16 and overlay_markers > 0:
-                    resolved_html, status = self._interrupt_resolve_overlays(raw_html)
-                    if status != "resolved":
-                        if "unreachable-paywalled" not in source.quality_flags:
-                            source.quality_flags.append("unreachable-paywalled")
-                        return [], []
-                    raw_html = resolved_html
-                if self._should_retry_with_browser(source.url, raw_html, query):
-                    browser_text = self._get_text_browser(
-                        source.url,
-                        max_chars=80_000,
-                    )
-                    if browser_text:
-                        raw_html = browser_text
-                content = self._html_to_text(raw_html)
-
-            if not content:
-                return [], []
+        ) -> tuple[list[str], list[ResearchSource], str]:
+            content, raw_html, status, _ = self._fetch_source_content(
+                source,
+                query,
+                browser_prefetch,
+            )
+            if status != "processed":
+                return [], [], status
             extra_queries: list[str] = []
             chained: list[ResearchSource] = []
             if len(content) > 80:
@@ -5006,7 +6390,7 @@ class DeepResearchEngine:
                 chained = self._extract_outbound_source_candidates(
                     raw_html, query, source.url
                 )
-            return extra_queries, chained
+            return extra_queries, chained, "processed"
 
         # Run enrichment in parallel — same as Claude/Gemini deep research.
         if not sources:
@@ -5016,9 +6400,22 @@ class DeepResearchEngine:
         with ThreadPoolExecutor(max_workers=max(1, min(30, len(sources)))) as executor:
             futures = {executor.submit(_enrich_one, src): src for src in sources}
             for future in as_completed(futures):
+                source = futures[future]
                 try:
-                    extra_qs, chained = future.result()
+                    extra_qs, chained, status = future.result()
+                    if status == "processed":
+                        self._update_crawl_queue_status(source.url, "processed")
+                    elif status not in {"", "skipped"}:
+                        self._update_crawl_queue_status(source.url, "failed", status)
                     new_queries.extend(extra_qs)
+                    if chained:
+                        self._enqueue_url_batch(
+                            [candidate.url for candidate in chained],
+                            query,
+                            self._active_run_id,
+                            source_url=source.url,
+                            priority=max(6.0, float(source.score or 0.0) + 1.0),
+                        )
                     for candidate in chained:
                         candidate_url = str(candidate.url or "").strip()
                         if not candidate_url or candidate_url in existing_chained_urls:
@@ -5026,7 +6423,11 @@ class DeepResearchEngine:
                         existing_chained_urls.add(candidate_url)
                         self._chained_sources.append(candidate)
                 except Exception:
-                    pass
+                    self._update_crawl_queue_status(
+                        source.url,
+                        "failed",
+                        "enrichment-exception",
+                    )
 
         seen: set[str] = set()
         result: list[str] = []
@@ -5417,6 +6818,132 @@ class DeepResearchEngine:
         host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
         return any(h in host for h in self._JS_REQUIRED_HOSTS)
 
+    def _headless_browser_pool_size(self, url_count: int) -> int:
+        if url_count <= 0:
+            return 0
+        if self._looks_like_current_evidence_query(self._active_objective):
+            return max(2, min(6, url_count))
+        return max(1, min(4, url_count))
+
+    def _new_headless_browser_bundle(self) -> dict[str, Any] | None:
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        try:
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-extensions",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--window-size=1280,900",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="America/New_York",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                },
+            )
+            return {
+                "playwright": playwright,
+                "browser": browser,
+                "context": context,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _close_headless_browser_bundle(bundle: dict[str, Any]) -> None:
+        context = bundle.get("context")
+        browser = bundle.get("browser")
+        playwright = bundle.get("playwright")
+        try:
+            if context is not None:
+                context.close()
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            finally:
+                if playwright is not None:
+                    playwright.stop()
+
+    def _render_browser_page_with_context(
+        self,
+        context: Any,
+        url: str,
+        max_chars: int,
+        timeout_ms: int,
+    ) -> str:
+        page = context.new_page()
+        page.route(
+            "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,mp3,webm}",
+            lambda route: route.abort(),
+        )
+        page.route(
+            "**/{ads,analytics,tracking,doubleclick,googlesyndication}**",
+            lambda route: route.abort(),
+        )
+        try:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=min(timeout_ms, 12_000),
+                )
+            except Exception:
+                pass
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            try:
+                text = page.inner_text("body")
+            except Exception:
+                try:
+                    text = page.evaluate("() => document.body.innerText")
+                except Exception:
+                    text = ""
+            return (text or "")[:max_chars]
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def _headless_browser_pool_fetch(
+        self,
+        urls: list[str],
+        max_chars: int = 80_000,
+        timeout_ms: int = 18_000,
+    ) -> dict[str, str]:
+        safe_urls = self._persistent_unique_urls(urls)
+        if not safe_urls:
+            return {}
+        worker_count = self._headless_browser_pool_size(len(safe_urls))
+        if worker_count <= 0:
+            return {}
+        pool = _HeadlessBrowserWorkerPool(
+            worker_count=worker_count,
+            bundle_factory=self._new_headless_browser_bundle,
+            render_with_context=self._render_browser_page_with_context,
+            bundle_cleanup=self._close_headless_browser_bundle,
+        )
+        return pool.render_many(safe_urls, max_chars, timeout_ms)
+
     def _get_text_browser(
         self,
         url: str,
@@ -5432,73 +6959,20 @@ class DeepResearchEngine:
         sites (Bloomberg, WSJ, SeekingAlpha, FT, Barron's) that return blank
         or paywalled HTML to plain HTTP requests.
         """
-        try:
-            from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
-        except ImportError:
+        bundle = self._new_headless_browser_bundle()
+        if not bundle:
             return ""
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-extensions",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--window-size=1280,900",
-                    ],
-                )
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 900},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    extra_http_headers={
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate, br",
-                    },
-                )
-                page = context.new_page()
-                # Block heavy non-content resources to speed up page load.
-                page.route(
-                    "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,mp3,webm}",
-                    lambda route: route.abort(),
-                )
-                page.route(
-                    "**/{ads,analytics,tracking,doubleclick,googlesyndication}**",
-                    lambda route: route.abort(),
-                )
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    # Wait for the main content area to settle.
-                    page.wait_for_load_state(
-                        "networkidle", timeout=min(timeout_ms, 12_000)
-                    )
-                except Exception:
-                    # Even a partial load is worth extracting.
-                    pass
-                # Try to dismiss cookie/paywall overlays by pressing Escape.
-                try:
-                    page.keyboard.press("Escape")
-                except Exception:
-                    pass
-                # Extract visible inner text — much cleaner than raw HTML.
-                try:
-                    text = page.inner_text("body")
-                except Exception:
-                    try:
-                        text = page.evaluate("() => document.body.innerText")
-                    except Exception:
-                        text = ""
-                browser.close()
-                return (text or "")[:max_chars]
+            return self._render_browser_page_with_context(
+                bundle["context"],
+                url,
+                max_chars,
+                timeout_ms,
+            )
         except Exception:
             return ""
+        finally:
+            self._close_headless_browser_bundle(bundle)
 
     def _get_text_with_browser_fallback(
         self,
@@ -5676,6 +7150,28 @@ class DeepResearchEngine:
         return any(token in lower for token in market_tokens)
 
     @staticmethod
+    def _looks_like_public_security_query(query: str) -> bool:
+        lower = query.lower()
+        security_tokens = {
+            "stock",
+            "stocks",
+            "share",
+            "shares",
+            "equity",
+            "equities",
+            "ticker",
+            "price target",
+            "wall street",
+            "public company",
+            "public companies",
+            "public securities",
+            "portfolio",
+            "upside",
+            "downside",
+        }
+        return any(token in lower for token in security_tokens)
+
+    @staticmethod
     def _looks_like_quant_finance_query(query: str) -> bool:
         lower = query.lower()
         quant_tokens = {
@@ -5707,6 +7203,40 @@ class DeepResearchEngine:
                 text or "",
             )
         )
+
+    @staticmethod
+    def _has_actionable_market_signal(text: str) -> bool:
+        lower = (text or "").lower()
+        if DeepResearchEngine._has_market_identifiers(text):
+            return True
+        actionable_markers = (
+            "earnings",
+            "revenue",
+            "margin",
+            "guidance",
+            "valuation",
+            "price target",
+            "free cash flow",
+            "cash flow",
+            "ev/ebitda",
+            "ebitda",
+            "p/e",
+            "eps",
+            "10-k",
+            "10-q",
+            "8-k",
+            "sec filing",
+            "analyst rating",
+            "analyst estimate",
+            "short interest",
+            "insider buying",
+            "insider selling",
+            "institutional ownership",
+            "catalyst",
+            "buyback",
+            "dividend",
+        )
+        return any(marker in lower for marker in actionable_markers)
 
     @staticmethod
     def _strip_dom_noise_tokens(text: str) -> str:
@@ -5803,26 +7333,10 @@ class DeepResearchEngine:
         anchors = cls._objective_anchor_terms(query)
         words = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", sample.lower()))
         overlap = len(anchors & words) if anchors else 0
+        entity_hits = cls._entity_hit_count(sample, query)
+        if entity_hits:
+            return not cls._has_dom_noise_pattern(sample)
         if cls._looks_like_market_query(query):
-            market_vocab = {
-                "stock",
-                "stocks",
-                "equity",
-                "equities",
-                "market",
-                "markets",
-                "earnings",
-                "valuation",
-                "price",
-                "target",
-                "revenue",
-                "margin",
-                "growth",
-                "upside",
-                "downside",
-                "ticker",
-                "guidance",
-            }
             offdomain_vocab = {
                 "radiocarbon",
                 "paleoenvironmental",
@@ -5834,13 +7348,27 @@ class DeepResearchEngine:
                 "tumour",
                 "trial",
             }
-            has_market = any(token in sample.lower() for token in market_vocab)
+            has_market = cls._has_market_signal(sample)
+            actionable_market = cls._has_actionable_market_signal(sample)
             has_offdomain = any(token in sample.lower() for token in offdomain_vocab)
             if has_offdomain and not has_market:
                 return False
             if not has_market and overlap < 2:
                 return False
-        return overlap >= 2 and not cls._has_dom_noise_pattern(sample)
+            if (
+                cls._looks_like_public_security_query(query)
+                and not actionable_market
+                and overlap < 2
+            ):
+                return False
+            return (
+                overlap >= 1 or actionable_market
+            ) and not cls._has_dom_noise_pattern(sample)
+        if not anchors:
+            return False
+        return overlap >= min(2, len(anchors)) and not cls._has_dom_noise_pattern(
+            sample
+        )
 
     @staticmethod
     def _html_to_text(raw: str) -> str:
@@ -6322,6 +7850,7 @@ class DeepResearchEngine:
         benchmark_adapters_path = artifact_dir / "benchmark_adapters.json"
         durable_notes_path = self._durable_report_path(run_id_for_durable_notes)
         findings = self._finding_ledger(query, sources, plan)
+        claim_trace_payload = self._claim_trace(objective, summary, findings)
         retrieval_payload = {
             "coverage": retrieval["coverage"],
             "passes": retrieval["passes"],
@@ -6329,6 +7858,13 @@ class DeepResearchEngine:
             "query_variants": retrieval["query_variants"],
         }
         benchmark_adapters = self._benchmark_adapters(sources)
+        evidence_graph_payload = self._evidence_graph(
+            objective,
+            sources,
+            retrieval,
+            pc_context_info,
+            findings,
+        )
         token_strategy_parts = [
             "structured scholarly APIs",
             "broad web search",
@@ -6447,23 +7983,11 @@ class DeepResearchEngine:
             encoding="utf-8",
         )
         claim_trace_path.write_text(
-            json.dumps(
-                self._claim_trace(objective, summary, findings),
-                indent=2,
-            ),
+            json.dumps(claim_trace_payload, indent=2),
             encoding="utf-8",
         )
         evidence_graph_path.write_text(
-            json.dumps(
-                self._evidence_graph(
-                    objective,
-                    sources,
-                    retrieval,
-                    pc_context_info,
-                    findings,
-                ),
-                indent=2,
-            ),
+            json.dumps(evidence_graph_payload, indent=2),
             encoding="utf-8",
         )
         benchmark_adapters_path.write_text(
@@ -6473,6 +7997,13 @@ class DeepResearchEngine:
         diagnostics_path.write_text(
             json.dumps(self.provider_diagnostics, indent=2),
             encoding="utf-8",
+        )
+        self._update_persistent_evidence_index(
+            run_id,
+            objective,
+            query,
+            sources,
+            claim_trace_payload,
         )
         artifacts = [
             str(sources_path.relative_to(self.workspace_root)),
@@ -6488,9 +8019,467 @@ class DeepResearchEngine:
             str(benchmark_adapters_path.relative_to(self.workspace_root)),
             str(diagnostics_path.relative_to(self.workspace_root)),
         ]
+        artifacts.extend(
+            self._write_persistent_state_snapshots(run_id, query, objective)
+        )
         if durable_notes_path is not None and durable_notes_path.exists():
             artifacts.append(str(durable_notes_path.relative_to(self.workspace_root)))
         return artifacts
+
+    def _update_persistent_evidence_index(
+        self,
+        run_id: str,
+        objective: str,
+        query: str,
+        sources: list[ResearchSource],
+        claim_trace: dict[str, Any],
+    ) -> None:
+        del sources
+        claims = list(claim_trace.get("claims") or [])
+        if not claims:
+            return
+        self._ensure_research_state_store()
+        now = datetime.now(UTC).isoformat()
+        try:
+            with closing(self._connect_research_state()) as connection:
+                with connection:
+                    for claim in claims:
+                        claim_text = str(claim.get("claim") or "").strip()
+                        claim_key = self._normalize_title(claim_text)
+                        if not claim_key:
+                            continue
+                        support_count = int(claim.get("support_count") or 0)
+                        contradiction_count = int(
+                            claim.get("contradiction_count") or 0
+                        )
+                        confidence_rank = self._finding_confidence_rank(
+                            str(claim.get("confidence") or "")
+                        )
+                        supporting_sources = list(
+                            claim.get("supporting_sources") or []
+                        )
+                        source_urls = self._persistent_unique_urls(
+                            [
+                                str(source.get("url") or "")
+                                for source in supporting_sources
+                                if isinstance(source, dict)
+                            ]
+                        )
+                        providers = self._merge_text_lists(
+                            [
+                                str(source.get("provider") or "").strip()
+                                for source in supporting_sources
+                                if isinstance(source, dict)
+                            ],
+                            limit=24,
+                        )
+                        perspectives = self._merge_text_lists(
+                            [str(claim.get("perspective") or "").strip()],
+                            limit=12,
+                        )
+                        existing_claim = connection.execute(
+                            """
+                            SELECT support_count, contradiction_count,
+                                   confidence_rank, source_urls_json,
+                                   providers_json, perspectives_json
+                            FROM evidence_claims
+                            WHERE claim_key = ?
+                            """,
+                            (claim_key,),
+                        ).fetchone()
+                        merged_source_urls = self._merge_text_lists(
+                            self._load_json_text_list(
+                                existing_claim["source_urls_json"]
+                            )
+                            if existing_claim
+                            else [],
+                            source_urls,
+                            limit=64,
+                        )
+                        merged_providers = self._merge_text_lists(
+                            self._load_json_text_list(existing_claim["providers_json"])
+                            if existing_claim
+                            else [],
+                            providers,
+                            limit=24,
+                        )
+                        merged_perspectives = self._merge_text_lists(
+                            self._load_json_text_list(
+                                existing_claim["perspectives_json"]
+                            )
+                            if existing_claim
+                            else [],
+                            perspectives,
+                            limit=16,
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO evidence_claims(
+                                claim_key,
+                                claim_text,
+                                support_count,
+                                contradiction_count,
+                                confidence_rank,
+                                source_urls_json,
+                                providers_json,
+                                perspectives_json,
+                                last_seen_run,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(claim_key) DO UPDATE SET
+                                claim_text = excluded.claim_text,
+                                support_count = excluded.support_count,
+                                contradiction_count = excluded.contradiction_count,
+                                confidence_rank = excluded.confidence_rank,
+                                source_urls_json = excluded.source_urls_json,
+                                providers_json = excluded.providers_json,
+                                perspectives_json = excluded.perspectives_json,
+                                last_seen_run = excluded.last_seen_run,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                claim_key,
+                                claim_text[:500],
+                                support_count
+                                + int(existing_claim["support_count"] or 0)
+                                if existing_claim
+                                else support_count,
+                                contradiction_count
+                                + int(existing_claim["contradiction_count"] or 0)
+                                if existing_claim
+                                else contradiction_count,
+                                max(
+                                    confidence_rank,
+                                    int(existing_claim["confidence_rank"] or 0)
+                                    if existing_claim
+                                    else 0,
+                                ),
+                                json.dumps(merged_source_urls),
+                                json.dumps(merged_providers),
+                                json.dumps(merged_perspectives),
+                                run_id,
+                                now,
+                            ),
+                        )
+
+                        contradiction_keys: list[str] = []
+                        if contradiction_count > 0:
+                            contradiction_key = claim_key
+                            contradiction_keys.append(contradiction_key)
+                            existing_contradiction = connection.execute(
+                                """
+                                SELECT count, claim_keys_json, source_urls_json
+                                FROM evidence_contradictions
+                                WHERE contradiction_key = ?
+                                """,
+                                (contradiction_key,),
+                            ).fetchone()
+                            merged_claim_keys = self._merge_text_lists(
+                                self._load_json_text_list(
+                                    existing_contradiction["claim_keys_json"]
+                                )
+                                if existing_contradiction
+                                else [],
+                                [claim_key],
+                                limit=32,
+                            )
+                            merged_contradiction_urls = self._merge_text_lists(
+                                self._load_json_text_list(
+                                    existing_contradiction["source_urls_json"]
+                                )
+                                if existing_contradiction
+                                else [],
+                                merged_source_urls,
+                                limit=64,
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO evidence_contradictions(
+                                    contradiction_key,
+                                    contradiction_text,
+                                    count,
+                                    claim_keys_json,
+                                    source_urls_json,
+                                    last_seen_run,
+                                    updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(contradiction_key) DO UPDATE SET
+                                    contradiction_text = excluded.contradiction_text,
+                                    count = excluded.count,
+                                    claim_keys_json = excluded.claim_keys_json,
+                                    source_urls_json = excluded.source_urls_json,
+                                    last_seen_run = excluded.last_seen_run,
+                                    updated_at = excluded.updated_at
+                                """,
+                                (
+                                    contradiction_key,
+                                    claim_text[:500],
+                                    contradiction_count
+                                    + int(existing_contradiction["count"] or 0)
+                                    if existing_contradiction
+                                    else contradiction_count,
+                                    json.dumps(merged_claim_keys),
+                                    json.dumps(merged_contradiction_urls),
+                                    run_id,
+                                    now,
+                                ),
+                            )
+
+                        for url in merged_source_urls:
+                            domain = self._source_domain(url)
+                            if not domain:
+                                continue
+                            existing_domain = connection.execute(
+                                """
+                                SELECT score, observation_count, urls_json,
+                                       claim_keys_json, contradiction_keys_json
+                                FROM evidence_domains
+                                WHERE domain = ?
+                                """,
+                                (domain,),
+                            ).fetchone()
+                            merged_domain_urls = self._merge_text_lists(
+                                self._load_json_text_list(existing_domain["urls_json"])
+                                if existing_domain
+                                else [],
+                                [url],
+                                limit=64,
+                            )
+                            merged_domain_claims = self._merge_text_lists(
+                                self._load_json_text_list(
+                                    existing_domain["claim_keys_json"]
+                                )
+                                if existing_domain
+                                else [],
+                                [claim_key],
+                                limit=48,
+                            )
+                            merged_domain_contradictions = self._merge_text_lists(
+                                self._load_json_text_list(
+                                    existing_domain["contradiction_keys_json"]
+                                )
+                                if existing_domain
+                                else [],
+                                contradiction_keys,
+                                limit=32,
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO evidence_domains(
+                                    domain,
+                                    score,
+                                    observation_count,
+                                    urls_json,
+                                    claim_keys_json,
+                                    contradiction_keys_json,
+                                    last_seen_run,
+                                    updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(domain) DO UPDATE SET
+                                    score = excluded.score,
+                                    observation_count = excluded.observation_count,
+                                    urls_json = excluded.urls_json,
+                                    claim_keys_json = excluded.claim_keys_json,
+                                    contradiction_keys_json = excluded.contradiction_keys_json,
+                                    last_seen_run = excluded.last_seen_run,
+                                    updated_at = excluded.updated_at
+                                """,
+                                (
+                                    domain,
+                                    float(support_count + confidence_rank)
+                                    + float(existing_domain["score"] or 0.0)
+                                    if existing_domain
+                                    else float(support_count + confidence_rank),
+                                    1
+                                    + int(existing_domain["observation_count"] or 0)
+                                    if existing_domain
+                                    else 1,
+                                    json.dumps(merged_domain_urls),
+                                    json.dumps(merged_domain_claims),
+                                    json.dumps(merged_domain_contradictions),
+                                    run_id,
+                                    now,
+                                ),
+                            )
+        except sqlite3.Error:
+            return
+
+    def _persistent_evidence_snapshot(
+        self,
+        query: str,
+        objective: str,
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        self._ensure_research_state_store()
+        with closing(self._connect_research_state()) as connection:
+            claim_rows = connection.execute(
+                """
+                SELECT claim_key, claim_text, support_count,
+                       contradiction_count, confidence_rank,
+                       source_urls_json, perspectives_json
+                FROM evidence_claims
+                ORDER BY support_count DESC, confidence_rank DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 6, 48),),
+            ).fetchall()
+            contradiction_rows = connection.execute(
+                """
+                SELECT contradiction_key, contradiction_text, count,
+                       claim_keys_json, source_urls_json
+                FROM evidence_contradictions
+                ORDER BY count DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 4, 24),),
+            ).fetchall()
+            domain_rows = connection.execute(
+                """
+                SELECT domain, score, observation_count, urls_json,
+                       claim_keys_json, contradiction_keys_json
+                FROM evidence_domains
+                ORDER BY score DESC, observation_count DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 4, 24),),
+            ).fetchall()
+
+        claims: list[dict[str, Any]] = []
+        for row in claim_rows:
+            claim_text = str(row["claim_text"] or "").strip()
+            if self._persistent_match_score(claim_text, query, objective) < 0.24:
+                continue
+            claims.append(
+                {
+                    "claim_key": str(row["claim_key"] or ""),
+                    "claim": claim_text,
+                    "support_count": int(row["support_count"] or 0),
+                    "contradiction_count": int(row["contradiction_count"] or 0),
+                    "confidence_rank": int(row["confidence_rank"] or 0),
+                    "source_urls": self._load_json_text_list(
+                        row["source_urls_json"]
+                    )[:8],
+                    "perspectives": self._load_json_text_list(
+                        row["perspectives_json"]
+                    )[:6],
+                }
+            )
+            if len(claims) >= limit:
+                break
+
+        contradictions: list[dict[str, Any]] = []
+        for row in contradiction_rows:
+            contradiction_text = str(row["contradiction_text"] or "").strip()
+            if self._persistent_match_score(
+                contradiction_text,
+                query,
+                objective,
+            ) < 0.22:
+                continue
+            contradictions.append(
+                {
+                    "contradiction_key": str(row["contradiction_key"] or ""),
+                    "text": contradiction_text,
+                    "count": int(row["count"] or 0),
+                    "claim_keys": self._load_json_text_list(
+                        row["claim_keys_json"]
+                    )[:8],
+                    "source_urls": self._load_json_text_list(
+                        row["source_urls_json"]
+                    )[:8],
+                }
+            )
+            if len(contradictions) >= limit:
+                break
+
+        domains: list[dict[str, Any]] = []
+        for row in domain_rows[:limit]:
+            domains.append(
+                {
+                    "domain": str(row["domain"] or ""),
+                    "score": float(row["score"] or 0.0),
+                    "observation_count": int(row["observation_count"] or 0),
+                    "urls": self._load_json_text_list(row["urls_json"])[:8],
+                    "claim_keys": self._load_json_text_list(
+                        row["claim_keys_json"]
+                    )[:8],
+                    "contradiction_keys": self._load_json_text_list(
+                        row["contradiction_keys_json"]
+                    )[:8],
+                }
+            )
+
+        return {
+            "query": query,
+            "objective": objective,
+            "seed_urls": self._persistent_seed_urls(query, objective, limit=limit),
+            "claims": claims,
+            "contradictions": contradictions,
+            "domains": domains,
+        }
+
+    def _persistent_crawl_queue_snapshot(self, limit: int = 24) -> dict[str, Any]:
+        self._ensure_research_state_store()
+        with closing(self._connect_research_state()) as connection:
+            rows = connection.execute(
+                """
+                SELECT url, domain, priority, status, source_query,
+                       source_url, js_required, attempts
+                FROM crawl_queue
+                ORDER BY priority DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return {
+            "queued": [
+                {
+                    "url": str(row["url"] or ""),
+                    "domain": str(row["domain"] or ""),
+                    "priority": float(row["priority"] or 0.0),
+                    "status": str(row["status"] or ""),
+                    "source_query": str(row["source_query"] or ""),
+                    "source_url": str(row["source_url"] or ""),
+                    "js_required": bool(int(row["js_required"] or 0)),
+                    "attempts": int(row["attempts"] or 0),
+                }
+                for row in rows
+            ]
+        }
+
+    def _write_persistent_state_snapshots(
+        self,
+        run_id: str,
+        query: str,
+        objective: str,
+    ) -> list[str]:
+        if not run_id:
+            return []
+        artifact_dir = self.workspace_root / "runs" / run_id / "research"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        evidence_snapshot_path = artifact_dir / "evidence_index_snapshot.json"
+        crawl_snapshot_path = artifact_dir / "crawl_queue_snapshot.json"
+        try:
+            evidence_snapshot_path.write_text(
+                json.dumps(
+                    self._persistent_evidence_snapshot(query, objective),
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            crawl_snapshot_path.write_text(
+                json.dumps(self._persistent_crawl_queue_snapshot(), indent=2),
+                encoding="utf-8",
+            )
+        except (OSError, sqlite3.Error):
+            return []
+        return [
+            str(evidence_snapshot_path.relative_to(self.workspace_root)),
+            str(crawl_snapshot_path.relative_to(self.workspace_root)),
+        ]
 
     def _benchmark_adapters(
         self,
@@ -7586,119 +9575,83 @@ class DeepResearchEngine:
 
     @staticmethod
     def _entity_queries(query: str, objective: str) -> list[str]:
-        lower = f"{query} {objective}".lower()
-        entities = []
-        for name in ("openclaw", "opencode", "openhands", "agentos"):
-            if name in lower:
-                entities.append(name)
-        # Entity-specific queries come first so they are not cut by
-        # max_query_variants when the list is later sliced.
+        combined = " ".join(part for part in (query, objective) if part).strip()
+        lower = combined.lower()
+        entities = sorted(
+            DeepResearchEngine._entity_terms_from_query(combined),
+            key=lambda item: (
+                lower.find(item.lower())
+                if lower.find(item.lower()) >= 0
+                else len(lower) + len(item),
+                len(item),
+            ),
+        )
+        generic_terms = DeepResearchEngine._generic_query_terms()
+        entity_tokens = {
+            token
+            for entity in entities
+            for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", entity.lower())
+        }
+
+        anchor_tokens: list[str] = []
+        seen_anchor_tokens: set[str] = set()
+        for token in re.findall(r"\b[a-z][a-z0-9-]{3,}\b", lower):
+            if token in generic_terms or token in entity_tokens or token in seen_anchor_tokens:
+                continue
+            seen_anchor_tokens.add(token)
+            anchor_tokens.append(token)
+            if len(anchor_tokens) >= 8:
+                break
+        for token in DeepResearchEngine._keywords(combined):
+            if token in generic_terms or token in entity_tokens or token in seen_anchor_tokens:
+                continue
+            seen_anchor_tokens.add(token)
+            anchor_tokens.append(token)
+            if len(anchor_tokens) >= 8:
+                break
+
+        focus_phrases: list[str] = []
+        if DeepResearchEngine._looks_like_current_evidence_query(combined):
+            focus_phrases.extend(["latest evidence", "current analysis"])
+        if "risk" in lower or "uncertainty" in lower:
+            focus_phrases.append("risk analysis")
+        if "compare" in lower or len(entities) > 1:
+            focus_phrases.append("comparison")
+
         focused: list[str] = []
-        for entity in entities:
-            focused.extend(
-                [
-                    f"{entity} architecture",
-                    f"{entity} benchmark evaluation",
-                    f"{entity} safety approval",
-                    f"{entity} implementation",
-                ]
-            )
-        if len(entities) > 1:
-            joined = " vs ".join(item.title() for item in entities)
-            focused.extend(
-                [
-                    f"{joined} comparison",
-                    f"{joined} benchmark",
-                ]
-            )
-        if "osworld" in lower or "webarena" in lower:
-            focused.extend(
-                [
-                    "OSWorld benchmark",
-                    "WebArena benchmark",
-                    "OSWorld WebArena computer use evaluation",
-                ]
-            )
-        if DeepResearchEngine._looks_like_software_agent_query(lower):
-            focused.extend(
-                [
-                    "LLM agent benchmark evaluation",
-                    "autonomous agent task planning execution",
-                    "AI agent computer use evaluation",
-                ]
-            )
-            if not entities and "research" in lower:
-                focused.extend(
-                    [
-                        "AI research agent evaluation",
-                        "automated literature review agent",
-                        "agentic technical due diligence system",
-                    ]
-                )
+        if entities:
+            for entity in entities[:4]:
+                focused.append(entity)
+                for token in anchor_tokens[:4]:
+                    focused.append(f"{entity} {token}")
+                for phrase in focus_phrases[:3]:
+                    if phrase not in entity.lower():
+                        focused.append(f"{entity} {phrase}")
+            for left, right in combinations(entities[:4], 2):
+                focused.append(f"{left} {right} comparison")
+        elif DeepResearchEngine._looks_like_current_evidence_query(combined):
+            core = DeepResearchEngine._query_core_terms(combined)
+            if core:
+                focused.append(core)
+                for phrase in focus_phrases[:2]:
+                    focused.append(f"{core} {phrase}")
 
-        # ── WALL STREET ANALYST QUERY DECOMPOSITION ──────────────────────────
-        # When the objective is a market/investment query, a real analyst breaks
-        # it into 12 orthogonal research axes immediately at planning time.
-        # These are NOT templates — they are the exact queries an MD would put
-        # into Bloomberg/Capital IQ before building a research note.
-        if DeepResearchEngine._looks_like_market_query(lower):
-            # Extract ticker candidates from the query for targeted queries.
-            tickers = _extract_ticker_candidates(f"{query} {objective}")
-            anchor = tickers[0] if tickers else ""
-
-            # Company-name fallback anchor (e.g. "NVIDIA" if ticker not found).
-            name_match = re.search(
-                r"\b([A-Z][a-zA-Z]{4,}(?:\s+[A-Z][a-zA-Z]{2,})?)"
-                r"\s+(?:stock|equity|shares|Inc|Corp|Ltd|Holdings|Technologies)\b",
-                f"{query} {objective}",
-            )
-            if not anchor and name_match:
-                anchor = name_match.group(1).split()[0].upper()
-
-            if anchor:
-                focused.extend(
-                    [
-                        # Valuation
-                        f"{anchor} DCF model fair value intrinsic value estimate 2025 2026",
-                        f"{anchor} EV/EBITDA P/E forward multiple vs peers comps",
-                        f"{anchor} price target analyst consensus upside downside",
-                        # Earnings / fundamentals
-                        f"{anchor} quarterly earnings EPS revenue beat miss surprise history",
-                        f"{anchor} revenue growth rate gross margin operating leverage trend",
-                        f"{anchor} free cash flow FCF yield capital allocation buyback dividend",
-                        f"{anchor} balance sheet net debt leverage ratio interest coverage",
-                        # Competitive / strategic
-                        f"{anchor} competitive moat market share TAM expansion 2025",
-                        f"{anchor} 10-K 10-Q annual report SEC filing latest fiscal year",
-                        f"{anchor} earnings call transcript guidance management commentary",
-                        # Institutional / sentiment
-                        f"{anchor} institutional ownership 13F changes Q1 2026",
-                        f"{anchor} insider buying selling transactions Form 4 2025 2026",
-                        f"{anchor} short interest ratio days to cover float short squeeze",
-                        f"{anchor} options unusual activity implied volatility skew",
-                        # Macro / risk
-                        f"{anchor} macro risk factor interest rate sensitivity 2026 outlook",
-                        f"{anchor} bear case thesis risk factors regulatory headwinds",
-                        # Technical
-                        f"{anchor} 52-week high low relative strength momentum technical setup",
-                    ]
-                )
-            else:
-                # Generic market queries without a specific ticker
-                focused.extend(
-                    [
-                        "highest potential stocks catalysts 2025 2026 analyst recommendations",
-                        "top stock picks valuation upside price target consensus",
-                        "earnings growth GARP value momentum factor screening 2026",
-                        "sector rotation macro tailwinds best positioned equities",
-                        "insider buying accumulation institutional 13F Q1 2026",
-                        "short squeeze high short interest catalyst watchlist",
-                        "FCF yield undervalued stocks capital return buyback 2026",
-                        "earnings revision momentum analyst upgrades 2026",
-                    ]
-                )
-
-        return focused
+        deduped: list[str] = []
+        seen_queries: set[str] = set()
+        for candidate in focused:
+            text = candidate[:120].strip()
+            if not text:
+                continue
+            if DeepResearchEngine._is_low_signal_query_variant(text, combined):
+                continue
+            if DeepResearchEngine._is_noisy_query_variant(text, combined):
+                continue
+            normalized = DeepResearchEngine._normalize_title(text)
+            if not normalized or normalized in seen_queries:
+                continue
+            seen_queries.add(normalized)
+            deduped.append(text)
+        return deduped[:18]
 
     @staticmethod
     def _question_to_keywords(question: str, query: str) -> str:
@@ -8149,6 +10102,36 @@ class DeepResearchEngine:
             max_query_variants=max(settings.max_query_variants, 4),
         )
 
+    @classmethod
+    def _settings_for_general_complex_objective(
+        cls,
+        settings: ResearchSettings,
+        objective: str,
+    ) -> ResearchSettings:
+        if settings.depth == "multi-hour":
+            return settings
+        if cls._looks_like_academic_query(objective):
+            return settings
+        lower = objective.lower()
+        if not (
+            cls._looks_like_software_agent_query(objective)
+            or cls._looks_like_comprehensive_research(lower)
+        ):
+            return settings
+        if settings.depth == "standard":
+            return ResearchSettings(
+                depth=settings.depth,
+                max_sources=max(settings.max_sources, 72),
+                per_provider=max(settings.per_provider, 24),
+                max_query_variants=max(settings.max_query_variants, 24),
+            )
+        return ResearchSettings(
+            depth=settings.depth,
+            max_sources=max(settings.max_sources, 18),
+            per_provider=max(settings.per_provider, 8),
+            max_query_variants=max(settings.max_query_variants, 6),
+        )
+
     @staticmethod
     def _current_web_targets(depth: str) -> dict[str, int | float]:
         if depth == "multi-hour":
@@ -8266,8 +10249,18 @@ class DeepResearchEngine:
 
         anchors: list[str] = []
         anchors.extend(sorted(cls._entity_terms_from_query(query)))
+        for keyword in sorted(cls._objective_anchor_terms(query)):
+            if len(keyword) < 4:
+                continue
+            if keyword in anchors:
+                continue
+            anchors.append(keyword)
+            if len(anchors) >= 8:
+                break
         for keyword in cls._keywords(query):
             if len(keyword) < 4:
+                continue
+            if keyword in cls._generic_query_terms():
                 continue
             if keyword in anchors:
                 continue
@@ -8741,7 +10734,13 @@ class DeepResearchEngine:
         scored.sort(key=lambda t: t[0], reverse=True)
         # Exclude sources with zero relevance score — they failed all
         # relevance checks and should not appear in the final set.
-        filtered = [source for score, source in scored if score > 0.0]
+        filtered = [
+            source
+            for score, source in scored
+            if score > 0.0
+            and "off-topic" not in (source.quality_flags or [])
+            and cls._source_is_on_topic(source, query)
+        ]
         return cls._enforce_provider_diversity(filtered)
 
     @classmethod
@@ -8834,6 +10833,10 @@ class DeepResearchEngine:
         distinctive_hits = sum(1 for t in distinctive_terms if t in haystack)
         term_relevance = distinctive_hits / max(len(distinctive_terms), 1)
         relevance = max(entity_relevance, term_relevance, objective_alignment)
+        if cls._looks_like_public_security_query(
+            query
+        ) and cls._has_actionable_market_signal(combined):
+            relevance = max(relevance, 0.35)
         recency = cls._recency_score(source.year)
         citation_strength = min(source.citation_count, 1000) / 1000
         credibility_score, credibility_penalty, quality_flags = cls._source_credibility(
@@ -8847,8 +10850,17 @@ class DeepResearchEngine:
         source.citation_strength = citation_strength
         source.credibility_score = credibility_score
         source.contradiction_risk = contradiction
-        source.quality_flags = quality_flags
-        if objective_alignment < 0.22:
+        source.quality_flags = list(
+            dict.fromkeys([*(source.quality_flags or []), *quality_flags])
+        )
+        if (
+            objective_alignment < 0.22
+            and entity_hits == 0
+            and not (
+                cls._looks_like_public_security_query(query)
+                and cls._has_actionable_market_signal(combined)
+            )
+        ):
             source.quality_flags.append("off-topic")
         if source.provider == "gemini-flash":
             source.relevance = max(relevance, 0.65)
@@ -8984,6 +10996,13 @@ class DeepResearchEngine:
 
         if source.provider in {"openalex", "semantic-scholar", "crossref"}:
             credibility += 0.15
+        if source.provider == "pc-browser-research":
+            if "browser-judged-source" in (source.quality_flags or []):
+                credibility += 0.1
+            if "browser-navigation-seed" in (source.quality_flags or []):
+                credibility += 0.06
+            if "browser-terminal-verified" in (source.quality_flags or []):
+                credibility += 0.16
         if any(
             host in url
             for host in (
@@ -9092,6 +11111,10 @@ class DeepResearchEngine:
                 for marker in (
                     "top stocks",
                     "best stocks",
+                    "stocks to buy",
+                    "stock to buy",
+                    "buy these stocks",
+                    "analyst bets",
                     "buy now",
                     "hot picks",
                     "10 stocks",
@@ -9175,6 +11198,17 @@ class DeepResearchEngine:
         if not ranked:
             return []
         capped = ranked[: max(max_sources * 3, max_sources)]
+        capped = [
+            source
+            for source in capped
+            if "off-topic" not in (source.quality_flags or [])
+            and (
+                float(source.score or 0.0) <= 0.0
+                or DeepResearchEngine._source_is_on_topic(source, query)
+            )
+        ]
+        if not capped:
+            return []
         by_provider: dict[str, list[ResearchSource]] = {}
         for source in capped:
             by_provider.setdefault(source.provider, []).append(source)
@@ -9250,6 +11284,17 @@ class DeepResearchEngine:
         if DeepResearchEngine._looks_like_software_agent_query(query):
             append_preferred("github-repositories")
 
+        append_preferred(
+            "pc-browser-research",
+            lambda source: (
+                "browser-terminal-verified" in (source.quality_flags or [])
+                or "browser-navigation-seed" in (source.quality_flags or [])
+                or "browser-judged-source" in (source.quality_flags or [])
+                or "browser-fetched-seed" in (source.quality_flags or [])
+            )
+            and DeepResearchEngine._source_is_on_topic(source, query),
+        )
+
         # For current-evidence tasks, preserve at least one tool observation
         # when available so runs do not collapse into a single-provider web
         # monoculture.
@@ -9292,6 +11337,7 @@ class DeepResearchEngine:
 
     @staticmethod
     def _entity_terms_from_query(query: str) -> set[str]:
+        raw_query = query or ""
         lower = query.lower()
         software_mode = DeepResearchEngine._looks_like_software_agent_query(query)
         entities = {
@@ -9318,6 +11364,37 @@ class DeepResearchEngine:
             matched.add("market intelligence")
         if not software_mode and "safety" in lower and "critical" in lower:
             matched.add("safety critical")
+        generic = DeepResearchEngine._generic_query_terms()
+        for ticker in _extract_ticker_candidates(raw_query):
+            matched.add(ticker.lower())
+        for quoted in re.findall(r"[\"'“”]([^\"'“”]{3,80})[\"'“”]", raw_query):
+            tokens = [
+                token.lower()
+                for token in re.findall(
+                    r"\b[A-Za-z][A-Za-z0-9&.\-]{2,}\b",
+                    quoted,
+                )
+                if token.lower() not in generic
+            ]
+            if tokens:
+                matched.add(" ".join(tokens[:5]))
+        for phrase in re.findall(
+            (
+                r"\b(?:[A-Z][A-Za-z0-9&.\-]{2,})"
+                r"(?:\s+[A-Z][A-Za-z0-9&.\-]{2,}){0,4}\b"
+            ),
+            raw_query,
+        ):
+            tokens = [
+                token.lower().strip("&.-")
+                for token in phrase.split()
+                if token.lower().strip("&.-") not in generic
+            ]
+            if not tokens:
+                continue
+            candidate = " ".join(tokens)
+            if len(candidate) >= 3:
+                matched.add(candidate)
         return matched
 
     @staticmethod
@@ -9449,10 +11526,40 @@ class DeepResearchEngine:
         if source.provider == "gemini-flash":
             return "tool-observation"
         if (
+            source.provider == "pc-browser-research"
+            and any(
+                flag in (source.quality_flags or [])
+                for flag in (
+                    "browser-judged-source",
+                    "browser-navigation-seed",
+                    "browser-terminal-verified",
+                )
+            )
+            and "off-topic" not in (source.quality_flags or [])
+        ):
+            return "tool-observation"
+        if (
             source.credibility_score < 0.25
+            or "off-topic" in source.quality_flags
+            or "market-nonspecific-web" in source.quality_flags
+            or "low-signal-web" in source.quality_flags
             or "speculative-proof-claim" in source.quality_flags
             or "unsupported-proof-title" in source.quality_flags
         ):
+            return "weak"
+        if source.provider in {
+            "web-search",
+            "bing-search",
+            "google-news-rss",
+            "financial-portals",
+            "reddit-finance",
+            "pc-browser-research",
+            "seed-url",
+        }:
+            if source.relevance >= 0.62 and source.credibility_score >= 0.55:
+                return "strong"
+            if source.relevance >= 0.48 and source.credibility_score >= 0.42:
+                return "moderate"
             return "weak"
         if (
             source.relevance >= 0.7
@@ -9480,36 +11587,89 @@ class DeepResearchEngine:
         return "weak"
 
     @staticmethod
-    def _objective_anchor_terms(query: str) -> set[str]:
-        stopwords = {
+    def _generic_query_terms() -> set[str]:
+        return {
             "about",
             "across",
             "after",
             "also",
+            "all",
+            "analyst",
             "analysis",
+            "analyze",
             "and",
+            "available",
             "best",
+            "brief",
+            "candidate",
+            "candidates",
+            "chief",
+            "companies",
+            "company",
+            "current",
+            "data",
+            "deep",
+            "deepest",
+            "direct",
+            "evidence",
+            "expert",
             "current",
             "for",
             "from",
+            "gathering",
+            "general",
             "highest",
             "latest",
+            "live",
+            "major",
+            "near-term",
             "now",
+            "opportunities",
+            "opportunity",
             "potential",
+            "primary",
+            "proper",
+            "public",
+            "produce",
+            "report",
+            "reports",
             "research",
+            "risk",
+            "risks",
+            "rigorous",
             "review",
+            "scenario",
+            "scenarios",
+            "signal",
+            "signals",
             "soar",
+            "source",
+            "sources",
+            "specialised",
+            "specialized",
             "that",
             "the",
             "their",
             "these",
             "this",
             "through",
+            "timeline",
             "today",
+            "tool",
+            "tools",
+            "uncertainties",
+            "uncertainty",
             "using",
+            "web",
+            "website",
+            "websites",
             "what",
             "with",
         }
+
+    @classmethod
+    def _objective_anchor_terms(cls, query: str) -> set[str]:
+        stopwords = cls._generic_query_terms()
         return {
             token
             for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower())
@@ -9519,14 +11679,58 @@ class DeepResearchEngine:
     @classmethod
     def _objective_alignment_score(cls, text: str, query: str) -> float:
         anchors = cls._objective_anchor_terms(query)
-        if not anchors:
-            return 1.0
-        words = {token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", text.lower())}
-        if not words:
+        entity_terms = cls._entity_terms_from_query(query)
+        lower_text = text.lower()
+        words = {
+            token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", lower_text)
+        }
+        if not words and not lower_text.strip():
             return 0.0
         overlap = len(anchors & words)
+        overlap += sum(1 for term in entity_terms if term and term in lower_text)
+        denominator = len(anchors) + len(entity_terms)
+        if denominator <= 0:
+            return 0.0
         # Reward overlap but stay conservative unless there are multiple matches.
-        return min(overlap / max(min(len(anchors), 4), 1), 1.0)
+        return min(overlap / max(min(denominator, 4), 1), 1.0)
+
+    @classmethod
+    def _entity_hit_count(cls, text: str, query: str) -> int:
+        lower_text = text.lower()
+        return sum(
+            1 for term in cls._entity_terms_from_query(query) if term in lower_text
+        )
+
+    @staticmethod
+    def _has_market_signal(text: str) -> bool:
+        lower = text.lower()
+        market_vocab = {
+            "stock",
+            "stocks",
+            "equity",
+            "equities",
+            "market",
+            "markets",
+            "earnings",
+            "valuation",
+            "price",
+            "target",
+            "revenue",
+            "margin",
+            "growth",
+            "upside",
+            "downside",
+            "ticker",
+            "guidance",
+            "cash flow",
+            "free cash flow",
+            "sec filing",
+            "10-k",
+            "10-q",
+        }
+        return DeepResearchEngine._has_market_identifiers(text) or any(
+            token in lower for token in market_vocab
+        )
 
     @classmethod
     def _is_low_signal_query_variant(cls, variant: str, query: str = "") -> bool:
@@ -9600,7 +11804,47 @@ class DeepResearchEngine:
         words = re.findall(r"\b[a-z0-9.-]+\b", lower)
         if len(words) < 2:
             return True
-        if query and cls._objective_alignment_score(lower, query) < 0.2:
+        if query:
+            meaningful_words = [
+                word
+                for word in words
+                if word not in cls._generic_query_terms()
+                and word not in noise_tokens
+            ]
+            broad_domain_terms = {
+                "stock",
+                "stocks",
+                "market",
+                "markets",
+                "equity",
+                "equities",
+                "science",
+                "scientific",
+                "software",
+                "system",
+                "systems",
+                "policy",
+                "policies",
+            }
+            has_entity = any(
+                term in lower for term in cls._entity_terms_from_query(query)
+            )
+            if len(meaningful_words) < 2 and not has_entity:
+                return True
+            if (
+                len(meaningful_words) == 1
+                and meaningful_words[0] in broad_domain_terms
+                and not has_entity
+            ):
+                return True
+        if (
+            query
+            and (
+                cls._objective_anchor_terms(query)
+                or cls._entity_terms_from_query(query)
+            )
+            and cls._objective_alignment_score(lower, query) < 0.2
+        ):
             return True
         noise_hits = sum(1 for word in words if word in noise_tokens)
         return noise_hits >= 2 and noise_hits >= max(2, len(words) // 2)
