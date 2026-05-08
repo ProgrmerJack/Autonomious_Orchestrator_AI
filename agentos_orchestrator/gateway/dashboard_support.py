@@ -14,6 +14,7 @@ from agentos_orchestrator.cognition.live_fire_eval import LiveFireEvalConfig
 from agentos_orchestrator.core.types import utc_now
 from agentos_orchestrator.gateway.channels import ChannelMessage
 from agentos_orchestrator.os_control import (
+    RustNativeWindowsBackend,
     VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
 )
@@ -47,19 +48,27 @@ def _requires_unsafe_ack(path: str, method: str) -> bool:
 def _pc_backend(name: str, state_path: str | Path):
     if name == "windows-uia":
         return WindowsUiaBackend()
+    if name == "rust-native-windows":
+        return RustNativeWindowsBackend(
+            Path(state_path).with_name("rust_native_body.json")
+        )
     if name == "virtual-desktop-sandbox":
         return VirtualDesktopSandboxBackend(
             Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
     raise ValueError(
-        f"Unknown PC backend: {name}. Expected 'windows-uia' or "
-        "'virtual-desktop-sandbox'."
+        f"Unknown PC backend: {name}. Expected 'windows-uia', "
+        "'rust-native-windows', or 'virtual-desktop-sandbox'."
     )
 
 
 def _pc_backend_status(state_path: str | Path) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
-    for name in ("windows-uia", "virtual-desktop-sandbox"):
+    for name in (
+        "windows-uia",
+        "rust-native-windows",
+        "virtual-desktop-sandbox",
+    ):
         try:
             backend = _pc_backend(name, state_path)
             available = backend.available()

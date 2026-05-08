@@ -36,7 +36,8 @@
 ## PC Control Agent
 
 - Allowed tools: `os.snapshot`, `os.act`.
-- Uses Windows UI Automation, Touchpoint, or DirectShell backends.
+- Uses Windows UI Automation, Rust-native Windows input, or the simulated
+  virtual desktop backend.
 - `os.snapshot` is read-only and may run under normal policy.
 - `os.act` requires an approval token before invoking, typing, clicking, or
   focusing controls.

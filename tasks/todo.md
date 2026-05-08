@@ -6,6 +6,10 @@
 - [x] Implement the Python orchestration brain.
 - [x] Implement OS-control adapter seams.
 - [x] Implement the Rust body process.
+- [x] Add first-party Rust native Windows input commands and expose them as a
+	Python `rust-native-windows` PC backend.
+- [x] Make virtual sandbox capabilities honest about simulated rights instead
+	of claiming full host control.
 - [x] Add policies, docs, and usage examples.
 - [x] Add and run verification tests.
 - [x] Add markdown runtime config files for agent identity, roles, and heartbeat behavior.
@@ -20,10 +24,12 @@
 Implemented a working hybrid Python/Rust foundation for the plan:
 
 - Python supervisor, worker, verifier, event bus, checkpoints, policy gates, and memory compressor.
-- OS-control adapters for Touchpoint and DirectShell-style SQLite action queues.
+- OS-control adapters for Windows UI Automation, direct Rust-native Windows
+	input, and the simulated virtual desktop sandbox.
 - MCP stdio JSON-RPC client seam for tools and external data sources.
 - Sandbox provider interfaces for dry-run, c/ua, Firecracker, and Kata.
-- Rust body process with health, describe, and event-bridge modes.
+- Rust body process with health, describe, event-bridge, simulated desktop,
+  native snapshot, and native action modes.
 - Default deep research policy, security notes, README, and unit tests.
 - Markdown config loader for `SOUL.md`, `AGENTS.md`, and `HEARTBEAT.md`.
 - Telegram webhook parsing seam, dashboard event fanout, and approval endpoints.

@@ -14,6 +14,7 @@ from .paint_live_fire import (
     PaintLiveFireResult,
     PaintLiveFireTrial,
 )
+from .rust_native_windows_backend import RustNativeWindowsBackend
 from .visual_fallback import HybridControlBackend, SeePointRefineController
 from .virtual_desktop_sandbox_backend import VirtualDesktopSandboxBackend
 from .workflow import (
@@ -52,6 +53,7 @@ __all__ = [
     "PaintLiveFireConfig",
     "PaintLiveFireResult",
     "PaintLiveFireTrial",
+    "RustNativeWindowsBackend",
     "OsControlBackend",
     "SeePointRefineController",
     "SpreadsheetWorkflowAdapter",

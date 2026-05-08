@@ -20,6 +20,9 @@ from agentos_orchestrator.evals import UnsupervisedEvalEngine
 from agentos_orchestrator.os_control.virtual_desktop_sandbox_backend import (
     VirtualDesktopSandboxBackend,
 )
+from agentos_orchestrator.os_control.rust_native_windows_backend import (
+    RustNativeWindowsBackend,
+)
 from agentos_orchestrator.os_control.windows_uia_backend import (
     WindowsUiaBackend,
 )
@@ -103,6 +106,10 @@ class ResearchOrchestrator:
         resolved_state_path = Path(state_path)
         if configured == "windows-uia":
             return WindowsUiaBackend()
+        if configured == "rust-native-windows":
+            return RustNativeWindowsBackend(
+                resolved_state_path.with_name("rust_native_body.json")
+            )
         if configured == "virtual-desktop-sandbox":
             return VirtualDesktopSandboxBackend(
                 resolved_state_path.with_name("virtual_desktop_sandbox.json")
@@ -110,13 +117,19 @@ class ResearchOrchestrator:
         if configured:
             raise ValueError(
                 "Unknown AGENTOS_PC_BACKEND "
-                f"'{configured}'; expected 'windows-uia' or "
-                "'virtual-desktop-sandbox'"
+                f"'{configured}'; expected 'windows-uia', "
+                "'rust-native-windows', or 'virtual-desktop-sandbox'"
             )
 
         windows_backend = WindowsUiaBackend()
         if windows_backend.available():
             return windows_backend
+
+        rust_native_backend = RustNativeWindowsBackend(
+            resolved_state_path.with_name("rust_native_body.json")
+        )
+        if rust_native_backend.available():
+            return rust_native_backend
 
         return VirtualDesktopSandboxBackend(
             resolved_state_path.with_name("virtual_desktop_sandbox.json")

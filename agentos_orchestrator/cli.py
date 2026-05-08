@@ -38,6 +38,7 @@ from .os_control import (
     NotepadLiveFireTrial,
     PaintLiveFireConfig,
     PaintLiveFireTrial,
+    RustNativeWindowsBackend,
     UiAction,
     VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
@@ -489,7 +490,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot_parser.add_argument(
         "--backend",
-        choices=("windows-uia", "virtual-desktop-sandbox"),
+        choices=(
+            "windows-uia",
+            "rust-native-windows",
+            "virtual-desktop-sandbox",
+        ),
         default="windows-uia",
     )
     snapshot_parser.add_argument("--limit", type=int, default=120)
@@ -501,7 +506,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     act_parser.add_argument(
         "--backend",
-        choices=("windows-uia", "virtual-desktop-sandbox"),
+        choices=(
+            "windows-uia",
+            "rust-native-windows",
+            "virtual-desktop-sandbox",
+        ),
         default="windows-uia",
     )
     act_parser.add_argument("--action", required=True)
@@ -516,7 +525,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live_fire_parser.add_argument(
         "--backend",
-        choices=("windows-uia", "virtual-desktop-sandbox"),
+        choices=(
+            "windows-uia",
+            "rust-native-windows",
+            "virtual-desktop-sandbox",
+        ),
         default="windows-uia",
     )
     live_fire_parser.add_argument(
@@ -537,7 +550,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paint_live_fire_parser.add_argument(
         "--backend",
-        choices=("windows-uia", "virtual-desktop-sandbox"),
+        choices=(
+            "windows-uia",
+            "rust-native-windows",
+            "virtual-desktop-sandbox",
+        ),
         default="windows-uia",
     )
     paint_live_fire_parser.add_argument(
@@ -987,13 +1004,17 @@ def main(argv: list[str] | None = None) -> int:
 def _pc_backend(name: str, state_path: str | Path):
     if name == "windows-uia":
         return WindowsUiaBackend()
+    if name == "rust-native-windows":
+        return RustNativeWindowsBackend(
+            Path(state_path).with_name("rust_native_body.json")
+        )
     if name == "virtual-desktop-sandbox":
         return VirtualDesktopSandboxBackend(
             Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
     raise ValueError(
-        f"Unknown PC backend: {name}. Expected 'windows-uia' or "
-        "'virtual-desktop-sandbox'."
+        f"Unknown PC backend: {name}. Expected 'windows-uia', "
+        "'rust-native-windows', or 'virtual-desktop-sandbox'."
     )
 
 

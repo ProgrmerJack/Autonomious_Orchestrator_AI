@@ -14,9 +14,17 @@ class WorkflowArtifactWriter:
     def __init__(self, workspace_root: str | Path) -> None:
         self.workspace_root = Path(workspace_root)
 
-    def materialize(self, plan: DesktopWorkflowPlan) -> list[dict[str, Any]]:
+    def materialize(
+        self,
+        plan: DesktopWorkflowPlan,
+        *,
+        skip_paths: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         written: list[dict[str, Any]] = []
+        skipped = {str(path) for path in (skip_paths or set())}
         for artifact in plan.artifacts:
+            if artifact.path in skipped:
+                continue
             path = self.workspace_root / artifact.path
             path.parent.mkdir(parents=True, exist_ok=True)
             content = self._artifact_content(plan, artifact)

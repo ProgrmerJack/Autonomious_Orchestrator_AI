@@ -131,6 +131,7 @@ def execute_via_agent_body(
     try:
         payload = client.request(request)
     except AgentBodyError as exc:
+        client.close()
         return ExecutionResult(
             provider=provider_name,
             command=command,
@@ -139,6 +140,7 @@ def execute_via_agent_body(
             exit_code=1,
             dry_run=False,
         )
+    client.close()
     return ExecutionResult(
         provider=provider_name,
         command=command,

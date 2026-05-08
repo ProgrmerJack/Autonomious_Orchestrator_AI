@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 from agentos_orchestrator.os_control.base import UiNode
 from agentos_orchestrator.os_control.workflow.planner import (
@@ -12,6 +13,7 @@ from agentos_orchestrator.os_control.workflow.planner import (
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
     DesktopWorkflowStep,
+    WorkflowArtifact,
 )
 from agentos_orchestrator.os_control.workflow.service import (
     DesktopWorkflowService,
@@ -128,6 +130,68 @@ class RecordingVerificationBackend(VerificationBackend):
     def perform(self, action) -> str:
         self.actions.append((action.action_type, action.selector))
         return super().perform(action)
+
+
+class MetadataRecordingBackend(VerificationBackend):
+    def __init__(self) -> None:
+        super().__init__(
+            reflect_value_in_snapshot=True,
+            include_value_in_receipt=True,
+        )
+        self.action_metadata: list[dict[str, Any]] = []
+
+    def perform(self, action) -> str:
+        self.action_metadata.append(dict(action.metadata or {}))
+        return super().perform(action)
+
+
+class PreActionBlockingBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="file-list",
+                role="List",
+                name="Protected Files",
+                focused=True,
+            )
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class GoalLockBlockingBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="doc-canvas",
+                role="Document",
+                name="Document Canvas",
+                focused=True,
+            )
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class StaticDesktopWorkflowPlanner:
+    def __init__(self, plan: DesktopWorkflowPlan) -> None:
+        self._plan = plan
+
+    def plan(self, objective: str) -> DesktopWorkflowPlan:
+        self._plan.objective = objective
+        return self._plan
 
 
 class WorkflowServiceTests(unittest.TestCase):
@@ -512,8 +576,8 @@ class WorkflowServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             service = DesktopWorkflowService(Path(temp_dir))
             backend = RecordingVerificationBackend()
-            service.planner.plan = lambda objective: DesktopWorkflowPlan(
-                objective=objective,
+            plan = DesktopWorkflowPlan(
+                objective="",
                 mode="report",
                 app_target=None,
                 summary="verification-sensitive plan",
@@ -526,8 +590,13 @@ class WorkflowServiceTests(unittest.TestCase):
                         metadata={
                             "verification_contract": {
                                 "kind": "field_contains",
-                                "expected": "The focused field contains the typed value.",
-                                "target": "automation_id=1001&&class_name=Edit",
+                                "expected": (
+                                    "The focused field contains the "
+                                    "typed value."
+                                ),
+                                "target": (
+                                    "automation_id=1001&&class_name=Edit"
+                                ),
                                 "value": "fail verification",
                                 "required": True,
                             }
@@ -542,12 +611,202 @@ class WorkflowServiceTests(unittest.TestCase):
                 ],
                 artifacts=[],
             )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
 
             with self.assertRaises(WorkflowVerificationError):
                 service.execute("write a report", backend)
 
             self.assertEqual(len(backend.actions), 1)
             self.assertEqual(backend.actions[0][1], "name=Document Canvas")
+
+    def test_workflow_records_control_metadata_and_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = MetadataRecordingBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="control metadata plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="name=Document Canvas",
+                        value="ledger-backed value",
+                        description="Type a ledger-backed value",
+                        metadata={
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": (
+                                    "The field contains the value."
+                                ),
+                                "target": "name=Document Canvas",
+                                "value": "ledger-backed value",
+                                "required": True,
+                            }
+                        },
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute("write a safe report note", backend)
+
+            first_receipt = result["receipts"][0]
+            control = first_receipt["control"]
+            self.assertEqual(control["control_route"], "structured_ui")
+            self.assertIn("observation_fingerprint", control)
+            self.assertIn("ledger_entry_id", control)
+            self.assertIn("app_agent", control)
+            self.assertIn("goal_lock", control)
+            self.assertIn("speculation", control)
+            self.assertIn("isolation", control)
+            self.assertEqual(
+                backend.action_metadata[0]["control"]["ledger_entry_id"],
+                control["ledger_entry_id"],
+            )
+            app_signature = control["app_agent"]["app_signature"]
+            self.assertTrue(app_signature)
+            self.assertTrue(
+                service.app_agent_runtime.policy_memory.preferred_channels(
+                    app_signature,
+                )
+            )
+            events = service.control_ledger.recent_events(limit=10)
+            stages = [event["stage"] for event in events]
+            self.assertIn("proposal", stages)
+            self.assertIn("completion", stages)
+            proposal = next(
+                event for event in events if event["stage"] == "proposal"
+            )
+            self.assertEqual(
+                proposal["payload"]["candidate_route"],
+                "structured_ui",
+            )
+            self.assertIn(
+                "stable_fingerprint",
+                proposal["payload"]["observation_frame"],
+            )
+
+    def test_programmer_lane_generates_artifact_before_ui_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = MetadataRecordingBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="programmer lane plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="name=Document Canvas",
+                        value="handoff note",
+                        description="Type a handoff note",
+                    )
+                ],
+                artifacts=[
+                    WorkflowArtifact(
+                        path="artifacts/workflows/report.md",
+                        kind="report",
+                        description="Workflow report",
+                    )
+                ],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute("write a report about orchestrators", backend)
+
+            self.assertEqual(result["receipts"][0]["action_type"], "tool")
+            self.assertEqual(len(backend.action_metadata), 1)
+            report_path = Path(temp_dir) / "artifacts" / "workflows" / "report.md"
+            self.assertTrue(report_path.exists())
+            self.assertIn("orchestrators", report_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                any(
+                    artifact["path"] == "artifacts/workflows/report.md"
+                    for artifact in result["artifacts"]
+                )
+            )
+
+    def test_goal_lock_blocks_unrelated_external_navigation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = GoalLockBlockingBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="goal lock plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="open_url",
+                        selector="browser-address-bar",
+                        value="https://example.com",
+                        description="Navigate away from the current editor task",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute(
+                    "summarize current task progress in the document",
+                    backend,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn("goal lock", failure["verification"]["reason"].lower())
+
+    def test_pre_action_verifier_blocks_delete_before_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = PreActionBlockingBackend()
+            step = DesktopWorkflowStep(
+                action_type="delete_file",
+                selector="protected-file",
+                description="Delete a protected file",
+                metadata={"path": "artifacts/workflows/report.md"},
+            )
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="file-ops",
+                app_target=None,
+                summary="blocked delete plan",
+                steps=[step],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute(
+                    "summarize the protected files",
+                    backend,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertEqual(
+                failure["verification"]["kind"],
+                "pre_action_verification",
+            )
+            self.assertIn(
+                "requires approval",
+                failure["verification"]["reason"],
+            )
+            events = service.control_ledger.recent_events(limit=10)
+            stages = [event["stage"] for event in events]
+            self.assertIn("proposal", stages)
+            self.assertIn("failure", stages)
+            golden_candidates = list(
+                (Path(temp_dir) / "benchmarks" / "golden_traces").glob(
+                    "workflow_*.json"
+                )
+            )
+            self.assertTrue(golden_candidates)
 
 
 if __name__ == "__main__":

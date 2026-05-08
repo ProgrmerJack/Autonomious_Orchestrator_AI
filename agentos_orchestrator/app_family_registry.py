@@ -415,6 +415,9 @@ def app_context_for_family(family: str) -> str:
 def sandbox_surface_for_app(app_name: str) -> tuple[str, str, str] | None:
     lower = app_name.lower()
     for spec in APP_FAMILY_SPECS:
+        if lower == spec.launch_target.lower():
+            return spec.primary_selector, spec.surface_role, spec.surface_name
+    for spec in APP_FAMILY_SPECS:
         if any(cue in lower for cue in spec.launch_cues):
             return spec.primary_selector, spec.surface_role, spec.surface_name
     return None

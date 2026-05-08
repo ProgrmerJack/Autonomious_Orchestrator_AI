@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from .base import BackendUnavailable, UiAction, UiNode
+from .rust_native_windows_backend import RustNativeWindowsBackend
 
 try:
     from comtypes import COMError  # type: ignore[import-not-found]
@@ -48,6 +49,8 @@ class WindowsUiaBackend:
         timeout_seconds: int = 15,
         max_depth: int = 7,
         max_nodes: int = 2000,
+        native_fallback: RustNativeWindowsBackend | None = None,
+        enable_native_fallback: bool = True,
     ) -> None:
         # Preserve the parameter for compatibility with older call sites and
         # tests, but the backend no longer shells out through PowerShell.
@@ -55,6 +58,8 @@ class WindowsUiaBackend:
         self.timeout_seconds = timeout_seconds
         self.max_depth = max_depth
         self.max_nodes = max_nodes
+        self._native_fallback = native_fallback
+        self.enable_native_fallback = enable_native_fallback
 
     def available(self) -> bool:
         if platform.system() != "Windows":
@@ -79,18 +84,33 @@ class WindowsUiaBackend:
         return payload
 
     def perform(self, action: UiAction) -> str:
-        self._ensure_available()
+        try:
+            self._ensure_available()
+        except BackendUnavailable as exc:
+            return self._native_perform(action, str(exc))
         if action.action_type == "launch_app":
-            return json.dumps(self._launch_app(action), sort_keys=True)
+            try:
+                return json.dumps(self._launch_app(action), sort_keys=True)
+            except (BackendUnavailable, OSError) as exc:
+                return self._native_perform(action, str(exc))
         if action.action_type == "hotkey":
-            return json.dumps(self._send_hotkey(action), sort_keys=True)
+            try:
+                return json.dumps(self._send_hotkey(action), sort_keys=True)
+            except BackendUnavailable as exc:
+                return self._native_perform(action, str(exc))
+            except _UIA_EXCEPTIONS as exc:
+                return self._native_perform(action, str(exc))
+        if action.action_type in {"move_cursor", "scroll", "wait"}:
+            return self._native_perform(action, "native-only action")
 
         matched = self._find_target(action.selector)
         if matched is None:
-            raise BackendUnavailable(
-                f"No UI element matched selector '{action.selector}'"
+            return self._native_perform(
+                action,
+                f"No UI element matched selector '{action.selector}'",
             )
         target, node = matched
+        action = self._with_target_metadata(action, node)
         focus_error = None
         status = "matched"
         try:
@@ -119,9 +139,10 @@ class WindowsUiaBackend:
             draw_path = self._draw_path(target, str(action.value or ""))
             status = "drawn"
         elif action.action_type != "focus":
-            raise BackendUnavailable(
+            return self._native_perform(
+                action,
                 "Windows UI Automation action "
-                f"'{action.action_type}' is not supported"
+                f"'{action.action_type}' is not supported",
             )
 
         receipt: dict[str, Any] = {
@@ -140,6 +161,83 @@ class WindowsUiaBackend:
             if sandbox_receipt:
                 receipt["cell_edit"] = sandbox_receipt
         return json.dumps(receipt, sort_keys=True)
+
+    def _native_perform(self, action: UiAction, reason: str) -> str:
+        if not self._can_native_fallback(action):
+            raise BackendUnavailable(reason)
+        backend = self._native_backend()
+        if backend is None:
+            raise BackendUnavailable(reason)
+        metadata = dict(action.metadata or {})
+        metadata.setdefault("uia_fallback_reason", reason)
+        fallback_action = UiAction(
+            action_type=action.action_type,
+            selector=action.selector,
+            value=action.value,
+            metadata=metadata,
+        )
+        try:
+            receipt = json.loads(backend.perform(fallback_action))
+        except BackendUnavailable as exc:
+            raise BackendUnavailable(
+                f"{reason}; Rust native fallback failed: {exc}"
+            ) from exc
+        receipt.setdefault("uia_fallback_reason", reason)
+        receipt.setdefault("via", "rust-native-windows")
+        return json.dumps(receipt, sort_keys=True)
+
+    def _native_backend(self) -> RustNativeWindowsBackend | None:
+        if not self.enable_native_fallback:
+            return None
+        if self._native_fallback is None:
+            self._native_fallback = RustNativeWindowsBackend()
+        if not self._native_fallback.available():
+            return None
+        return self._native_fallback
+
+    @staticmethod
+    def _can_native_fallback(action: UiAction) -> bool:
+        if action.action_type in {
+            "launch_app",
+            "open_url",
+            "hotkey",
+            "move_cursor",
+            "scroll",
+            "wait",
+        }:
+            return True
+        if action.action_type in {
+            "click",
+            "invoke",
+            "type",
+            "set_text",
+            "set_value",
+        }:
+            metadata = dict(action.metadata or {})
+            return bool(
+                ("x" in metadata and "y" in metadata)
+                or "bounds" in metadata
+                or "bbox" in metadata
+                or "," in str(action.selector or "")
+            )
+        if action.action_type == "draw_path":
+            metadata = dict(action.metadata or {})
+            return bool("bounds" in metadata or "bbox" in metadata)
+        return False
+
+    @staticmethod
+    def _with_target_metadata(action: UiAction, node: UiNode) -> UiAction:
+        metadata = dict(action.metadata or {})
+        if node.bounds is not None:
+            metadata.setdefault("bounds", list(node.bounds))
+        metadata.setdefault("matched_name", node.name)
+        metadata.setdefault("matched_role", node.role)
+        return UiAction(
+            action_type=action.action_type,
+            selector=action.selector,
+            value=action.value,
+            metadata=metadata,
+        )
 
     def _ensure_available(self) -> None:
         if not self.available():

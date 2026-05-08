@@ -320,6 +320,77 @@ class DashboardEndpointsTests(unittest.TestCase):
                 self.assertIn("failure", payload)
                 self.assertTrue(payload["failure"]["verification"]["required"])
 
+    def test_dashboard_workflow_execute_enables_universal_mode(self) -> None:
+        temp_dir, app, client = self._client()
+        with temp_dir:
+            with client as api:
+                headers = self._auth_headers(api, app)
+                calls: dict[str, object] = {}
+                original_ensure = (
+                    app.state.workflow_service.ensure_universal_mode
+                )
+                original_execute = app.state.workflow_service.execute
+
+                def stub_ensure(backend, max_steps=12):
+                    calls["ensure_backend"] = backend
+                    calls["ensure_max_steps"] = max_steps
+
+                def stub_execute(objective, backend):
+                    calls["execute_objective"] = objective
+                    calls["execute_backend"] = backend
+                    return {
+                        "plan": {
+                            "mode": "report",
+                            "requires_clarification": False,
+                            "steps": [],
+                        },
+                        "artifacts": [],
+                        "receipts": [],
+                    }
+
+                app.state.workflow_service.ensure_universal_mode = stub_ensure
+                app.state.workflow_service.execute = stub_execute
+                try:
+                    pending = api.post(
+                        "/pc/workflow/execute",
+                        json={
+                            "objective": "write a report about agent control",
+                            "backend": "virtual-desktop-sandbox",
+                        },
+                        headers=headers,
+                    ).json()
+                    self.assertEqual(pending["status"], "approval_required")
+                    approval_token = pending["decision"]["approval"]["token"]
+                    api.post(
+                        f"/approvals/{approval_token}/approve",
+                        headers=headers,
+                    ).json()
+                    payload = api.post(
+                        "/pc/workflow/execute",
+                        json={
+                            "objective": "write a report about agent control",
+                            "backend": "virtual-desktop-sandbox",
+                            "approval_token": approval_token,
+                        },
+                        headers=headers,
+                    ).json()
+                finally:
+                    app.state.workflow_service.ensure_universal_mode = (
+                        original_ensure
+                    )
+                    app.state.workflow_service.execute = original_execute
+
+                self.assertEqual(payload["status"], "executed")
+                self.assertEqual(calls["ensure_max_steps"], 8)
+                self.assertEqual(
+                    calls["execute_objective"],
+                    "write a report about agent control",
+                )
+                self.assertIs(
+                    calls["ensure_backend"],
+                    calls["execute_backend"],
+                )
+
     def test_dashboard_background_job_endpoint(self) -> None:
         temp_dir, app, client = self._client()
         with temp_dir:

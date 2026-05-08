@@ -4014,7 +4014,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         if cls._backend_is_sandbox(backend):
             return True
         backend_name = str(getattr(backend, "name", "") or "").lower()
-        if backend_name in {"windows-uia", "touchpoint"}:
+        if backend_name in {"windows-uia", "rust-native-windows"}:
             return False
         payload = cls._backend_capability_payload(backend)
         if not isinstance(payload, dict):
@@ -5474,6 +5474,14 @@ class WorkerAgent(ObjectiveAnalysisMixin):
 
     @staticmethod
     def _point_selector_for_node(node: UiNode) -> str | None:
+        metadata = dict(node.metadata or {})
+        semantic_tokens: list[str] = []
+        for key in ("automation_id", "class_name"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                semantic_tokens.append(f"{key}={value}")
+        if semantic_tokens:
+            return ";".join(semantic_tokens)
         if not node.bounds:
             return None
         x, y, width, height = node.bounds

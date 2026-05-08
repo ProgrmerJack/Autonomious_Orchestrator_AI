@@ -1,7 +1,7 @@
 [project]
 name = "agentos-orchestrator"
 version = "0.1.0"
-description = "Python autonomous research orchestrator scaffold with an optional experimental Rust sandbox adapter, policy gates, durable state, MCP integration, and OS-control adapters."
+description = "Python autonomous research orchestrator with a Rust native input body, policy gates, durable state, MCP integration, and OS-control adapters."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -34,9 +34,6 @@ cognition = [
 ]
 os-control = [
 	"mss>=10.0,<11",
-]
-os-control-touchpoint = [
-	"touchpoint>=0.0.1; platform_system == 'Windows'",
 ]
 full = [
 	"fastapi>=0.115,<1",

@@ -120,6 +120,7 @@ def register_dashboard_pc_routes(
             return blocked
         backend = _pc_backend(backend_name, orchestrator.state_path)
         try:
+            workflow_service.ensure_universal_mode(backend, max_steps=8)
             result = workflow_service.execute(objective, backend)
         except WorkflowVerificationError as exc:
             envelope = {

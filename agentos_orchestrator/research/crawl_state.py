@@ -388,6 +388,12 @@ class ResearchCrawlStateMixin:
             return
         if not self._auto_start_crawl_workers_enabled():
             return
+        queued_count = self._queued_crawl_backlog_count()
+        if (
+            queued_count is not None
+            and 0 < queued_count < self._detached_crawl_auto_start_backlog_threshold()
+        ):
+            return
         try:
             from agentos_orchestrator.product import CrawlWorkerServiceManager
         except Exception:
@@ -403,7 +409,6 @@ class ResearchCrawlStateMixin:
                     service_manager.start(task_name=service_status.task_name)
                 self._crawl_worker_auto_started = True
                 return
-        queued_count = self._queued_crawl_backlog_count()
         if (
             queued_count is not None
             and queued_count < self._detached_crawl_auto_start_backlog_threshold()

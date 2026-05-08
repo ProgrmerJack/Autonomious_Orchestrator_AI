@@ -716,6 +716,10 @@ class V2ServiceIntegrationTests(unittest.TestCase):
             self.assertIn("run_id", receipt)
             self.assertIn("avg_latency_ms", receipt)
             self.assertIn("model_used_ratio", receipt)
+            self.assertEqual(
+                receipt["adaptation_readiness"]["status"],
+                "needs_training_or_eval",
+            )
 
 
 if __name__ == "__main__":

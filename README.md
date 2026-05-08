@@ -5,7 +5,8 @@ This repository turns the architectural plan in [Plan.md](Plan.md) into a workin
 The implementation follows a hybrid model:
 
 - Python is the brain: orchestration, event routing, policy checks, checkpointing, MCP wiring, and worker coordination.
-- Rust is the body: a low-latency process boundary for native accessibility, file I/O, and event streaming integrations.
+- Rust is the body: a low-latency process boundary for native input,
+  accessibility, file I/O, and event streaming integrations.
 - Security is default-deny: worker agents must declare intended actions before execution, and the policy engine blocks forbidden actions before any tool is invoked.
 
 ## What Works Now
@@ -16,9 +17,13 @@ The implementation follows a hybrid model:
 - Permission boundary mapping with allow, deny, and approval-required decisions.
 - MCP stdio JSON-RPC client seam for tools/resources/prompts.
 - Live deep research retrieval through public scholarly APIs, with MCP seams for richer sources.
-- OS control abstraction with Windows UI Automation, Touchpoint, and DirectShell-compatible adapters.
+- OS control abstraction with Windows UI Automation, Rust-native Windows
+  input fallback, direct `rust-native-windows`, and the honest simulated
+  virtual desktop sandbox.
 - Sandbox provider seams for local dry-run, c/ua, Firecracker, and Kata-style execution.
-- A stdlib-only Rust body process that can be built independently and extended with native OS backends.
+- A Rust body process that can be built independently and now exposes both
+  the simulated virtual desktop protocol and first-party native Windows
+  commands through `native_snapshot` and `native_act`.
 - Markdown runtime configuration via [SOUL.md](SOUL.md), [AGENTS.md](AGENTS.md), and [HEARTBEAT.md](HEARTBEAT.md).
 - Human approval CLI commands, Telegram-style channel routing, and an optional FastAPI/Tauri dashboard gateway.
 - Operator dashboard controls for background research jobs, run history,
@@ -47,7 +52,9 @@ OpenHands as concrete local product surfaces:
 - Benchmark-oriented runtime status combining readiness checks, provider and
   channel counts, and live event evaluator results.
 - Secure PC control with default-deny policy, exact approval tokens, trust
-  degradation, and Windows accessibility-tree snapshots/actions.
+  degradation, Windows accessibility-tree snapshots/actions, and a
+  `rust-native-windows` backend for coordinate input, hotkeys, launch/open,
+  scroll, and draw-path actions.
 
 ## One-Install Windows Start
 
@@ -115,6 +122,20 @@ Build the Rust body when Rust is available:
 ```powershell
 cargo check --manifest-path crates/agent_body/Cargo.toml
 ```
+
+Select a PC backend explicitly when needed:
+
+```powershell
+python -m agentos_orchestrator pc-snapshot --backend windows-uia
+python -m agentos_orchestrator pc-snapshot --backend rust-native-windows
+python -m agentos_orchestrator pc-snapshot --backend virtual-desktop-sandbox
+```
+
+`windows-uia` is the structured accessibility backend. When it cannot satisfy
+a coordinate-native action, it can delegate guarded input to the Rust native
+body instead of failing immediately. `rust-native-windows` exposes the Rust
+input path directly. `virtual-desktop-sandbox` remains the safe simulated
+backend for tests and dry-runs.
 
 Inspect markdown configuration:
 

@@ -250,6 +250,10 @@ class VirtualDesktopSandboxBackend:
             "status": "executed",
         }
         selected_index = self._find_node_index(nodes, action.selector)
+        if selected_index is not None:
+            receipt["matched_node_id"] = str(
+                nodes[selected_index].get("node_id") or "unknown"
+            )
         if self._apply_virtual_system_action(state, nodes, action, receipt):
             state["nodes"] = nodes
             state["last_action"] = receipt
@@ -1045,6 +1049,17 @@ class VirtualDesktopSandboxBackend:
         selector_lower = selector.lower()
         selector_tokens = self._parse_selector_tokens(selector_lower)
 
+        point = None
+        if selector_lower.startswith("point="):
+            point = self._parse_point(selector_lower.split("=", 1)[1])
+        elif selector_tokens.get("point"):
+            point = self._parse_point(selector_tokens["point"])
+        if point is not None:
+            point_x, point_y = point
+            for index, node in enumerate(nodes):
+                if self._node_contains_point(node, point_x, point_y):
+                    return index
+
         # Tier 1: exact/semantic token match (node_id/role/name/panel_type).
         if selector_tokens:
             for index, node in enumerate(nodes):
@@ -1090,7 +1105,10 @@ class VirtualDesktopSandboxBackend:
         node_id = str(node.get("node_id") or "").lower()
         role = str(node.get("role") or "").lower()
         name = str(node.get("name") or "").lower()
-        panel_type = str((node.get("metadata") or {}).get("panel_type") or "").lower()
+        metadata = dict(node.get("metadata") or {})
+        panel_type = str(metadata.get("panel_type") or "").lower()
+        automation_id = str(metadata.get("automation_id") or "").lower()
+        class_name = str(metadata.get("class_name") or "").lower()
 
         target_id = tokens.get("node_id")
         if target_id and node_id != target_id:
@@ -1104,7 +1122,20 @@ class VirtualDesktopSandboxBackend:
         target_panel = tokens.get("panel_type")
         if target_panel and target_panel != panel_type:
             return False
-        return bool(target_id or target_role or target_name or target_panel)
+        target_automation_id = tokens.get("automation_id")
+        if target_automation_id and target_automation_id != automation_id:
+            return False
+        target_class_name = tokens.get("class_name")
+        if target_class_name and target_class_name != class_name:
+            return False
+        return bool(
+            target_id
+            or target_role
+            or target_name
+            or target_panel
+            or target_automation_id
+            or target_class_name
+        )
 
     @staticmethod
     def _parse_point(raw: str) -> tuple[int, int] | None:
