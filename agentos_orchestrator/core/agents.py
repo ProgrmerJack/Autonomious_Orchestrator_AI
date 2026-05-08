@@ -666,6 +666,15 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                 str((task.inputs or {}).get("adaptive_effort") or "").strip() or None,
             )
             evidence = brief.evidence()
+            mcp_metadata = dict((getattr(brief, "metadata", {}) or {}).get("mcp") or {})
+            for action in list(mcp_metadata.get("actions") or []):
+                evidence.append(
+                    {
+                        "source": str(action.get("target") or "mcp://research"),
+                        "claim": "MCP research action executed during literature retrieval.",
+                        "metadata": action,
+                    }
+                )
             if getattr(brief, "metadata", None):
                 evidence.append(
                     {
@@ -1038,15 +1047,30 @@ class WorkerAgent(ObjectiveAnalysisMixin):
 
     def _merge_mcp_research_sources(self, brief: Any) -> Any:
         try:
-            from agentos_orchestrator.mcp import run_mcp_research_query
+            from agentos_orchestrator.mcp import run_mcp_research_execution
         except Exception:
             return brief
 
         query = str(getattr(brief, "query", "") or getattr(brief, "objective", ""))
         if not query.strip():
             return brief
-        hits, diagnostics = run_mcp_research_query(query, limit=5)
-        if not hits and not diagnostics:
+        execution = run_mcp_research_execution(query, limit=5)
+        hits = list(getattr(execution, "hits", []) or [])
+        diagnostics = list(getattr(execution, "diagnostics", []) or [])
+        actions = [
+            {
+                "action_type": action.action_type,
+                "target": action.target,
+                "status": action.status,
+                "server": action.server,
+                "tool": action.tool,
+                "result_count": action.result_count,
+                "error": action.error,
+                "stderr": list(action.stderr),
+            }
+            for action in list(getattr(execution, "actions", []) or [])
+        ]
+        if not hits and not diagnostics and not actions:
             return brief
 
         existing_keys = {
@@ -1076,6 +1100,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         metadata["mcp"] = {
             "source_count": len(mcp_sources),
             "diagnostics": diagnostics,
+            "actions": actions,
         }
         brief.metadata = metadata
         return brief

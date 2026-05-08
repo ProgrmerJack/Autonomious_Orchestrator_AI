@@ -41,10 +41,7 @@ def _extract_session_token(headers: Any) -> str:
 
 
 def _requires_unsafe_ack(path: str, method: str) -> bool:
-    return (
-        method.upper() not in {"GET", "HEAD", "OPTIONS"}
-        and path != "/auth/session"
-    )
+    return method.upper() not in {"GET", "HEAD", "OPTIONS"} and path != "/auth/session"
 
 
 def _pc_backend(name: str, state_path: str | Path):
@@ -67,9 +64,7 @@ def _pc_backend_status(state_path: str | Path) -> list[dict[str, Any]]:
             backend = _pc_backend(name, state_path)
             available = backend.available()
         except (OSError, RuntimeError, ValueError) as exc:
-            statuses.append(
-                {"name": name, "available": False, "error": str(exc)}
-            )
+            statuses.append({"name": name, "available": False, "error": str(exc)})
         else:
             statuses.append({"name": name, "available": available})
     return statuses

@@ -81,9 +81,7 @@ class _FakeControl:
 
 class WindowsUiaBackendTests(unittest.TestCase):
     def test_capture_decodes_png_payload(self) -> None:
-        backend = _StubWindowsUiaBackend(
-            b"\x89PNG\r\n\x1a\nsynthetic-payload"
-        )
+        backend = _StubWindowsUiaBackend(b"\x89PNG\r\n\x1a\nsynthetic-payload")
 
         payload = backend.capture()
 

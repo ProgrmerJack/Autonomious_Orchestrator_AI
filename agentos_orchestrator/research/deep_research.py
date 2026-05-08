@@ -2344,6 +2344,7 @@ class DeepResearchEngine(
                         return valid
         except Exception as _persp_exc:
             import warnings
+
             warnings.warn(
                 f"AI research-perspective generation failed ({_persp_exc!r}); "
                 "falling back to generic perspectives.",

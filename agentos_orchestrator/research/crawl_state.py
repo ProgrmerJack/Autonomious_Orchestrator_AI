@@ -388,6 +388,21 @@ class ResearchCrawlStateMixin:
             return
         if not self._auto_start_crawl_workers_enabled():
             return
+        try:
+            from agentos_orchestrator.product import CrawlWorkerServiceManager
+        except Exception:
+            pass
+        else:
+            service_manager = CrawlWorkerServiceManager(
+                self.workspace_root,
+                python_executable=sys.executable,
+            )
+            service_status = service_manager.status()
+            if service_status.installed:
+                if service_status.status != "running":
+                    service_manager.start(task_name=service_status.task_name)
+                self._crawl_worker_auto_started = True
+                return
         queued_count = self._queued_crawl_backlog_count()
         if (
             queued_count is not None

@@ -110,14 +110,17 @@ class ResearchRetrievalMixin:
         allowed_providers = self._classify_query(classify_input)
 
         for pass_index in range(max_passes):
+            pass_variant_limit = settings.max_query_variants
+            if settings.depth == "multi-hour" and pass_index < min_depth_passes:
+                pass_variant_limit = 1
             pass_variants = self._pass_variants(
                 all_variants,
                 pass_index,
-                settings.max_query_variants,
+                pass_variant_limit,
             )
             if not pass_variants:
                 if all_variants:
-                    pass_variants = all_variants[: settings.max_query_variants]
+                    pass_variants = all_variants[:pass_variant_limit]
                 else:
                     stop_reason = "no_query_variants"
                     break
@@ -524,8 +527,8 @@ class ResearchRetrievalMixin:
             )
             low_marginal_yield_pass = (
                 pass_index > 0
-                and marginal_unique_url_gain < marginal_yield_floor["unique_urls"]
-                and marginal_title_gain < marginal_yield_floor["titles"]
+                and marginal_unique_url_gain <= marginal_yield_floor["unique_urls"]
+                and marginal_title_gain <= marginal_yield_floor["titles"]
             )
             if low_novelty_pass:
                 low_novelty_streak += 1
