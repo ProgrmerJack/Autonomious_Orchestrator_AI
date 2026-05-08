@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from agentos_orchestrator.cognition.abstract_world_model import AbstractUIState
 from agentos_orchestrator.cognition.learned_world_model import (
@@ -224,6 +224,8 @@ class LocalFastVLATests(unittest.TestCase):
     def test_vla_propose_action_returns_action(self) -> None:
         vla = LocalFastVLA()
         img = Image.new("RGB", (640, 480), color="white")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([120, 90, 320, 190], fill="blue", outline="black")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         action = vla.propose_action(buf.getvalue(), "click the button", [])
@@ -244,9 +246,19 @@ class LocalFastVLATests(unittest.TestCase):
         start = time.perf_counter()
         action = vla.propose_action(buf.getvalue(), "click", [])
         elapsed = (time.perf_counter() - start) * 1000
-        self.assertIsNotNone(action)
+        self.assertIsNone(action)
         # Should be fast (generally <100ms for small images)
         self.assertLess(elapsed, 500.0)  # Generous threshold for CI
+
+    def test_vla_returns_none_without_visual_evidence(self) -> None:
+        vla = LocalFastVLA()
+        img = Image.new("RGB", (320, 240), color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        action = vla.propose_action(buf.getvalue(), "click the button", [])
+
+        self.assertIsNone(action)
 
     def test_vla_classify_element_bootstrap(self) -> None:
         vla = LocalFastVLA()

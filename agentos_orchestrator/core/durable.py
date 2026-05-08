@@ -139,6 +139,9 @@ class DurableExecutionStore:
     def fail_run(self, run_id: str) -> None:
         self._update_run_status(run_id, "failed")
 
+    def mark_run_running(self, run_id: str) -> None:
+        self._update_run_status(run_id, "running")
+
     def load_manifest(self, run_id: str) -> JsonObject | None:
         with closing(self._connect()) as connection:
             row = connection.execute(

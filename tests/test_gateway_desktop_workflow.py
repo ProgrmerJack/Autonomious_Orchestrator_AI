@@ -7,6 +7,10 @@ from pathlib import Path
 
 from agentos_orchestrator.gateway import ChannelMessage, GatewayCommandRouter
 from agentos_orchestrator.os_control import VirtualDesktopSandboxBackend
+from agentos_orchestrator.os_control.base import UiAction
+from agentos_orchestrator.os_control.workflow.service import (
+    WorkflowVerificationError,
+)
 
 from tests.gateway_test_support import new_orchestrator
 
@@ -158,6 +162,49 @@ class GatewayDesktopWorkflowTests(unittest.TestCase):
                     for item in response.payload["receipts"]
                 )
             )
+
+    def test_gateway_router_returns_error_on_verification_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            router = GatewayCommandRouter(self._desktop_orchestrator(root))
+
+            def fail_execute(_objective, _backend):
+                raise WorkflowVerificationError(
+                    action=UiAction(
+                        action_type="type",
+                        selector="name=Document Canvas",
+                        value="broken",
+                    ),
+                    receipt='{"status": "executed"}',
+                    verification={
+                        "kind": "field_contains",
+                        "matched": False,
+                        "expected": "typed value visible",
+                        "observed": "document canvas",
+                        "required": True,
+                        "reason": "typed value was not observed",
+                        "evidence": {},
+                    },
+                    recovery={
+                        "applied": False,
+                        "attempted": False,
+                        "reason": "",
+                        "verification_failed": True,
+                        "verification_reason": "typed value was not observed",
+                    },
+                )
+
+            router.workflow_service.execute = fail_execute
+            response = router.handle(
+                ChannelMessage(
+                    "telegram",
+                    "42",
+                    "/pc write a report about local pc automation",
+                )
+            )
+
+            self.assertEqual(response.status, "error")
+            self.assertEqual(response.payload["status"], "verification_failed")
 
 
 if __name__ == "__main__":

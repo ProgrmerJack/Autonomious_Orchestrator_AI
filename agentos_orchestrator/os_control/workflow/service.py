@@ -4,6 +4,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agentos_orchestrator.cognition.live_fire_eval_recipes import (
+    abstract_state,
+    snapshot_nodes,
+)
+from agentos_orchestrator.cognition.verification_contracts import (
+    VerificationContract,
+    ensure_verification_contract,
+    verify_action_contract,
+)
 from agentos_orchestrator.os_control.base import UiAction
 from agentos_orchestrator.os_control.selector_debug import debug_selector
 from agentos_orchestrator.os_control.workflow.artifact_writer import (
@@ -15,6 +24,33 @@ from agentos_orchestrator.os_control.workflow.planner import (
 from agentos_orchestrator.os_control.workflow.reasoner import (
     DesktopWorkflowReasoner,
 )
+
+
+class WorkflowVerificationError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        action: UiAction,
+        receipt: str,
+        verification: dict[str, Any],
+        recovery: dict[str, Any],
+    ) -> None:
+        self.action = action
+        self.receipt = receipt
+        self.verification = verification
+        self.recovery = recovery
+        reason = str(verification.get("reason") or "workflow verification failed")
+        super().__init__(reason)
+
+    def asdict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action.action_type,
+            "selector": self.action.selector,
+            "value": self.action.value,
+            "verification": dict(self.verification),
+            "recovery": dict(self.recovery),
+            "receipt": DesktopWorkflowService._json_or_text(self.receipt),
+        }
 
 
 class DesktopWorkflowService:
@@ -36,24 +72,17 @@ class DesktopWorkflowService:
         use_vla: bool = True,
         max_steps: int = 30,
     ) -> None:
-        """Enable the cognitive-architecture universal agent.
+        """Enable the production universal agent path.
 
-        When enabled, execute() will first run the planned steps, then
-        hand off to the UniversalDesktopAgent for arbitrary-task handling.
+        The legacy method name is preserved for compatibility, but the runtime
+        now binds V2 only so the workflow service has a single cognitive path.
         """
-        from agentos_orchestrator.cognition.universal_agent import (
-            UniversalDesktopAgent,
-        )
-
-        self._universal_agent = UniversalDesktopAgent(
-            backend=backend,
-            workspace_root=str(self.writer.workspace_root),
-            use_mcts=use_mcts,
-            use_active_inference=use_active_inference,
-            use_vla=use_vla,
+        del use_mcts, use_active_inference
+        self.enable_universal_mode_v2(
+            backend,
+            use_local_vla=use_vla,
             max_steps=max_steps,
         )
-        self._universal_backend_id = id(backend)
 
     def enable_universal_mode_v2(
         self,
@@ -94,17 +123,7 @@ class DesktopWorkflowService:
             backend
         ):
             return
-        try:
-            self.enable_universal_mode_v2(backend, max_steps=max_steps)
-        except (
-            AttributeError,
-            ImportError,
-            ModuleNotFoundError,
-            OSError,
-            RuntimeError,
-            ValueError,
-        ):
-            self.enable_universal_mode(backend, max_steps=max_steps)
+        self.enable_universal_mode_v2(backend, max_steps=max_steps)
 
     def plan(self, objective: str):
         return self.planner.plan(objective)
@@ -121,7 +140,12 @@ class DesktopWorkflowService:
         written = self.writer.materialize(plan)
         receipts: list[dict[str, Any]] = []
         for step in plan.steps:
-            receipt, final_selector, recovery = self._perform_with_recovery(
+            (
+                receipt,
+                final_selector,
+                recovery,
+                verification,
+            ) = self._perform_with_recovery(
                 backend,
                 step,
             )
@@ -132,6 +156,7 @@ class DesktopWorkflowService:
                     "description": step.description,
                     "receipt": self._json_or_text(receipt),
                     "recovery": recovery,
+                    "verification": verification,
                 }
             )
         self._execute_adaptive_steps(
@@ -216,7 +241,12 @@ class DesktopWorkflowService:
             )
             if decision.done or decision.step is None:
                 return
-            receipt, final_selector, recovery = self._perform_with_recovery(
+            (
+                receipt,
+                final_selector,
+                recovery,
+                verification,
+            ) = self._perform_with_recovery(
                 backend,
                 decision.step,
             )
@@ -227,6 +257,7 @@ class DesktopWorkflowService:
                     "description": decision.step.description,
                     "receipt": self._json_or_text(receipt),
                     "recovery": recovery,
+                    "verification": verification,
                     "adaptive": True,
                     "reasoner": decision.engine,
                     "rationale": decision.rationale,
@@ -245,33 +276,40 @@ class DesktopWorkflowService:
         self,
         backend: Any,
         step: Any,
-    ) -> tuple[str, str, dict[str, Any]]:
+    ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+        before_nodes = snapshot_nodes(backend)
+        before = abstract_state("unknown", before_nodes)
         recovery = self._empty_recovery()
-        receipt, selector = self._perform_with_selector(
+        receipt, selector, action = self._perform_with_selector(
             backend,
             step,
             recovery,
         )
-        return receipt, selector, recovery
+        after_nodes = snapshot_nodes(backend)
+        after = abstract_state("unknown", after_nodes)
+        verification = self._verify_step(action, before, after, receipt, recovery)
+        return receipt, selector, recovery, verification
 
     def _perform_with_selector(
         self,
         backend: Any,
         step: Any,
         recovery: dict[str, Any],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, UiAction]:
         selector = step.selector
         if step.action_type != "launch_app":
             selector = self._preflight_selector(backend, step.selector, recovery)
-        receipt = self._perform_step(backend, step, selector)
-        selector, receipt = self._retry_with_fallback(
+        action = self._workflow_action(step, selector)
+        receipt = backend.perform(action)
+        selector, receipt, action = self._retry_with_fallback(
             backend,
             step,
             selector,
             receipt,
             recovery,
+            action,
         )
-        return receipt, selector
+        return receipt, selector, action
 
     @staticmethod
     def _empty_recovery() -> dict[str, Any]:
@@ -303,13 +341,64 @@ class DesktopWorkflowService:
 
     @staticmethod
     def _perform_step(backend: Any, step: Any, selector: str) -> str:
-        return backend.perform(
-            UiAction(
-                action_type=step.action_type,
-                selector=selector,
-                value=step.value,
-                metadata=step.metadata,
+        return backend.perform(DesktopWorkflowService._workflow_action(step, selector))
+
+    @staticmethod
+    def _workflow_action(step: Any, selector: str) -> UiAction:
+        action = UiAction(
+            action_type=step.action_type,
+            selector=selector,
+            value=step.value,
+            metadata=dict(step.metadata or {}),
+        )
+        if "verification_contract" not in action.metadata:
+            contract = DesktopWorkflowService._workflow_contract(
+                step.action_type,
+                selector,
             )
+            if contract is not None:
+                action.metadata["verification_contract"] = contract.asdict()
+        ensure_verification_contract(action)
+        return action
+
+    @staticmethod
+    def _workflow_contract(
+        action_type: str,
+        selector: str,
+    ) -> VerificationContract | None:
+        if action_type == "cell_edit":
+            return VerificationContract(
+                kind="receipt_success",
+                expected="The backend receipt reports successful action execution.",
+                target=selector,
+                required=True,
+            )
+        if action_type == "draw_path":
+            return VerificationContract(
+                kind="receipt_success",
+                expected="The backend receipt reports successful action execution.",
+                target=selector,
+                required=False,
+            )
+        if action_type not in {"type", "set_text", "set_value"}:
+            return None
+        lower_selector = str(selector or "").strip().lower()
+        explicit_field_tokens = (
+            "automation_id=1001",
+            "class_name=edit",
+            "role=edit",
+            "file name",
+            "address",
+            "search",
+            "text editor",
+        )
+        if any(token in lower_selector for token in explicit_field_tokens):
+            return None
+        return VerificationContract(
+            kind="receipt_success",
+            expected="The backend receipt reports successful text entry.",
+            target=selector,
+            required=False,
         )
 
     def _retry_with_fallback(
@@ -319,13 +408,14 @@ class DesktopWorkflowService:
         selector: str,
         receipt: str,
         recovery: dict[str, Any],
-    ) -> tuple[str, str]:
+        action: UiAction,
+    ) -> tuple[str, str, UiAction]:
         payload = self._json_or_text(receipt)
         if not self._needs_retry(payload):
-            return selector, receipt
+            return selector, receipt, action
         retry_selector = self._suggest_selector(backend, step.selector)
         if retry_selector is None or retry_selector == selector:
-            return selector, receipt
+            return selector, receipt, action
         recovery.update(
             {
                 "attempted": True,
@@ -335,12 +425,29 @@ class DesktopWorkflowService:
                 "to": retry_selector,
             }
         )
-        retry_receipt = self._perform_step(
-            backend,
-            step,
-            retry_selector,
-        )
-        return retry_selector, retry_receipt
+        retry_action = self._workflow_action(step, retry_selector)
+        retry_receipt = backend.perform(retry_action)
+        return retry_selector, retry_receipt, retry_action
+
+    @staticmethod
+    def _verify_step(
+        action: UiAction,
+        before: Any,
+        after: Any,
+        receipt: str,
+        recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        verification = verify_action_contract(action, before, after, receipt)
+        if verification.required and not verification.matched:
+            recovery["verification_failed"] = True
+            recovery["verification_reason"] = verification.reason
+            raise WorkflowVerificationError(
+                action=action,
+                receipt=receipt,
+                verification=verification.asdict(),
+                recovery=recovery,
+            )
+        return verification.asdict()
 
     @staticmethod
     def _needs_retry(payload: Any) -> bool:

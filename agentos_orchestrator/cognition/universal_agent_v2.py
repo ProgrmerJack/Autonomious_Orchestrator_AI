@@ -1187,11 +1187,12 @@ class UniversalDesktopAgentV2:
         if mcts_action:
             return mcts_action
 
-        # 5. Ultimate fallback: generic click in main region
+        # 5. Ultimate fallback: re-ground with local exploration instead of
+        # issuing a blind coordinate click.
         return UiAction(
-            action_type="click",
-            selector="fallback_main_region",
-            metadata={"x": 960, "y": 540, "source": "fallback"},
+            action_type="explore",
+            selector="reground-ui",
+            metadata={"source": "fallback"},
         )
 
     def _warm_world_model_with_action(

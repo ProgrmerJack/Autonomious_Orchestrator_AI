@@ -9,7 +9,7 @@ from .adapters import (
 from .artifact_writer import WorkflowArtifactWriter
 from .models import DesktopWorkflowPlan, DesktopWorkflowStep, WorkflowArtifact
 from .planner import DesktopWorkflowPlanner
-from .service import DesktopWorkflowService
+from .service import DesktopWorkflowService, WorkflowVerificationError
 
 __all__ = [
     "BrowserWorkflowAdapter",
@@ -24,4 +24,5 @@ __all__ = [
     "SpreadsheetWorkflowAdapter",
     "WorkflowArtifact",
     "WorkflowArtifactWriter",
+    "WorkflowVerificationError",
 ]

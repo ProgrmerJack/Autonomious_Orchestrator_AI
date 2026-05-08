@@ -9,8 +9,13 @@ from agentos_orchestrator.os_control.base import UiNode
 from agentos_orchestrator.os_control.workflow.planner import (
     DesktopWorkflowPlanner,
 )
+from agentos_orchestrator.os_control.workflow.models import (
+    DesktopWorkflowPlan,
+    DesktopWorkflowStep,
+)
 from agentos_orchestrator.os_control.workflow.service import (
     DesktopWorkflowService,
+    WorkflowVerificationError,
 )
 
 
@@ -77,6 +82,52 @@ class AdaptiveOnlyBackend:
             "value": action.value,
         }
         return json.dumps(payload)
+
+
+class VerificationBackend:
+    def __init__(
+        self,
+        *,
+        reflect_value_in_snapshot: bool,
+        include_value_in_receipt: bool,
+    ) -> None:
+        self.field_value = "Document Canvas"
+        self.reflect_value_in_snapshot = reflect_value_in_snapshot
+        self.include_value_in_receipt = include_value_in_receipt
+
+    def snapshot(self) -> list[UiNode]:
+        value = (
+            self.field_value if self.reflect_value_in_snapshot else "Document Canvas"
+        )
+        return [UiNode(node_id="doc-canvas", role="Document", name=value)]
+
+    def perform(self, action) -> str:
+        if action.action_type in {"type", "set_text", "set_value"}:
+            self.field_value = action.value or ""
+            payload = {
+                "status": (
+                    "value-set" if self.include_value_in_receipt else "executed"
+                ),
+                "action": action.action_type,
+                "selector": action.selector,
+            }
+            if self.include_value_in_receipt:
+                payload["value"] = action.value
+            return json.dumps(payload)
+        return json.dumps({"status": "executed", "selector": action.selector})
+
+
+class RecordingVerificationBackend(VerificationBackend):
+    def __init__(self) -> None:
+        super().__init__(
+            reflect_value_in_snapshot=False,
+            include_value_in_receipt=False,
+        )
+        self.actions: list[tuple[str, str]] = []
+
+    def perform(self, action) -> str:
+        self.actions.append((action.action_type, action.selector))
+        return super().perform(action)
 
 
 class WorkflowServiceTests(unittest.TestCase):
@@ -384,6 +435,119 @@ class WorkflowServiceTests(unittest.TestCase):
                     for item in adaptive_receipts
                 )
             )
+
+    def test_perform_with_recovery_records_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = VerificationBackend(
+                reflect_value_in_snapshot=True,
+                include_value_in_receipt=True,
+            )
+            step = DesktopWorkflowStep(
+                action_type="type",
+                selector="name=Document Canvas",
+                value="AgentOS verified value",
+                description="Type into the document",
+                metadata={
+                    "verification_contract": {
+                        "kind": "field_contains",
+                        "expected": "The focused field contains the typed value.",
+                        "target": "name=Document Canvas",
+                        "value": "AgentOS verified value",
+                        "required": True,
+                    }
+                },
+            )
+
+            receipt, selector, recovery, verification = service._perform_with_recovery(
+                backend,
+                step,
+            )
+
+            self.assertEqual(selector, "name=Document Canvas")
+            self.assertEqual(json.loads(receipt)["status"], "value-set")
+            self.assertFalse(recovery.get("verification_failed", False))
+            self.assertTrue(verification["required"])
+            self.assertTrue(verification["matched"])
+
+    def test_perform_with_recovery_flags_verification_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = VerificationBackend(
+                reflect_value_in_snapshot=False,
+                include_value_in_receipt=False,
+            )
+            step = DesktopWorkflowStep(
+                action_type="type",
+                selector="automation_id=1001&&class_name=Edit",
+                value="AgentOS missing value",
+                description="Type into the document",
+                metadata={
+                    "verification_contract": {
+                        "kind": "field_contains",
+                        "expected": "The focused field contains the typed value.",
+                        "target": "automation_id=1001&&class_name=Edit",
+                        "value": "AgentOS missing value",
+                        "required": True,
+                    }
+                },
+            )
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service._perform_with_recovery(
+                    backend,
+                    step,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertTrue(failure["verification"]["required"])
+            self.assertFalse(failure["verification"]["matched"])
+            self.assertTrue(failure["recovery"]["verification_failed"])
+            self.assertIn(
+                "typed value",
+                failure["recovery"]["verification_reason"],
+            )
+
+    def test_execute_hard_stops_on_required_verification_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = RecordingVerificationBackend()
+            service.planner.plan = lambda objective: DesktopWorkflowPlan(
+                objective=objective,
+                mode="report",
+                app_target=None,
+                summary="verification-sensitive plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="automation_id=1001&&class_name=Edit",
+                        value="fail verification",
+                        description="First step must verify",
+                        metadata={
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": "The focused field contains the typed value.",
+                                "target": "automation_id=1001&&class_name=Edit",
+                                "value": "fail verification",
+                                "required": True,
+                            }
+                        },
+                    ),
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="automation_id=1001&&class_name=Edit",
+                        value="should not execute",
+                        description="Must never run",
+                    ),
+                ],
+                artifacts=[],
+            )
+
+            with self.assertRaises(WorkflowVerificationError):
+                service.execute("write a report", backend)
+
+            self.assertEqual(len(backend.actions), 1)
+            self.assertEqual(backend.actions[0][1], "name=Document Canvas")
 
 
 if __name__ == "__main__":

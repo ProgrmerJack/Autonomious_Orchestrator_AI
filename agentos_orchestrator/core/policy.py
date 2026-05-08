@@ -129,10 +129,6 @@ class PermissionPolicy:
         return [self.assert_allowed(request) for request in requests]
 
     def _requires_approval(self, request: ActionRequest) -> bool:
-        # Sandbox-isolated targets never require approval — the sandbox is an
-        # isolated environment with no host-OS impact.
-        if str(request.target or "").lower().startswith("sandbox://"):
-            return False
         return self._matches_any(
             request.action_type,
             self.require_approval.get("actions", []),
@@ -149,7 +145,31 @@ class PermissionPolicy:
 
     @staticmethod
     def _target_needs_path_check(action_type: str) -> bool:
-        return action_type in {"file.read", "file.write", "network.fetch"}
+        """Return True for any action whose *target* must pass a path/host
+        allow-list check before the action is permitted.
+
+        High-blast-radius OS actions (os.act, subprocess.exec, shell.run,
+        os.shell) are included alongside the original file/network trio so
+        that a policy that allows ``os.act`` without specifying a target
+        scope cannot be silently bypassed.
+        """
+        return action_type in {
+            # File I/O
+            "file.read",
+            "file.write",
+            "file.delete",
+            "file.move",
+            "file.exec",
+            # Network
+            "network.fetch",
+            "network.request",
+            # OS / process execution
+            "os.act",
+            "os.shell",
+            "subprocess.exec",
+            "shell.run",
+            "process.spawn",
+        }
 
     @staticmethod
     def _matches_any(value: str, patterns: list[str]) -> bool:

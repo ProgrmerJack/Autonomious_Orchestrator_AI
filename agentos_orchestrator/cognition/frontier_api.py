@@ -17,6 +17,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from agentos_orchestrator.config import default_frontier_model
+
 
 TARGETED_ACTIONS = {
     "click",
@@ -960,7 +962,10 @@ def default_provider_from_env() -> HTTPFrontierClient | None:
         return HTTPFrontierClient(
             FrontierProviderConfig(
                 provider="openai",
-                model=os.environ.get("AGENTOS_FRONTIER_MODEL", "gpt-4o-mini"),
+                model=os.environ.get(
+                    "AGENTOS_FRONTIER_MODEL",
+                    default_frontier_model("openai"),
+                ),
                 api_key_env="OPENAI_API_KEY",
                 endpoint=os.environ.get("AGENTOS_FRONTIER_ENDPOINT", ""),
                 max_output_tokens=max_output_tokens,
@@ -973,7 +978,8 @@ def default_provider_from_env() -> HTTPFrontierClient | None:
             FrontierProviderConfig(
                 provider="anthropic",
                 model=os.environ.get(
-                    "AGENTOS_FRONTIER_MODEL", "claude-3-5-haiku-latest"
+                    "AGENTOS_FRONTIER_MODEL",
+                    default_frontier_model("anthropic"),
                 ),
                 api_key_env="ANTHROPIC_API_KEY",
                 endpoint=os.environ.get("AGENTOS_FRONTIER_ENDPOINT", ""),
@@ -986,7 +992,10 @@ def default_provider_from_env() -> HTTPFrontierClient | None:
         return HTTPFrontierClient(
             FrontierProviderConfig(
                 provider="gemini",
-                model=os.environ.get("AGENTOS_FRONTIER_MODEL", "gemini-2.5-flash"),
+                model=os.environ.get(
+                    "AGENTOS_FRONTIER_MODEL",
+                    default_frontier_model("gemini"),
+                ),
                 api_key_env="GEMINI_API_KEY",
                 endpoint=os.environ.get("AGENTOS_FRONTIER_ENDPOINT", ""),
                 max_output_tokens=max_output_tokens,

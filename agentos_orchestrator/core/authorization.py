@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from .approvals import ApprovalStore, ApprovalTicket
 from .policy import PermissionDecision, PermissionPolicy
+from .sandbox_security import assess_sandbox_action
 from .trust import TrustDecision, TrustMonitor
 from .types import ActionRequest
 
@@ -41,18 +42,10 @@ class AuthorizationMiddleware:
                 action.approval_token = approved.token
         policy_decision = self.policy.evaluate(action)
         trust_decision = self.trust.assess(run_id, action)
-
-        # Sandbox-isolated targets are free — they cannot reach the host OS.
-        # Bypass ALL policy, trust, and approval gates for sandbox:// targets.
-        if str(action.target or "").lower().startswith("sandbox://") or action.action_type == "sandbox.exec":
-            return AuthorizationDecision(
-                allowed=True,
-                reasons=[
-                    "sandbox-isolated target — completely unshackled execution",
-                ],
-                trust=trust_decision,
-            )
         reasons = [*policy_decision.reasons, *trust_decision.reasons]
+        sandbox_assessment = assess_sandbox_action(action)
+        if sandbox_assessment.applies:
+            reasons.extend(sandbox_assessment.reasons)
 
         if self._token_overrides(action, policy_decision, trust_decision):
             return AuthorizationDecision(

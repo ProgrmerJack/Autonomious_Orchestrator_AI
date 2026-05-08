@@ -712,6 +712,9 @@ class UniversalAgentTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class CognitiveWorkflowIntegrationTests(unittest.TestCase):
     def test_service_enables_universal_mode(self) -> None:
+        from agentos_orchestrator.cognition.universal_agent_v2 import (
+            UniversalDesktopAgentV2,
+        )
         from agentos_orchestrator.os_control.workflow.service import (
             DesktopWorkflowService,
         )
@@ -721,6 +724,7 @@ class CognitiveWorkflowIntegrationTests(unittest.TestCase):
             backend = FakeBackend()
             service.enable_universal_mode(backend, max_steps=3)
             self.assertIsNotNone(service._universal_agent)
+            self.assertIsInstance(service._universal_agent, UniversalDesktopAgentV2)
 
     def test_service_execute_with_universal_mode(self) -> None:
         from agentos_orchestrator.os_control.workflow.service import (

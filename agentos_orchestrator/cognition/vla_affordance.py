@@ -19,6 +19,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from agentos_orchestrator.config import gemini_vision_model
 from agentos_orchestrator.os_control.base import UiAction
 
 
@@ -113,11 +114,10 @@ class VLAAffordanceGrounding:
     encoded screenshots.
     """
 
-    _MODEL_NAME = "gemini-2.0-flash"
     _MAX_IMAGE_MB = 4
 
     def __init__(self, model_name: str | None = None) -> None:
-        self.model_name = model_name or self._MODEL_NAME
+        self.model_name = model_name or gemini_vision_model()
         self._api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
             "GOOGLE_API_KEY"
         )

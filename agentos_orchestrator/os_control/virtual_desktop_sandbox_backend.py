@@ -155,7 +155,8 @@ class VirtualDesktopSandboxBackend:
             "type": "sandbox.capabilities",
             "status": "ok",
             "sandbox": True,
-            "rights": "full-virtual-rights",
+            "is_simulated": True,
+            "rights": "simulated-virtual-rights",
             "capabilities": [
                 "snapshot",
                 "act",
@@ -168,7 +169,7 @@ class VirtualDesktopSandboxBackend:
                 "virtual-processes",
                 "clipboard",
                 "modal-mutation",
-                "sandbox-confined-full-privileges",
+                "simulated-sandbox-privileges",
                 "stateful-control-receipts",
                 "history-preserving-reset",
                 "window-panel-mutation",
@@ -1050,15 +1051,6 @@ class VirtualDesktopSandboxBackend:
                 if self._node_matches_tokens(node, selector_tokens):
                     return index
 
-            # Tier 2: spatial fallback using point=x,y when semantics are missing.
-            if "point" in selector_tokens:
-                point = self._parse_point(str(selector_tokens.get("point") or ""))
-                if point is not None:
-                    point_x, point_y = point
-                    for index, node in enumerate(nodes):
-                        if self._node_contains_point(node, point_x, point_y):
-                            return index
-
         for index, node in enumerate(nodes):
             if self._node_matches_selector(node, selector_lower):
                 return index
@@ -1148,6 +1140,66 @@ class VirtualDesktopSandboxBackend:
                 metadata["text"] = f"Sandbox content loaded for {url}"
                 node["metadata"] = metadata
                 node["name"] = f"Sandbox Page - {url}"
+
+    def hydrate_browser_page(
+        self,
+        url: str,
+        *,
+        title: str = "",
+        text: str = "",
+        source: str = "",
+    ) -> dict:
+        """Inject real fetched browser content into the sandbox document.
+
+        The sandbox remains a safe virtual UI backend, but its browser document
+        should reflect actual fetched page content when the worker has already
+        retrieved it through the research engine. That turns PC navigation from
+        a pure selector exercise into stateful evidence-bearing UI context.
+        """
+        state = self._load_state()
+        nodes = list(state.get("nodes") or [])
+        clean_url = str(url or "").strip() or "about:blank"
+        clean_title = str(title or "").strip()
+        clean_text = str(text or "")
+        self._update_browser_url(nodes, clean_url)
+        for node in nodes:
+            node_id = str(node.get("node_id") or "")
+            if node_id == "browser-address-bar":
+                metadata = dict(node.get("metadata") or {})
+                metadata["value"] = clean_url
+                node["metadata"] = metadata
+                continue
+            if node_id != "browser-main-doc":
+                continue
+            metadata = dict(node.get("metadata") or {})
+            metadata.update(
+                {
+                    "url": clean_url,
+                    "title": clean_title,
+                    "text": clean_text,
+                    "content_source": source or "research-engine",
+                    "content_chars": len(clean_text),
+                    "hydrated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            node["metadata"] = metadata
+            node["name"] = clean_title or f"Sandbox Page - {clean_url}"
+        state["nodes"] = nodes
+        receipt = {
+            "type": "sandbox.browser_hydrate",
+            "status": "hydrated",
+            "sandbox": True,
+            "backend": self.name,
+            "url": clean_url,
+            "title": clean_title,
+            "content_chars": len(clean_text),
+            "source": source or "research-engine",
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        state["last_action"] = receipt
+        self._append_agent_history(state, receipt)
+        self._save_state(state)
+        return receipt
 
     @staticmethod
     def _is_browser_app(app_name: str) -> bool:

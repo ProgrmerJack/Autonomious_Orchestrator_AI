@@ -59,6 +59,16 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(result.dry_run)
         self.assertEqual(result.exit_code, 0)
 
+    def test_sandbox_manager_agent_body_is_opt_in(self) -> None:
+        manager = SandboxManager()
+        result = manager.execute(
+            SandboxSpec(provider="agent-body", image="research-vm"),
+            [],
+        )
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("not enabled or available", result.stdout)
+
     def test_sandbox_manager_agent_body_executes_control_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = SandboxManager()

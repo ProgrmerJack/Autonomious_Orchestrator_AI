@@ -37,6 +37,10 @@ from agentos_orchestrator.cognition.live_fire_review import (
 )
 from agentos_orchestrator.cognition.os_eval_packs import eval_pack_payload
 from agentos_orchestrator.cognition.replay_debug import load_replay_debug
+from agentos_orchestrator.gateway.auth import (
+    GatewaySecurityError,
+    GatewaySecurityManager,
+)
 from agentos_orchestrator.gateway.channels import (
     ChannelMessage,
     DiscordWebhookAdapter,
@@ -53,6 +57,7 @@ from agentos_orchestrator.os_control import (
     VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
 )
+from agentos_orchestrator.os_control.workflow import WorkflowVerificationError
 from agentos_orchestrator.os_control.selector_debug import debug_selector
 from agentos_orchestrator.product import (
     CommandRegistry,
@@ -219,10 +224,18 @@ def create_dashboard_app(
     try:
         fastapi = importlib.import_module("fastapi")
         cors = importlib.import_module("fastapi.middleware.cors")
+        responses = importlib.import_module("fastapi.responses")
     except ImportError as exc:
         raise RuntimeError("Install fastapi to run the dashboard API") from exc
 
-    app = fastapi.FastAPI(title="AgentOS Gateway")
+    auth = GatewaySecurityManager()
+    app = fastapi.FastAPI(
+        title="AgentOS Gateway",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.state.gateway_auth = auth
     app.add_middleware(
         cors.CORSMiddleware,
         allow_origins=[
@@ -235,7 +248,59 @@ def create_dashboard_app(
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def enforce_gateway_auth(request: Any, call_next: Any):
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
+        client_host = _client_host(request)
+        origin = _request_origin(request)
+        try:
+            if request.url.path == "/auth/session":
+                auth.assert_loopback_client(client_host)
+                auth.assert_local_origin(origin)
+            else:
+                auth.require_session(
+                    session_token=_extract_session_token(request.headers),
+                    client_host=client_host,
+                    origin=origin,
+                    csrf_token=request.headers.get("x-agentos-csrf"),
+                    require_csrf=request.method.upper() not in {"GET", "HEAD"},
+                    require_unsafe_ack=_requires_unsafe_ack(
+                        request.url.path,
+                        request.method,
+                    ),
+                    unsafe_ack=request.headers.get("x-agentos-unsafe"),
+                )
+        except GatewaySecurityError as exc:
+            return responses.JSONResponse(
+                {"detail": str(exc)},
+                status_code=exc.status_code,
+            )
+        return await call_next(request)
+
+    async def create_auth_session(payload: dict, request: Any) -> dict:
+        session = auth.create_session(
+            bootstrap_token=str(payload.get("bootstrap_token") or ""),
+            client_host=_client_host(request),
+            origin=_request_origin(request),
+        )
+        return session.asdict()
+
+    create_auth_session.__annotations__["request"] = fastapi.Request
+    app.post("/auth/session")(create_auth_session)
+
     async def events(websocket: Any) -> None:
+        try:
+            auth.require_session(
+                session_token=str(websocket.query_params.get("session_token") or ""),
+                client_host=_client_host(websocket),
+                origin=_request_origin(websocket),
+                csrf_token=str(websocket.query_params.get("csrf_token") or ""),
+                require_csrf=True,
+            )
+        except GatewaySecurityError as exc:
+            await websocket.close(code=4401, reason=str(exc))
+            return
         await websocket.accept()
         queue = event_hub.subscribe()
         try:
@@ -273,6 +338,7 @@ def create_dashboard_app(
         run_manager = DashboardRunManager(orchestrator, event_hub)
         daemon_manager = DaemonManager(Path.cwd())
         workflow_service = DesktopWorkflowService(Path.cwd())
+        app.state.workflow_service = workflow_service
         pc_receipts: deque[dict[str, Any]] = deque(maxlen=100)
         channel_deliveries: deque[dict[str, Any]] = deque(maxlen=100)
 
@@ -634,7 +700,25 @@ def create_dashboard_app(
                 )
                 return blocked
             backend = _pc_backend(backend_name, orchestrator.state_path)
-            result = workflow_service.execute(objective, backend)
+            try:
+                result = workflow_service.execute(objective, backend)
+            except WorkflowVerificationError as exc:
+                envelope = {
+                    "status": "verification_failed",
+                    "objective": objective,
+                    "failure": exc.asdict(),
+                }
+                pc_receipts.appendleft(
+                    {
+                        "created_at": utc_now(),
+                        "backend": backend_name,
+                        "selector": "workflow",
+                        "action": "workflow.execute",
+                        "result": envelope,
+                    }
+                )
+                event_hub.publish({"pc_receipt": pc_receipts[0]})
+                return envelope
             if result.get("status") == "clarification_required":
                 envelope = result
             else:
@@ -783,6 +867,31 @@ def create_dashboard_app(
             return response
 
     return app
+
+
+def _client_host(connection: Any) -> str:
+    client = getattr(connection, "client", None)
+    if client is None:
+        return ""
+    return str(getattr(client, "host", "") or "")
+
+
+def _request_origin(connection: Any) -> str | None:
+    headers = getattr(connection, "headers", None)
+    if headers is None:
+        return None
+    return str(headers.get("origin") or headers.get("referer") or "") or None
+
+
+def _extract_session_token(headers: Any) -> str:
+    authorization = str(headers.get("authorization") or "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return str(headers.get("x-agentos-session") or "")
+
+
+def _requires_unsafe_ack(path: str, method: str) -> bool:
+    return method.upper() not in {"GET", "HEAD", "OPTIONS"} and path != "/auth/session"
 
 
 def _pc_backend(name: str, state_path: str | Path):

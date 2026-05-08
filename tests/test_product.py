@@ -130,6 +130,44 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(payload["worker_pids"], [111, 222])
             self.assertEqual(payload["queue_db_path"], str(queue_db))
 
+    def test_crawl_worker_manager_start_clamps_power_sensitive_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+
+            class _FakeProcess:
+                def __init__(self, pid: int) -> None:
+                    self.pid = pid
+
+            with patch(
+                "agentos_orchestrator.product.crawl_worker.subprocess.Popen"
+            ) as popen:
+                popen.side_effect = [
+                    _FakeProcess(111),
+                    _FakeProcess(222),
+                    _FakeProcess(333),
+                    _FakeProcess(444),
+                ]
+                manager = CrawlWorkerManager(temp_dir, python_executable="python")
+                record = manager.start(
+                    worker_count=12,
+                    queue_db_path=queue_db,
+                    poll_interval_seconds=9.0,
+                    batch_size=40,
+                    claim_ttl_seconds=300,
+                )
+
+            self.assertEqual(record.worker_count, 4)
+            self.assertEqual(record.batch_size, 16)
+            self.assertEqual(record.worker_pids, [111, 222, 333, 444])
+            payload = json.loads(
+                (Path(temp_dir) / ".agentos/crawl_worker.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(payload["worker_count"], 4)
+            self.assertEqual(payload["batch_size"], 16)
+            self.assertIn("16", popen.call_args.args[0])
+
     def test_crawl_worker_manager_start_records_broker_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
@@ -346,6 +384,65 @@ class ProductTests(unittest.TestCase):
             task_xml = service.task_xml_path.read_text(encoding="utf-16")
             self.assertIn("crawl-worker supervise", task_xml)
             self.assertIn(str(queue_db), task_xml)
+            self.assertEqual(schtasks.call_count, 2)
+            self.assertIn("/Create", schtasks.call_args_list[0].args[0])
+            self.assertIn("/Run", schtasks.call_args_list[1].args[0])
+
+    def test_crawl_worker_service_start_applies_runtime_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_db = Path(temp_dir) / ".agentos/research_state.sqlite3"
+            service = CrawlWorkerServiceManager(temp_dir, python_executable="python")
+            schtasks_result = subprocess.CompletedProcess(
+                args=["schtasks"],
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            )
+            running = CrawlWorkerRecord(
+                status="running",
+                worker_pids=[111, 222, 333, 444],
+                worker_count=4,
+                queue_db_path=str(queue_db),
+                log_paths=[
+                    str(Path(temp_dir) / ".agentos/logs/crawl-worker-1.log"),
+                    str(Path(temp_dir) / ".agentos/logs/crawl-worker-2.log"),
+                    str(Path(temp_dir) / ".agentos/logs/crawl-worker-3.log"),
+                    str(Path(temp_dir) / ".agentos/logs/crawl-worker-4.log"),
+                ],
+                batch_size=16,
+                detail="ok",
+            )
+
+            with (
+                patch.object(service, "_is_supported", return_value=True),
+                patch.object(service, "_task_exists", return_value=True),
+                patch.object(
+                    service,
+                    "_run_schtasks",
+                    return_value=schtasks_result,
+                ) as schtasks,
+                patch(
+                    "agentos_orchestrator.product.crawl_worker.CrawlWorkerManager.status",
+                    return_value=running,
+                ),
+            ):
+                record = service.start(
+                    task_name="AgentOS Test Crawl",
+                    worker_count=12,
+                    poll_interval_seconds=7.0,
+                    batch_size=40,
+                    claim_ttl_seconds=300,
+                )
+
+            self.assertEqual(record.status, "running")
+            payload = json.loads(service.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["worker_count"], 4)
+            self.assertEqual(payload["batch_size"], 16)
+            self.assertEqual(payload["poll_interval_seconds"], 7.0)
+            self.assertEqual(payload["claim_ttl_seconds"], 300)
+            task_xml = service.task_xml_path.read_text(encoding="utf-16")
+            self.assertIn("--workers", task_xml)
+            self.assertIn("16", task_xml)
             self.assertEqual(schtasks.call_count, 2)
             self.assertIn("/Create", schtasks.call_args_list[0].args[0])
             self.assertIn("/Run", schtasks.call_args_list[1].args[0])

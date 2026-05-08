@@ -22,11 +22,22 @@ import {
     ShieldAlert,
     TerminalSquare
 } from 'lucide-react';
+import {
+    dashboardEventSocketUrl,
+    establishDashboardSession,
+    fetchDashboardJson,
+    resolveBootstrapToken,
+    setApiBase,
+    type DashboardSession
+} from './api';
+import {
+    desktopBootstrap,
+    desktopDaemonControl,
+    desktopDaemonStatus,
+    isDesktopShell,
+    type DaemonRecord
+} from './desktop';
 import './styles.css';
-
-const API_BASE =
-    import.meta.env.VITE_AGENTOS_API_BASE || 'http://127.0.0.1:8000';
-const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
 type JsonMap = Record<string, unknown>;
 type View = 'research' | 'pc' | 'approvals' | 'runs' | 'events' | 'channels' | 'live-fire' | 'system';
@@ -59,16 +70,6 @@ type SystemStatus = {
     jobs: RunJob[];
     pc_backends: BackendStatus[];
     daemon?: DaemonRecord;
-};
-
-type DaemonRecord = {
-    status: string;
-    launcher_pid: number | null;
-    api_url: string;
-    ui_url: string;
-    log_path: string;
-    started_at?: string | null;
-    detail: string;
 };
 
 type SetupCheck = {
@@ -158,6 +159,33 @@ type ResearchArtifacts = {
         score?: number;
     }>;
     artifacts: string[];
+};
+
+type RunProgress = {
+    run_id?: string;
+    depth?: string;
+    stage?: string;
+    pass_index?: number;
+    max_passes?: number;
+    query_index?: number;
+    query_total?: number;
+    active_query?: string;
+    recent_queries?: string[];
+    elapsed_seconds?: number;
+    sources_found?: number;
+    stop_reason?: string | null;
+    last_updated?: string;
+    cycle?: number;
+    max_cycles?: number;
+    worker_count?: number;
+    frontier_batch_size?: number;
+    frontier_url_count?: number;
+    direct_urls?: number;
+    judged_results?: number;
+    discovered_domains?: number;
+    novelty_rate?: number;
+    domain_count?: number;
+    passes?: JsonMap[];
 };
 
 type PcActionResponse = {
@@ -251,15 +279,6 @@ type ShadowTrainingSummary = {
     source_paths?: string[];
 };
 
-async function fetchJson<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(`${API_BASE}${path}`, options);
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text || response.statusText);
-    }
-    return (await response.json()) as T;
-}
-
 function selectorFor(node: UiNode): string {
     if (node.metadata.automation_id) {
         return `automation_id=${node.metadata.automation_id}`;
@@ -281,7 +300,62 @@ function approvalAction(approval: Approval) {
     };
 }
 
+function runProgressSummary(progress: RunProgress | null): string {
+    if (!progress) {
+        return '';
+    }
+    const stage = String(progress.stage || '');
+    if (stage.startsWith('pc-research')) {
+        const cycle = progress.cycle ?? progress.pass_index ?? 0;
+        const maxCycles = progress.max_cycles ?? progress.max_passes;
+        const cycleText = maxCycles ? `${cycle}/${maxCycles}` : String(cycle);
+        return `Cycle ${cycleText} · ${progress.discovered_domains ?? 0} domains · ${progress.direct_urls ?? 0} reads`;
+    }
+    if (stage.startsWith('retrieval')) {
+        const pass = progress.pass_index ?? 0;
+        const maxPasses = progress.max_passes;
+        const passText = maxPasses ? `${pass}/${maxPasses}` : String(pass);
+        const queryText = progress.query_total
+            ? ` · query ${progress.query_index ?? 0}/${progress.query_total}`
+            : '';
+        const sourceText = typeof progress.sources_found === 'number'
+            ? ` · ${progress.sources_found} sources`
+            : '';
+        return `Pass ${passText}${queryText}${sourceText}`;
+    }
+    if (typeof progress.elapsed_seconds === 'number') {
+        return `${Math.round(progress.elapsed_seconds)}s elapsed`;
+    }
+    return stage || 'Progress available';
+}
+
+function runProgressQuery(progress: RunProgress | null): string {
+    if (!progress) {
+        return '';
+    }
+    if (progress.active_query) {
+        return progress.active_query;
+    }
+    const recent = Array.isArray(progress.recent_queries)
+        ? progress.recent_queries.find((query) => Boolean(query))
+        : '';
+    return recent || '';
+}
+
 function App() {
+    const desktopShell = isDesktopShell();
+    const [bootstrapToken, setBootstrapToken] = useState(() =>
+        desktopShell ? '' : resolveBootstrapToken()
+    );
+    const [desktopIpcToken, setDesktopIpcToken] = useState('');
+    const [session, setSession] = useState<DashboardSession | null>(null);
+    const [authStatus, setAuthStatus] = useState(
+        desktopShell
+            ? 'connecting to local desktop bridge'
+            : bootstrapToken
+                ? 'authenticating'
+                : 'bootstrap token required'
+    );
     const [view, setView] = useState<View>('research');
     const [events, setEvents] = useState<EventPayload[]>([]);
     const [approvals, setApprovals] = useState<Approval[]>([]);
@@ -305,7 +379,9 @@ function App() {
     const [pcDebug, setPcDebug] = useState<SelectorDebugReport | null>(null);
     const [pcReceipts, setPcReceipts] = useState<JsonMap[]>([]);
     const [selectedRun, setSelectedRun] = useState<ResearchArtifacts | null>(null);
+    const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
     const [runCheckpoint, setRunCheckpoint] = useState<JsonMap | null>(null);
+    const [runProgress, setRunProgress] = useState<Record<string, RunProgress>>({});
     const [policyActionType, setPolicyActionType] = useState('os.snapshot');
     const [policyTarget, setPolicyTarget] = useState('windows-uia://snapshot');
     const [policyDecision, setPolicyDecision] = useState<JsonMap | null>(null);
@@ -326,8 +402,96 @@ function App() {
         (backend) => backend.name === pcBackend
     )?.available;
 
+    async function establishSession(token: string) {
+        const trimmed = token.trim();
+        if (!trimmed) {
+            setSession(null);
+            setAuthStatus('bootstrap token required');
+            return;
+        }
+        setAuthStatus('authenticating');
+        try {
+            const nextSession = await establishDashboardSession(trimmed);
+            setSession(nextSession);
+            setBootstrapToken(trimmed);
+            setAuthStatus('authenticated');
+            setError('');
+        } catch (caught) {
+            setSession(null);
+            setAuthStatus('authentication failed');
+            setError(caught instanceof Error ? caught.message : String(caught));
+        }
+    }
+
+    async function establishDesktopBridgeSession() {
+        setAuthStatus('connecting to local desktop bridge');
+        try {
+            const bridge = await desktopBootstrap();
+            setApiBase(bridge.api_base);
+            setDesktopIpcToken(bridge.ipc_token);
+            setDaemon(bridge.daemon);
+            setSession(bridge.session);
+            setAuthStatus('authenticated');
+            setError('');
+        } catch (caught) {
+            setSession(null);
+            setAuthStatus('desktop bridge unavailable');
+            setError(caught instanceof Error ? caught.message : String(caught));
+        }
+    }
+
+    async function fetchJson<T>(path: string, options?: RequestInit): Promise<T> {
+        if (!session) {
+            throw new Error('Dashboard session is not established');
+        }
+        const method = (options?.method || 'GET').toUpperCase();
+        return fetchDashboardJson<T>(
+            path,
+            session,
+            options,
+            method !== 'GET' && method !== 'HEAD'
+        );
+    }
+
+    async function loadRunProgress(runId: string): Promise<RunProgress | null> {
+        if (!runId) {
+            return null;
+        }
+        try {
+            return await fetchJson<RunProgress>(`/runs/${runId}/progress`);
+        } catch {
+            return null;
+        }
+    }
+
+    function rememberRunProgress(runId: string, progress: RunProgress | null) {
+        setRunProgress((current) => {
+            const next = { ...current };
+            if (progress) {
+                next[runId] = progress;
+            } else {
+                delete next[runId];
+            }
+            return next;
+        });
+    }
+
     useEffect(() => {
-        const socket = new WebSocket(`${WS_BASE}/ws/events`);
+        if (desktopShell) {
+            void establishDesktopBridgeSession();
+            return;
+        }
+        if (!bootstrapToken.trim()) {
+            return;
+        }
+        void establishSession(bootstrapToken);
+    }, []);
+
+    useEffect(() => {
+        if (!session) {
+            return;
+        }
+        const socket = new WebSocket(dashboardEventSocketUrl(session));
         socket.onopen = () => setStreamStatus('streaming');
         socket.onclose = () => setStreamStatus('disconnected');
         socket.onerror = () => setStreamStatus('error');
@@ -343,13 +507,16 @@ function App() {
             }
         };
         return () => socket.close();
-    }, []);
+    }, [session]);
 
     useEffect(() => {
+        if (!session) {
+            return;
+        }
         void refreshAll();
         const timer = window.setInterval(() => void refreshAll(), 5000);
         return () => window.clearInterval(timer);
-    }, []);
+    }, [session]);
 
     useEffect(() => {
         if (!activeJobId) {
@@ -391,7 +558,9 @@ function App() {
                     fetchJson<RunRecord[]>('/runs'),
                     fetchJson<RunJob[]>('/jobs'),
                     fetchJson<ProductStatus>('/setup/checks'),
-                    fetchJson<DaemonRecord>('/daemon/status'),
+                    desktopShell && desktopIpcToken
+                        ? desktopDaemonStatus(desktopIpcToken)
+                        : fetchJson<DaemonRecord>('/daemon/status'),
                     fetchJson<WorkflowCommand[]>('/commands'),
                     fetchJson<ChannelDelivery[]>('/channels/deliveries'),
                     fetchJson<JsonMap[]>('/pc/receipts'),
@@ -407,6 +576,31 @@ function App() {
             setDeliveries(deliveriesPayload);
             setPcReceipts(receiptsPayload);
             setGoldenTraces(tracesPayload);
+            const progressRunIds = Array.from(
+                new Set(
+                    [
+                        ...jobsPayload
+                            .filter(
+                                (job) =>
+                                    Boolean(job.run_id)
+                                    && job.status !== 'completed'
+                                    && job.status !== 'failed'
+                            )
+                            .map((job) => job.run_id as string),
+                        ...(selectedRunId ? [selectedRunId] : [])
+                    ]
+                )
+            );
+            const progressEntries = await Promise.all(
+                progressRunIds.map(async (runId) => [runId, await loadRunProgress(runId)] as const)
+            );
+            const nextProgress: Record<string, RunProgress> = {};
+            for (const [runId, progress] of progressEntries) {
+                if (progress) {
+                    nextProgress[runId] = progress;
+                }
+            }
+            setRunProgress(nextProgress);
             setError('');
         } catch (caught) {
             setError(caught instanceof Error ? caught.message : String(caught));
@@ -489,6 +683,22 @@ function App() {
     }
 
     async function controlDaemon(action: 'start' | 'stop' | 'restart') {
+        if (desktopShell) {
+            if (!desktopIpcToken) {
+                throw new Error('Desktop bridge IPC token is not established');
+            }
+            const payload = await desktopDaemonControl(action, desktopIpcToken);
+            setDaemon(payload);
+            if (action === 'stop') {
+                setSession(null);
+                setStreamStatus('disconnected');
+                setAuthStatus('desktop backend stopped');
+                setError('');
+                return;
+            }
+            await establishDesktopBridgeSession();
+            return;
+        }
         const payload = await fetchJson<DaemonRecord>(`/daemon/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -593,16 +803,24 @@ function App() {
     }
 
     async function openRun(runId: string) {
-        const payload = await fetchJson<ResearchArtifacts>(
-            `/runs/${runId}/research`
-        );
+        const [payload, progress] = await Promise.all([
+            fetchJson<ResearchArtifacts>(`/runs/${runId}/research`),
+            loadRunProgress(runId)
+        ]);
+        setSelectedRunId(runId);
+        rememberRunProgress(runId, progress);
         setSelectedRun(payload);
         setRunCheckpoint(null);
         setView('runs');
     }
 
     async function inspectRun(runId: string) {
-        const payload = await fetchJson<JsonMap>(`/runs/${runId}`);
+        const [payload, progress] = await Promise.all([
+            fetchJson<JsonMap>(`/runs/${runId}`),
+            loadRunProgress(runId)
+        ]);
+        setSelectedRunId(runId);
+        rememberRunProgress(runId, progress);
         setRunCheckpoint(payload);
         setSelectedRun(null);
         setView('runs');
@@ -612,6 +830,9 @@ function App() {
         const payload = await fetchJson<JsonMap>(`/runs/${runId}/recover`, {
             method: 'POST'
         });
+        const progress = await loadRunProgress(runId);
+        setSelectedRunId(runId);
+        rememberRunProgress(runId, progress);
         setRunCheckpoint(payload);
         await refreshAll();
     }
@@ -642,6 +863,67 @@ function App() {
         });
         setChannelResponse(payload);
         await refreshAll();
+    }
+
+    if (!session) {
+        return (
+            <main className="app-shell">
+                <header>
+                    <div>
+                        <h1>AgentOS Control</h1>
+                        <p>{authStatus}</p>
+                    </div>
+                </header>
+
+                {error && <p className="notice">{error}</p>}
+
+                <section className="panel full">
+                    <h2><ShieldAlert size={18} /> Local Session</h2>
+                    {desktopShell ? (
+                        <div className="stack">
+                            <button
+                                title="Connect the local desktop bridge"
+                                onClick={() => void establishDesktopBridgeSession()}
+                            >
+                                <ShieldAlert size={16} />
+                                {daemon?.status === 'stopped' ? ' Start Local Backend' : ' Connect Desktop Bridge'}
+                            </button>
+                            <p className="muted">
+                                The desktop shell owns the loopback API process and exchanges the bootstrap token natively.
+                            </p>
+                            {daemon && (
+                                <p className="muted">
+                                    {daemon.status} · {daemon.detail}
+                                </p>
+                            )}
+                        </div>
+                    ) : (
+                        <form
+                            className="stack"
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                void establishSession(bootstrapToken);
+                            }}
+                        >
+                            <input
+                                aria-label="Bootstrap token"
+                                value={bootstrapToken}
+                                onChange={(event) => setBootstrapToken(event.target.value)}
+                                placeholder="Paste the local bootstrap token"
+                            />
+                            <button title="Establish local session">
+                                <ShieldAlert size={16} /> Connect
+                            </button>
+                        </form>
+                    )}
+                    {!desktopShell && (
+                        <p className="muted">
+                            Launch the dashboard through AgentOS so the UI receives a local bootstrap token automatically.
+                        </p>
+                    )}
+                </section>
+            </main>
+        );
     }
 
     return (
@@ -719,11 +1001,16 @@ function App() {
                     <div className="panel">
                         <h2><ClipboardList size={18} /> Background Jobs</h2>
                         {jobs.length === 0 && <p className="muted">No background jobs yet</p>}
-                        {jobs.map((job) => (
+                        {jobs.map((job) => {
+                            const progress = job.run_id ? runProgress[job.run_id] || null : null;
+                            const activeQuery = runProgressQuery(progress);
+                            return (
                             <article className="row" key={job.job_id}>
                                 <div>
                                     <strong>{job.status}</strong>
                                     <p>{job.objective}</p>
+                                    {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
+                                    {activeQuery && <p className="muted">{activeQuery}</p>}
                                     {job.error && <p className="danger">{job.error}</p>}
                                 </div>
                                 {job.run_id && job.status === 'completed' && (
@@ -732,7 +1019,8 @@ function App() {
                                     </button>
                                 )}
                             </article>
-                        ))}
+                            );
+                        })}
                     </div>
                 </section>
             )}
@@ -854,11 +1142,16 @@ function App() {
                     <div className="panel">
                         <h2><History size={18} /> Run History</h2>
                         {runs.length === 0 && <p className="muted">No runs yet</p>}
-                        {runs.map((run) => (
+                        {runs.map((run) => {
+                            const progress = runProgress[run.run_id] || null;
+                            const activeQuery = runProgressQuery(progress);
+                            return (
                             <article className="row" key={run.run_id}>
                                 <div>
                                     <strong>{run.status}</strong>
                                     <p>{run.objective}</p>
+                                    {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
+                                    {activeQuery && <p className="muted">{activeQuery}</p>}
                                     <span>{run.run_id}</span>
                                 </div>
                                 <div className="actions">
@@ -875,11 +1168,25 @@ function App() {
                                     )}
                                 </div>
                             </article>
-                        ))}
+                            );
+                        })}
                     </div>
                     <div className="panel research-detail">
                         <h2><FileText size={18} /> Research Artifacts</h2>
                         {!selectedRun && !runCheckpoint && <p className="muted">Select a run</p>}
+                        {selectedRunId && runProgress[selectedRunId] && (
+                            <div className="debug-box">
+                                <h3>Live Progress</h3>
+                                <p>{runProgress[selectedRunId].stage || 'progress'}</p>
+                                <p className="muted">{runProgressSummary(runProgress[selectedRunId])}</p>
+                                {runProgressQuery(runProgress[selectedRunId]) && (
+                                    <p className="muted">{runProgressQuery(runProgress[selectedRunId])}</p>
+                                )}
+                                {runProgress[selectedRunId].last_updated && (
+                                    <span>{runProgress[selectedRunId].last_updated}</span>
+                                )}
+                            </div>
+                        )}
                         {selectedRun && (
                             <>
                                 <div className="artifact-list">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -79,11 +80,15 @@ def resolve_agent_body_invocation(
     agent_body_bin = str(metadata.get("agent_body_bin") or "").strip()
     if agent_body_bin:
         return [agent_body_bin]
+    agent_body_manifest = str(metadata.get("agent_body_manifest") or "").strip()
+    # The Rust crate is an experimental state proxy, not a native OS backend.
+    # Do not auto-discover and run it just because the repo happens to contain
+    # a Cargo manifest. Using it must be an explicit choice via metadata or env.
+    if not agent_body_manifest and os.environ.get("AGENTOS_ENABLE_AGENT_BODY", "") != "1":
+        return []
     manifest = Path(
-        str(
-            metadata.get("agent_body_manifest")
-            or (Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
-        )
+        agent_body_manifest
+        or str(Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
     )
     if not manifest.exists() or shutil.which("cargo") is None:
         return []

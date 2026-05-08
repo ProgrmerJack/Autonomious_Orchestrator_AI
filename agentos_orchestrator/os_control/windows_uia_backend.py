@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import platform
 import shutil
@@ -60,6 +61,16 @@ class WindowsUiaBackend:
             )
         return nodes
 
+    def capture(self) -> bytes:
+        self._ensure_available()
+        payload = self._run_text(self._capture_script())
+        if not payload:
+            return b""
+        try:
+            return base64.b64decode(payload)
+        except (ValueError, binascii.Error) as exc:
+            raise BackendUnavailable("Windows screenshot payload was invalid") from exc
+
     def perform(self, action: UiAction) -> str:
         self._ensure_available()
         payload = self._run_json(
@@ -72,6 +83,12 @@ class WindowsUiaBackend:
         return json.dumps(payload, sort_keys=True)
 
     def _run_json(self, script: str) -> dict:
+        output = self._run_text(script)
+        if not output:
+            return {}
+        return json.loads(output)
+
+    def _run_text(self, script: str) -> str:
         if self.powershell_path is None:
             raise BackendUnavailable("PowerShell is not available")
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
@@ -91,10 +108,38 @@ class WindowsUiaBackend:
         )
         if result.returncode != 0:
             raise BackendUnavailable(result.stderr.strip() or result.stdout)
-        output = result.stdout.strip()
-        if not output:
-            return {}
-        return json.loads(output)
+        return result.stdout.strip()
+
+    def _capture_script(self) -> str:
+        return """
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$Bitmap = New-Object System.Drawing.Bitmap $Bounds.Width, $Bounds.Height
+$Graphics = [System.Drawing.Graphics]::FromImage($Bitmap)
+try {
+  $Graphics.CopyFromScreen(
+    $Bounds.Left,
+    $Bounds.Top,
+    0,
+    0,
+    $Bitmap.Size,
+    [System.Drawing.CopyPixelOperation]::SourceCopy
+  )
+  $Stream = New-Object System.IO.MemoryStream
+  try {
+    $Bitmap.Save($Stream, [System.Drawing.Imaging.ImageFormat]::Png)
+    [Convert]::ToBase64String($Stream.ToArray())
+  } finally {
+    $Stream.Dispose()
+  }
+} finally {
+  $Graphics.Dispose()
+  $Bitmap.Dispose()
+}
+"""
 
     def _snapshot_script(self) -> str:
         return f"""

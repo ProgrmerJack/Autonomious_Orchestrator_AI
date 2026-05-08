@@ -443,6 +443,22 @@ def _receipt_success(receipt: str, receipt_info: dict[str, Any]) -> bool:
         "typed",
         "invoked",
         "hotkey-sent",
+        "value-set",
+        "file-op-executed",
+        "clipboard-updated",
+        "process-executed",
+        "window-switched",
+        "window-updated",
+        "tab-selected",
+        "modal-closed",
+        "modal-opened",
+        "panel-opened",
+        "panel-closed",
+        "context-menu-opened",
+        "context-menu-closed",
+        "menu-item-selected",
+        "form-field-filled",
+        "form-submitted",
     }:
         return True
     return any(token in str(receipt).lower() for token in ("ok", "success", "executed"))

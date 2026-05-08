@@ -121,7 +121,7 @@ def execute_via_agent_body(
             command=command,
             stdout=(
                 f"Prepared sandbox '{spec.image}' without host execution. "
-                "Rust agent_body was not available."
+                "Experimental Rust agent_body was not enabled or available."
             ),
             stderr="",
             exit_code=0,

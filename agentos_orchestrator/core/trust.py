@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .sandbox_security import assess_sandbox_action
 from .types import ActionRequest, utc_now
 
 
@@ -95,6 +96,7 @@ class TrustMonitor:
         reasons: list[str] = []
         candidate = f"{action.target} {action.payload}".lower()
         action_type = action.action_type.lower()
+        sandbox_assessment = assess_sandbox_action(action)
 
         if action_type in {"host.admin", "system.registry.write"}:
             score += 10
@@ -102,17 +104,24 @@ class TrustMonitor:
         if action_type == "os.act":
             sandbox_target = str(action.target or "").lower()
             if sandbox_target.startswith("sandbox://"):
-                reasons.append("os.act confined to sandbox isolation — no trust impact")
+                if sandbox_assessment.hardened:
+                    reasons.append(
+                        "sandbox os.act backed by explicit isolation, egress, and secret stripping controls"
+                    )
+                else:
+                    score += 2
+                    reasons.extend(sandbox_assessment.reasons)
             else:
                 score += 3
                 reasons.append("high-impact execution action requested")
         elif action_type == "sandbox.exec":
-            sandbox_target = str(action.target or "").lower()
-            if sandbox_target.startswith("sandbox://"):
-                reasons.append("sandbox-confined execution action")
+            if sandbox_assessment.hardened:
+                reasons.append(
+                    "sandbox execution is backed by explicit isolation, egress, and secret stripping controls"
+                )
             else:
                 score += 2
-                reasons.append("non-confined sandbox execution target")
+                reasons.extend(sandbox_assessment.reasons)
         if self._looks_sensitive(candidate):
             score += 6
             reasons.append("target resembles a sensitive local resource")

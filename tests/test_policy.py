@@ -7,6 +7,7 @@ from pathlib import Path
 from agentos_orchestrator.core.approvals import ApprovalStore
 from agentos_orchestrator.core.authorization import AuthorizationMiddleware
 from agentos_orchestrator.core.policy import PermissionPolicy
+from agentos_orchestrator.core.sandbox_security import assess_sandbox_action
 from agentos_orchestrator.core.trust import TrustMonitor
 from agentos_orchestrator.core.types import ActionRequest
 
@@ -92,7 +93,7 @@ class PermissionPolicyTests(unittest.TestCase):
                 rejected.reasons,
             )
 
-    def test_sandbox_exec_is_not_trust_escalated(self) -> None:
+    def test_sandbox_exec_without_hardening_evidence_is_trust_scored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.sqlite3"
             trust = TrustMonitor(db_path)
@@ -108,8 +109,83 @@ class PermissionPolicyTests(unittest.TestCase):
             )
 
             self.assertFalse(decision.requires_approval)
+            self.assertEqual(decision.score_delta, 2)
+            self.assertIn(
+                "sandbox request does not prove a real VM-backed isolation boundary",
+                decision.reasons,
+            )
+
+    def test_hardened_sandbox_exec_stays_low_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.sqlite3"
+            trust = TrustMonitor(db_path)
+
+            decision = trust.assess(
+                "run_sandbox_2",
+                ActionRequest(
+                    "agent",
+                    "sandbox.exec",
+                    "sandbox://firecracker/browser-research",
+                    payload={
+                        "sandbox_security": {
+                            "isolation_boundary": "firecracker",
+                            "egress_controlled": True,
+                            "secret_stripping": True,
+                            "network_allowlist": ["api.openalex.org"],
+                        }
+                    },
+                ),
+            )
+
+            self.assertFalse(decision.requires_approval)
             self.assertEqual(decision.score_delta, 0)
-            self.assertIn("sandbox-confined execution action", decision.reasons)
+            self.assertIn(
+                "sandbox execution is backed by explicit isolation, egress, and secret stripping controls",
+                decision.reasons,
+            )
+
+    def test_sandbox_target_obeys_policy_approval_rules(self) -> None:
+        policy = PermissionPolicy(
+            {
+                "default": "deny",
+                "allow": {"actions": ["sandbox.exec"], "paths": []},
+                "forbid": {"actions": [], "paths": []},
+                "require_approval": {"actions": ["sandbox.exec"]},
+            }
+        )
+
+        decision = policy.evaluate(
+            ActionRequest(
+                "agent",
+                "sandbox.exec",
+                "sandbox://virtual-desktop/browser-research",
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.requires_approval)
+
+    def test_sandbox_security_helper_requires_all_three_controls(self) -> None:
+        assessment = assess_sandbox_action(
+            ActionRequest(
+                "agent",
+                "sandbox.exec",
+                "sandbox://kata/research",
+                payload={
+                    "sandbox_security": {
+                        "isolation_boundary": "kata",
+                        "egress_controlled": True,
+                    }
+                },
+            )
+        )
+
+        self.assertTrue(assessment.applies)
+        self.assertFalse(assessment.hardened)
+        self.assertIn(
+            "sandbox request does not prove secret stripping before execution",
+            assessment.reasons,
+        )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from agentos_orchestrator.config import gemini_workflow_model
 from agentos_orchestrator.os_control.base import UiNode
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
@@ -33,7 +34,8 @@ class DesktopWorkflowReasoner:
     back to deterministic heuristics.
     """
 
-    _MODEL_NAME = "gemini-2.0-flash"
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or gemini_workflow_model()
 
     def next_decision(
         self,
@@ -144,7 +146,7 @@ class DesktopWorkflowReasoner:
         }
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._MODEL_NAME}:generateContent?key={urllib.parse.quote(api_key)}"
+            f"{self.model_name}:generateContent?key={urllib.parse.quote(api_key)}"
         )
         request = urllib.request.Request(
             url,

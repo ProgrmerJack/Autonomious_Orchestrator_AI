@@ -5,6 +5,7 @@ import asyncio
 import importlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -55,22 +56,34 @@ from .research.crawl_worker import CrawlWorkerLoopConfig, ResearchCrawlWorker
 
 
 def _configure_dashboard_event_loop_policy() -> None:
-    """Use a stable asyncio policy for dashboard serving on Windows.
+    """Configure the Windows event loop policy for dashboard serving.
 
-    The Proactor loop on recent Python/Windows combinations can emit
-    WinError 64 accept-loop failures under client disconnect churn.
-    Switching to the selector policy improves socket accept resilience
-    for local dashboard workloads.
+    Playwright requires the Proactor loop on Windows because its driver runs
+    in a subprocess. Default to the Proactor policy so dashboard-served
+    research can still use headless browser retrieval. Operators can opt back
+    into the selector workaround by setting
+    AGENTOS_DASHBOARD_EVENT_LOOP_POLICY=selector.
     """
     if os.name != "nt":
         return
-    selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
-    if selector_policy is None:
-        return
+    requested_policy = (
+        os.getenv("AGENTOS_DASHBOARD_EVENT_LOOP_POLICY", "")
+        .strip()
+        .lower()
+    )
     current_policy = asyncio.get_event_loop_policy()
-    if isinstance(current_policy, selector_policy):
+    if requested_policy == "selector":
+        if type(current_policy).__name__ == "WindowsSelectorEventLoopPolicy":
+            return
+        asyncio.set_event_loop_policy(
+            asyncio.WindowsSelectorEventLoopPolicy(),
+        )
         return
-    asyncio.set_event_loop_policy(selector_policy())
+    if type(current_policy).__name__ == "WindowsProactorEventLoopPolicy":
+        return
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsProactorEventLoopPolicy(),
+    )
 
 
 def add_runtime_options(
@@ -122,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[runtime_parent],
     )
     run_parser.add_argument("--objective", required=True)
+    run_parser.add_argument("--backend", default="")
 
     resume_parser = subparsers.add_parser(
         "resume",
@@ -129,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[runtime_parent],
     )
     resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument("--backend", default="")
 
     recover_parser = subparsers.add_parser(
         "recover",
@@ -136,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[runtime_parent],
     )
     recover_parser.add_argument("--run-id", required=True)
+    recover_parser.add_argument("--backend", default="")
 
     inspect_parser = subparsers.add_parser(
         "inspect-policy",
@@ -368,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_worker_broker_serve.add_argument("--host", default="127.0.0.1")
     crawl_worker_broker_serve.add_argument("--port", type=int, default=8787)
     crawl_worker_broker_serve.add_argument("--auth-token", default="")
-    crawl_worker_broker_serve.add_argument("--shards", type=int, default=4)
+    crawl_worker_broker_serve.add_argument("--shards", type=int, default=8)
     crawl_worker_service = crawl_worker_subparsers.add_parser(
         "service",
         help="Manage the OS service wrapper for crawl workers.",
@@ -681,10 +697,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(decision), indent=2))
         return 0 if decision.allowed else 2
 
+    backend = (
+        _pc_backend(args.backend, args.state)
+        if getattr(args, "backend", "")
+        else None
+    )
+
     orchestrator = ResearchOrchestrator.from_paths(
         policy_path=policy_path,
         state_path=args.state,
         memory_path=args.memory,
+        pc_backend=backend,
     )
 
     if args.command == "run":
@@ -1000,9 +1023,15 @@ def _launch_dashboard(args: argparse.Namespace) -> int:
         "--port",
         str(args.ui_port),
     ]
-    api_process = subprocess.Popen(api_command, cwd=workspace_root)
+    bootstrap_token = os.environ.get(
+        "AGENTOS_DASHBOARD_BOOTSTRAP_TOKEN"
+    ) or secrets.token_urlsafe(32)
+    api_env = os.environ.copy()
+    api_env["AGENTOS_DASHBOARD_BOOTSTRAP_TOKEN"] = bootstrap_token
+    api_process = subprocess.Popen(api_command, cwd=workspace_root, env=api_env)
     ui_env = os.environ.copy()
     ui_env["VITE_AGENTOS_API_BASE"] = f"http://{args.host}:{args.api_port}"
+    ui_env["VITE_AGENTOS_BOOTSTRAP_TOKEN"] = bootstrap_token
     ui_process = subprocess.Popen(
         ui_command,
         cwd=dashboard_dir,

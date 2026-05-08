@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+
+
+def generic_query_terms() -> set[str]:
+    return {
+        "about",
+        "across",
+        "after",
+        "also",
+        "all",
+        "analyst",
+        "analysis",
+        "analyze",
+        "and",
+        "available",
+        "best",
+        "brief",
+        "candidate",
+        "candidates",
+        "chief",
+        "companies",
+        "company",
+        "current",
+        "data",
+        "deep",
+        "deepest",
+        "direct",
+        "evidence",
+        "expert",
+        "for",
+        "from",
+        "gathering",
+        "general",
+        "highest",
+        "how",
+        "latest",
+        "live",
+        "major",
+        "month",
+        "months",
+        "more",
+        "near-term",
+        "need",
+        "next",
+        "now",
+        "opportunities",
+        "opportunity",
+        "over",
+        "potential",
+        "primary",
+        "proper",
+        "public",
+        "produce",
+        "report",
+        "reports",
+        "research",
+        "risk",
+        "risks",
+        "rigorous",
+        "review",
+        "scenario",
+        "scenarios",
+        "signal",
+        "signals",
+        "soar",
+        "source",
+        "sources",
+        "specialised",
+        "specialized",
+        "that",
+        "the",
+        "their",
+        "these",
+        "this",
+        "through",
+        "timeline",
+        "today",
+        "tool",
+        "tools",
+        "uncertainties",
+        "uncertainty",
+        "use",
+        "using",
+        "web",
+        "website",
+        "websites",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "year",
+        "years",
+        "find",
+        "have",
+        "has",
+        "had",
+    }
+
+
+def blocked_market_query_site_hosts() -> set[str]:
+    return {
+        "finance.yahoo.com",
+        "marketwatch.com",
+        "cnbc.com",
+        "news.google.com",
+        "arxiv.org",
+        "info.arxiv.org",
+        "static.arxiv.org",
+        "status.arxiv.org",
+        "iarxiv.org",
+        "doi.org",
+        "irs.gov",
+        "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "pmc.ncbi.nlm.nih.gov",
+    }
+
+
+def blocked_irrelevant_site_hosts(
+    reference_query: str,
+    *,
+    looks_like_market_query: Callable[[str], bool],
+    looks_like_software_agent_query: Callable[[str], bool],
+) -> set[str]:
+    blocked: set[str] = set()
+    if looks_like_market_query(reference_query):
+        blocked.update(blocked_market_query_site_hosts())
+    if not looks_like_software_agent_query(reference_query):
+        blocked.update(
+            {
+                "ai.google.dev",
+                "developers.google.com",
+                "platform.openai.com",
+                "docs.anthropic.com",
+                "docs.mistral.ai",
+                "docs.cohere.com",
+                "modelcontextprotocol.io",
+            }
+        )
+    return blocked
+
+
+def trim_query_variant_text(candidate: str, limit: int = 240) -> str:
+    text = re.sub(r"\s+", " ", str(candidate or "")).strip(" ,.;:-")
+    if not text or len(text) <= limit:
+        return text
+    clipped = text[:limit].rstrip(" ,.;:-")
+    if limit < len(text) and not text[limit].isspace():
+        last_space = clipped.rfind(" ")
+        if last_space >= max(0, limit - 48):
+            clipped = clipped[:last_space]
+    return clipped.strip(" ,.;:-")
+
+
+def has_query_scaffold_noise(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not lowered:
+        return False
+    contamination_markers = (
+        "so fix code also",
+        "jats title abstract jats",
+        "my knowledge this does",
+        "gemini flash class attempt",
+        "class attempt theme",
+        "veritone which ai stock",
+    )
+    if any(marker in lowered for marker in contamination_markers):
+        return True
+    if re.match(
+        r"^(this|our|the)\s+(synthesis|analysis|report|evaluation|study)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(synthesis|analysis|report|evaluation|study)\s+"
+        r"(evaluates|assesses|reviews|summarizes|explores)\b",
+        lowered,
+    ):
+        return True
+    truncated_suffixes = (
+        "find authorita",
+        "primary eviden",
+        "counterevidenc",
+        "independent ve",
+        "uncertainty an",
+        "comparative an",
+        "longitudinal d",
+    )
+    return any(lowered.endswith(fragment) for fragment in truncated_suffixes)
+
+
+def normalize_research_plan_query(
+    candidate: str,
+    reference_query: str,
+    *,
+    query_core_terms: Callable[[str], str],
+    looks_like_market_query: Callable[[str], bool],
+    looks_like_software_agent_query: Callable[[str], bool],
+    is_low_signal_query_variant: Callable[[str, str], bool],
+    is_noisy_query_variant: Callable[[str, str], bool],
+) -> str:
+    text = trim_query_variant_text(candidate)
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    meta_markers = (
+        "all available",
+        "analyst-grade",
+        "scientist-grade",
+        "ranked candidates",
+        "uncertainty bounds",
+        "current-web",
+        "browser-grounded",
+        "cross-checking",
+        "evidence for and against",
+        "catalyst quality",
+        "execution risk",
+        "valuation-sensitive",
+        "clear reasons for the ranking",
+        "do not use",
+    )
+    if len(text) > 120 or any(marker in lowered for marker in meta_markers):
+        distilled = query_core_terms(text)
+        if distilled:
+            text = distilled
+
+    blocked_site_hosts = blocked_irrelevant_site_hosts(
+        reference_query,
+        looks_like_market_query=looks_like_market_query,
+        looks_like_software_agent_query=looks_like_software_agent_query,
+    )
+    if blocked_site_hosts:
+        site_matches = re.findall(r"\bsite:([^\s]+)", text, flags=re.IGNORECASE)
+        for host in site_matches:
+            normalized_host = host.strip().lower().lstrip("www.")
+            if normalized_host in blocked_site_hosts:
+                return ""
+        normalized_site_text = lowered.replace(":", " ").replace(".", " ")
+        normalized_site_text = re.sub(r"\s+", " ", normalized_site_text)
+        if any(
+            f"site {host.replace('.', ' ')}" in normalized_site_text
+            for host in blocked_site_hosts
+        ):
+            return ""
+
+    text = trim_query_variant_text(text)
+    if not text:
+        return ""
+    if has_query_scaffold_noise(text):
+        return ""
+    if is_low_signal_query_variant(text, reference_query):
+        return ""
+    if is_noisy_query_variant(text, reference_query):
+        return ""
+    return trim_query_variant_text(text)

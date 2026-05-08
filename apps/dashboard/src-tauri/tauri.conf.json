@@ -12,6 +12,7 @@
     "app": {
         "windows": [
             {
+                "label": "main",
                 "title": "AgentOS Control",
                 "width": 1100,
                 "height": 760

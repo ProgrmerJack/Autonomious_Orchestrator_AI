@@ -55,6 +55,10 @@ class TaskSpec:
     objective: str
     declared_actions: list[ActionRequest]
     inputs: JsonObject = field(default_factory=dict)
+    depends_on: list[str] = field(default_factory=list)
+    max_attempts: int = 1
+    required_capabilities: list[str] = field(default_factory=list)
+    synthesis_contract: JsonObject = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -65,6 +69,9 @@ class WorkerResult:
     artifacts: list[str] = field(default_factory=list)
     evidence: list[JsonObject] = field(default_factory=list)
     confidence: float = 0.0
+    provenance_score: float = 0.0
+    attempt_count: int = 1
+    metadata: JsonObject = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -75,3 +82,4 @@ class RunReport:
     worker_results: list[WorkerResult]
     synthesis: str
     checkpoint_path: str
+    synthesis_contract: JsonObject = field(default_factory=dict)

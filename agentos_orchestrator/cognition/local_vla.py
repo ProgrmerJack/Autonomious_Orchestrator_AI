@@ -246,15 +246,7 @@ class LocalFastVLA:
         start = time.perf_counter()
         elements = self.detect_elements(screenshot_bytes)
         if not elements:
-            # Fallback: click center if nothing detected
-            elapsed = time.perf_counter() - start
-            return VLAActionSpace(
-                action_type="click",
-                x=320,
-                y=240,
-                text=None,
-                rationale=f"LocalVLA: no elements detected, fallback click center in {elapsed * 1000:.1f}ms",
-            )
+            return None
         # Score elements by relevance to objective
         scored = self._score_elements_for_objective(elements, objective, history)
         if not scored:

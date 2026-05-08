@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import urllib.parse
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from agentos_orchestrator.cognition.frontier_api import (
     FrontierDecision,
@@ -17,7 +20,8 @@ from agentos_orchestrator.core.agents import (
     WorkerAgent,
 )
 from agentos_orchestrator.core.orchestrator import ResearchOrchestrator
-from agentos_orchestrator.core.types import WorkerResult
+from agentos_orchestrator.core.policy import PermissionPolicy
+from agentos_orchestrator.core.types import TaskSpec, WorkerResult
 from agentos_orchestrator.os_control.base import UiNode
 from agentos_orchestrator.os_control.virtual_desktop_sandbox_backend import (
     VirtualDesktopSandboxBackend,
@@ -228,6 +232,56 @@ class OrchestratorTests(unittest.TestCase):
             1,
         )
 
+    def test_expansive_browser_budget_scales_for_multi_hour_current_web(self) -> None:
+        budget = WorkerAgent._browser_research_budget(
+            "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox",
+            "highest-potential stocks right now",
+            220,
+        )
+
+        self.assertEqual(budget["mode"], "expansive")
+        self.assertGreaterEqual(int(budget["max_queries"]), 48)
+        self.assertGreaterEqual(int(budget["max_direct_urls"]), 160)
+        self.assertGreaterEqual(int(budget["candidate_urls"]), 640)
+        self.assertGreaterEqual(int(budget["financial_results_per_query"]), 16)
+
+    def test_expansive_pc_browser_frontier_budget_is_bounded(self) -> None:
+        objective = (
+            "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox"
+        )
+        browser_plan = {
+            "enabled": True,
+            "search_queries": [f"query {index}" for index in range(12)],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend = VirtualDesktopSandboxBackend(Path(temp_dir) / "sandbox.json")
+
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_navigation_limit(
+                    objective,
+                    [f"https://example.com/{index}" for index in range(48)],
+                    browser_plan,
+                ),
+                24,
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_cycle_count(objective, browser_plan),
+                8,
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_parallel_browser_worker_count(
+                    objective,
+                    backend,
+                    [f"https://example.com/{index}" for index in range(48)],
+                ),
+                4,
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_batch_limit(objective, 64),
+                12,
+            )
+
     def test_current_web_multi_hour_sandbox_enables_pc_research(self) -> None:
         tasks = SupervisorAgent().plan(
             "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox"
@@ -366,30 +420,69 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(any("when the c" in url for url in decoded_urls))
         self.assertFalse(any("github.com/search" in url for url in urls))
 
-    def test_browser_search_queries_preserve_natural_objective_clauses(self) -> None:
+    def test_browser_search_queries_strip_instructional_prompt_fragments(
+        self,
+    ) -> None:
         objective = (
-            "[multi-hour] Research public stocks with the highest potential to soar as of now "
-            "using all available tools in sandbox. Produce the deepest possible analyst and scientist report "
-            "with live current-web evidence, explicit uncertainties, competing hypotheses, and critical ranking."
+            "[multi-hour] As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months. Use all available "
+            "general-purpose research means, including browser-grounded web research, sandboxed exploration, "
+            "current-web evidence, company filings, earnings material, product signals, independent sources, "
+            "and cross-checking. Do not use finance-specific hardcoded templates or domain-specific shortcuts. "
+            "Produce an analyst-grade and scientist-grade report with ranked candidates, the evidence for and "
+            "against each thesis, uncertainty bounds, catalyst quality, execution risk, valuation-sensitive "
+            "considerations, and clear reasons for the ranking."
         )
 
         queries = WorkerAgent._browser_search_queries(objective, [])
 
-        self.assertGreaterEqual(len(queries), 2)
+        self.assertGreaterEqual(len(queries), 1)
         self.assertTrue(
             any(
-                query.startswith(
-                    "Research public stocks with the highest potential to soar as of now"
-                )
+                "publicly traded companies" in query.lower()
+                and "upside potential" in query.lower()
                 for query in queries
             )
         )
-        self.assertTrue(
-            any(
-                "deepest possible analyst and scientist report" in query
-                for query in queries
-            )
+        self.assertFalse(
+            any("do not use finance-specific" in query.lower() for query in queries)
         )
+        self.assertFalse(any("analyst-grade" in query.lower() for query in queries))
+        self.assertFalse(
+            any("all available general-purpose research means" in query.lower() for query in queries)
+        )
+
+    def test_browser_search_queries_reject_frontier_page_text_fragments(
+        self,
+    ) -> None:
+        objective = (
+            "[multi-hour] As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months. Use all available "
+            "general-purpose research means, including browser-grounded web research, sandboxed exploration, "
+            "current-web evidence, company filings, earnings material, product signals, independent sources, "
+            "and cross-checking. Do not use finance-specific hardcoded templates or domain-specific shortcuts. "
+            "Produce an analyst-grade and scientist-grade report with ranked candidates, the evidence for and "
+            "against each thesis, uncertainty bounds, catalyst quality, execution risk, valuation-sensitive "
+            "considerations, and clear reasons for the ranking."
+        )
+
+        queries = WorkerAgent._browser_search_queries(
+            objective,
+            [
+                "https://html.duckduckgo.com/html/?q="
+                "bls+bureau+labor+statistics+release+calendar+subscribe+search+button+search+menu+search+button+search+release+calendar+subscribe+home"
+            ],
+            [
+                "report with , the evidence for",
+                "against each thesis",
+            ],
+        )
+
+        joined = " | ".join(query.lower() for query in queries)
+        self.assertTrue(any("upside potential" in query.lower() for query in queries))
+        self.assertNotIn("report with", joined)
+        self.assertNotIn("against each thesis", joined)
+        self.assertNotIn("release calendar subscribe", joined)
 
     def test_browser_search_queries_expand_for_current_web_frontier(self) -> None:
         urls = [
@@ -453,6 +546,154 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertIn("https://github.com", browser_plan["seed_urls"])
         self.assertIn("https://playwright.dev", browser_plan["seed_urls"])
+
+    def test_planning_browser_research_strips_instruction_fragments_for_market_prompt(
+        self,
+    ) -> None:
+        objective = (
+            "[multi-hour] As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months. Use all available "
+            "general-purpose research means, including browser-grounded web research, sandboxed exploration, "
+            "current-web evidence, company filings, earnings material, product signals, independent sources, "
+            "and cross-checking. Do not use finance-specific hardcoded templates or domain-specific shortcuts. "
+            "Produce an analyst-grade and scientist-grade report with ranked candidates, the evidence for and "
+            "against each thesis, uncertainty bounds, catalyst quality, execution risk, valuation-sensitive "
+            "considerations, and clear reasons for the ranking."
+        )
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker.research_engine._ai_research_strategy = lambda objective, query, depth: {
+            "reasoning_queries": [
+                "scientist-grade report with ranked candidates, the evidence for",
+                "against each thesis",
+                "publicly traded companies upside potential 12 24 months",
+            ],
+            "authoritative_domains": ["sec.gov", "reuters.com"],
+        }
+
+        browser_plan = worker._planning_browser_research(
+            objective,
+            WorkerAgent._heuristic_objective_analysis(objective),
+        )
+
+        queries = browser_plan["search_queries"]
+        self.assertTrue(
+            any(
+                "publicly traded companies" in query.lower()
+                and "upside potential" in query.lower()
+                for query in queries
+            )
+        )
+        self.assertFalse(any("scientist-grade" in query.lower() for query in queries))
+        self.assertFalse(any("against each thesis" in query.lower() for query in queries))
+        self.assertIn("https://sec.gov", browser_plan["seed_urls"])
+        self.assertIn("https://reuters.com", browser_plan["seed_urls"])
+
+    def test_ai_objective_analysis_requires_llm_by_default(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker.research_engine._load_env_from_dotenv = lambda: None
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "No LLM provider configured for AI planning",
+            ):
+                worker._ai_analyze_objective("Research current market risks")
+
+    def test_ai_objective_analysis_retries_invalid_json(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        responses = iter(
+            [
+                "not json at all",
+                '{"complexity_score": "bad"}',
+                json.dumps(
+                    {
+                        "complexity_score": 8,
+                        "profile": {
+                            "academic": False,
+                            "current": True,
+                            "comparison": True,
+                            "risk": True,
+                        },
+                        "min_source_count": 12,
+                        "min_provider_count": 3,
+                        "min_scholarly_sources": 1,
+                        "max_contradiction_risk": 0.35,
+                        "max_retrieval_passes": 9,
+                        "hypotheses": ["Catalyst quality and valuation will dominate."],
+                    }
+                ),
+            ]
+        )
+        worker.research_engine._call_ai_text = lambda _system, _user: next(responses)
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True):
+            analysis = worker._ai_analyze_objective(
+                "Research current market risks and compare alternatives"
+            )
+
+        self.assertEqual(analysis["complexity_score"], 8)
+        self.assertEqual(analysis["min_source_count"], 12)
+        self.assertEqual(
+            analysis["hypotheses"],
+            ["Catalyst quality and valuation will dominate."],
+        )
+
+    def test_build_deep_plan_blocks_empty_hypotheses_without_opt_in(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker._ai_analyze_objective = lambda _objective: {
+            "complexity_score": 6,
+            "profile": {},
+            "min_source_count": 8,
+            "min_provider_count": 2,
+            "min_scholarly_sources": 2,
+            "max_contradiction_risk": 0.75,
+            "max_retrieval_passes": 8,
+            "hypotheses": [],
+        }
+        task = TaskSpec(
+            task_id="task_plan",
+            role="planning",
+            objective="Design deep research plan for: compare live market risk signals",
+            declared_actions=[],
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "returned no hypotheses",
+            ):
+                worker._build_deep_plan("run_plan", task)
+
+    def test_frontier_session_seed_urls_interleave_domains_before_navigation(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        seed_urls = worker._frontier_session_seed_urls(
+            [
+                "https://finance.yahoo.com/quote/AAA",
+                "https://finance.yahoo.com/quote/BBB",
+                "https://finance.yahoo.com/quote/CCC",
+                "https://www.sec.gov/Archives/example-filing",
+                "https://www.reuters.com/markets/example-analysis",
+            ],
+            {
+                "seed_urls": [],
+                "search_queries": [
+                    "publicly traded companies upside potential over next 12 24 months"
+                ],
+            },
+            worker._empty_frontier_graph(),
+            market_query=True,
+        )
+
+        self.assertEqual(seed_urls[0], "https://www.sec.gov/Archives/example-filing")
+        self.assertIn("https://www.sec.gov/Archives/example-filing", seed_urls[:3])
+        self.assertIn(
+            "https://www.reuters.com/markets/example-analysis",
+            seed_urls[:3],
+        )
+        self.assertFalse(any("finance.yahoo.com" in url for url in seed_urls))
 
     def test_planning_browser_urls_preserve_seed_urls_and_queries(self) -> None:
         urls = WorkerAgent._planning_browser_urls(
@@ -544,6 +785,58 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(workspace.get("triggered"))
             self.assertTrue(post_nodes)
 
+    def test_live_pc_research_routes_as_os_act_and_bootstraps_browser(self) -> None:
+        class FakeLiveBackend:
+            name = "windows-uia"
+
+            def __init__(self) -> None:
+                self.launches: list[str] = []
+
+            def available(self) -> bool:
+                return True
+
+            def snapshot(self) -> list[UiNode]:
+                if self.launches:
+                    return [
+                        UiNode(
+                            node_id="browser-1",
+                            role="Window",
+                            name="Microsoft Edge",
+                        )
+                    ]
+                return [UiNode(node_id="desktop-1", role="Window", name="Desktop")]
+
+            def perform(self, action):
+                if action.action_type == "launch_app":
+                    self.launches.append(str(action.value or action.selector))
+                    return "launched"
+                raise RuntimeError(action.action_type)
+
+        backend = FakeLiveBackend()
+        worker = WorkerAgent(None, None, FakeResearchEngine(), pc_backend=backend)
+
+        selected_backend = worker._sandbox_pc_backend()
+        self.assertEqual(
+            worker._pc_research_action_surface(selected_backend),
+            ("os.act", "windows-uia://browser-research"),
+        )
+
+        workspace = worker._prepare_cross_surface_workspace(
+            selected_backend,
+            selected_backend.snapshot(),
+            "run_live_backend",
+        )
+        self.assertEqual(workspace.get("status"), "skipped")
+
+        nodes, report = worker._ensure_browser_surface(
+            selected_backend,
+            selected_backend.snapshot(),
+            "https://example.com/report",
+        )
+        self.assertEqual(report.get("status"), "launched")
+        self.assertEqual(report.get("launch_target"), "https://example.com/report")
+        self.assertTrue(worker._has_browser_surface(nodes))
+
     def test_run_pc_browser_actions_uses_frontier_selected_browser_nodes(
         self,
     ) -> None:
@@ -597,6 +890,40 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertGreaterEqual(len(frontier_client.calls), 3)
             self.assertTrue(post_nodes)
+
+    def test_run_pc_browser_actions_hydrates_virtual_browser_with_real_content(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend = VirtualDesktopSandboxBackend(Path(temp_dir) / "sandbox.json")
+            worker = WorkerAgent(None, None, FakeResearchEngine())
+
+            receipts, post_nodes, _, _, _ = worker._run_pc_browser_actions(
+                backend,
+                ["https://example.com/current-analysis"],
+                run_id="run_browser_hydrate",
+                navigation_limit=1,
+            )
+
+            hydrate_receipt = next(
+                receipt
+                for receipt in receipts
+                if receipt.get("step") == "hydrate-browser-content"
+            )
+            document_node = next(
+                node for node in post_nodes if node.node_id == "browser-main-doc"
+            )
+
+            self.assertEqual(hydrate_receipt["result"]["status"], "hydrated")
+            self.assertGreater(hydrate_receipt["result"]["content_chars"], 20)
+            self.assertEqual(
+                document_node.metadata.get("url"),
+                "https://example.com/current-analysis",
+            )
+            self.assertIn(
+                "Direct website evidence",
+                str(document_node.metadata.get("text") or ""),
+            )
 
     def test_browser_frontier_session_persists_graph_and_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -656,6 +983,95 @@ class OrchestratorTests(unittest.TestCase):
                 1,
             )
 
+    def test_filter_browser_findings_portals_prunes_yahoo_artifacts(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        findings = worker._filter_browser_findings_portals(
+            {
+                "candidate_urls": [
+                    "https://finance.yahoo.com/quote/AAPL",
+                    "https://www.sec.gov/Archives/edgar/data/320193/",
+                ],
+                "direct_urls": [
+                    "https://finance.yahoo.com/quote/AAPL",
+                    "https://www.sec.gov/Archives/edgar/data/320193/",
+                ],
+                "judged_results": [
+                    {
+                        "url": "https://finance.yahoo.com/quote/AAPL",
+                        "domain": "finance.yahoo.com",
+                    },
+                    {
+                        "url": "https://www.sec.gov/Archives/edgar/data/320193/",
+                        "domain": "sec.gov",
+                    },
+                ],
+                "discovered_domains": ["finance.yahoo.com", "sec.gov"],
+            },
+            market_query=True,
+        )
+
+        joined = " ".join(findings.get("candidate_urls") or [])
+        self.assertNotIn("finance.yahoo.com", joined)
+        self.assertEqual(
+            findings["direct_urls"],
+            ["https://www.sec.gov/Archives/edgar/data/320193/"],
+        )
+        self.assertEqual(
+            [item["domain"] for item in findings["judged_results"]],
+            ["sec.gov"],
+        )
+        self.assertEqual(findings["discovered_domains"], ["sec.gov"])
+
+    def test_sanitize_frontier_graph_prunes_persistent_portal_urls(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        graph = {
+            "version": 1,
+            "urls": {
+                "https://finance.yahoo.com/quote/AAPL": {
+                    "url": "https://finance.yahoo.com/quote/AAPL",
+                    "domain": "finance.yahoo.com",
+                    "priority": 0.9,
+                },
+                "https://www.sec.gov/Archives/edgar/data/320193/": {
+                    "url": "https://www.sec.gov/Archives/edgar/data/320193/",
+                    "domain": "sec.gov",
+                    "priority": 0.8,
+                },
+            },
+            "domains": {
+                "finance.yahoo.com": {
+                    "urls": ["https://finance.yahoo.com/quote/AAPL"],
+                    "observations": 2,
+                },
+                "sec.gov": {
+                    "urls": ["https://www.sec.gov/Archives/edgar/data/320193/"],
+                    "observations": 1,
+                },
+            },
+            "claims": {
+                "sample": {
+                    "claim": "sample claim",
+                    "sources": [
+                        "https://finance.yahoo.com/quote/AAPL",
+                        "https://www.sec.gov/Archives/edgar/data/320193/",
+                    ],
+                }
+            },
+        }
+
+        sanitized = worker._sanitize_frontier_graph(graph, market_query=True)
+
+        self.assertNotIn(
+            "https://finance.yahoo.com/quote/AAPL",
+            sanitized["urls"],
+        )
+        self.assertNotIn("finance.yahoo.com", sanitized["domains"])
+        self.assertEqual(
+            sanitized["claims"]["sample"]["sources"],
+            ["https://www.sec.gov/Archives/edgar/data/320193/"],
+        )
+
     def test_browser_checkpoint_contradictions_compound_in_frontier_graph(
         self,
     ) -> None:
@@ -684,6 +1100,48 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(summary["contradiction_count"], 1)
         self.assertIn("sec.gov", summary["top_domains"])
         self.assertIn("https://sec.gov/Archives/example-filings", seed_urls)
+
+    def test_frontier_graph_seed_urls_drop_market_portal_domains_for_market_runs(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        graph = worker._empty_frontier_graph()
+        graph["urls"] = {
+            "https://finance.yahoo.com/quote/AAA": {
+                "url": "https://finance.yahoo.com/quote/AAA",
+                "domain": "finance.yahoo.com",
+                "priority": 0.95,
+                "visits": 0,
+                "status": "candidate",
+            },
+            "https://www.sec.gov/Archives/example-filing": {
+                "url": "https://www.sec.gov/Archives/example-filing",
+                "domain": "sec.gov",
+                "priority": 0.8,
+                "visits": 0,
+                "status": "candidate",
+            },
+            "https://www.reuters.com/markets/example-analysis": {
+                "url": "https://www.reuters.com/markets/example-analysis",
+                "domain": "reuters.com",
+                "priority": 0.79,
+                "visits": 0,
+                "status": "candidate",
+            },
+        }
+
+        seed_urls = worker._frontier_graph_seed_urls(
+            graph,
+            limit=10,
+            market_query=True,
+        )
+
+        self.assertIn("https://www.sec.gov/Archives/example-filing", seed_urls)
+        self.assertIn(
+            "https://www.reuters.com/markets/example-analysis",
+            seed_urls,
+        )
+        self.assertFalse(any("finance.yahoo.com" in url for url in seed_urls))
 
     def test_supervisor_data_task_adapts_to_research_domain(self) -> None:
         tasks = SupervisorAgent().plan(
@@ -824,6 +1282,164 @@ class OrchestratorTests(unittest.TestCase):
             findings["judged_results"][0].get("quality_flags") or [],
         )
 
+    def test_browser_findings_recover_cross_domain_coverage_after_rank_collapse(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        def fake_search_results(
+            query: str,
+            limit: int | None = None,
+        ) -> list[ResearchSource]:
+            del query, limit
+            return [
+                ResearchSource(
+                    provider="web-search",
+                    title=f"Yahoo market page {index}",
+                    url=f"https://finance.yahoo.com/quote/TEST{index}",
+                    abstract="Portal quote page.",
+                    year=2026,
+                    score=95.0 - index,
+                )
+                for index in range(5)
+            ] + [
+                ResearchSource(
+                    provider="web-search",
+                    title="SEC filing",
+                    url="https://www.sec.gov/Archives/example-filing",
+                    abstract="Primary filing evidence.",
+                    year=2026,
+                    score=82.0,
+                ),
+                ResearchSource(
+                    provider="web-search",
+                    title="Reuters market analysis",
+                    url="https://www.reuters.com/markets/example-analysis",
+                    abstract="Independent reporting.",
+                    year=2026,
+                    score=81.0,
+                ),
+            ]
+
+        worker.research_engine._search_web_results = fake_search_results
+        worker.research_engine._search_financial_portals = lambda query, limit=10: []
+        worker.research_engine._search_sec_edgar = lambda query, limit=6: []
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: [
+            source for source in sources if "finance.yahoo.com" in source.url
+        ][:5]
+        worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
+        worker._deep_page_read = lambda url: f"signal from {url} " * 40
+        worker._content_block_quality = lambda content: {"quality_score": 0.8}
+        worker._browser_preview_is_blocked = lambda preview: False
+        worker._extract_page_evidence = lambda content, title, query: [
+            "cross-domain evidence"
+        ]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: (
+            "high signal"
+        )
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] Research public companies with current-web upside catalysts as of now",
+            [],
+        )
+
+        discovered_domains = set(findings["discovered_domains"])
+        self.assertFalse(
+            any("finance.yahoo.com" in url for url in findings["candidate_urls"])
+        )
+        self.assertNotIn("finance.yahoo.com", discovered_domains)
+        self.assertIn("sec.gov", discovered_domains)
+        self.assertIn("reuters.com", discovered_domains)
+
+    def test_browser_findings_use_preview_fallback_to_preserve_seed_domain_mix(
+        self,
+    ) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        worker.research_engine._search_web_results = lambda query, limit=None: []
+        worker.research_engine._search_financial_portals = lambda query, limit=10: []
+        worker.research_engine._search_sec_edgar = lambda query, limit=6: []
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: sources
+        worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
+        worker._deep_page_read = lambda url: "signal " * 200 if "sec.gov" in url else ""
+        worker._browser_page_preview = lambda url: {
+            "page_title": f"Preview for {url}",
+            "page_excerpt": "catalyst evidence valuation risk filing data " * 20,
+        }
+        worker._content_block_quality = lambda content: {"quality_score": 0.8}
+        worker._browser_preview_is_blocked = lambda preview: False
+        worker._extract_page_evidence = lambda content, title, query: [
+            "cross-domain evidence"
+        ]
+        worker._ai_page_judgment = lambda source, content, objective, core_query: (
+            "high signal"
+        )
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] Research public companies with current-web upside catalysts as of now",
+            [
+                "https://www.sec.gov/Archives/example-filing",
+                "https://www.reuters.com/markets/example-analysis",
+                "https://fred.stlouisfed.org/series/GDPC1",
+                "https://www.bls.gov/news.release/cpi.nr0.htm",
+            ],
+            {"search_queries": ["public companies upside catalysts"]},
+        )
+
+        discovered_domains = set(findings["discovered_domains"])
+        self.assertIn("sec.gov", discovered_domains)
+        self.assertIn("reuters.com", discovered_domains)
+        self.assertIn("fred.stlouisfed.org", discovered_domains)
+        self.assertTrue(
+            any(
+                "preview-only" in (item.get("quality_flags") or [])
+                for item in findings["judged_results"]
+                if item.get("domain") in {"reuters.com", "fred.stlouisfed.org"}
+            )
+        )
+
+    def test_active_pc_research_writes_dashboard_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                worker = WorkerAgent(None, None, FakeResearchEngine())
+                worker._run_pc_browser_frontier_session = lambda *args, **kwargs: (
+                    [],
+                    [],
+                    "virtual-desktop-sandbox",
+                    {"triggered": False, "reports": [], "navigated_urls": []},
+                    {"triggered": False},
+                    {
+                        "search_queries": ["current market upside"],
+                        "judged_results": [{"url": "https://example.com/report"}],
+                        "direct_urls": ["https://example.com/report"],
+                        "discovered_domains": ["example.com"],
+                        "worker_sessions": [{"cycle": 1}],
+                    },
+                )
+                task = TaskSpec(
+                    task_id="task_pc_progress",
+                    role="pc-research",
+                    objective="[multi-hour] Research current market opportunities as of now",
+                    declared_actions=[],
+                    inputs={"optional": True, "adaptive_effort": "multi-hour"},
+                )
+
+                worker._active_pc_research("run_pc_progress", task, [])
+
+                progress_path = root / "runs" / "run_pc_progress" / "research" / "progress.json"
+                payload = json.loads(progress_path.read_text(encoding="utf-8"))
+
+                self.assertEqual(payload["stage"], "pc-research-completed")
+                self.assertEqual(payload["direct_urls"], 1)
+                self.assertEqual(payload["discovered_domains"], 1)
+            finally:
+                os.chdir(previous_cwd)
+
     def test_terminal_verification_uses_terminal_selector_and_json_receipt(
         self,
     ) -> None:
@@ -892,7 +1508,49 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(findings["candidate_urls"]), 2)
         self.assertGreaterEqual(len(findings["direct_urls"]), 2)
-        self.assertEqual(findings["frontier"]["ranked_candidates"], 0)
+        self.assertIn("example.com", findings["discovered_domains"])
+        self.assertIn("example.org", findings["discovered_domains"])
+
+    def test_browser_findings_reject_js_shell_preview_fallback_pages(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+
+        worker.research_engine._search_web_results = lambda query, limit=None: [
+            ResearchSource(
+                provider="web-search",
+                title="Yahoo shell",
+                url="https://finance.yahoo.com/quote/TEST",
+                abstract="Script-heavy shell page.",
+                year=2026,
+                score=55.0,
+            ),
+            ResearchSource(
+                provider="web-search",
+                title="Yahoo shell two",
+                url="https://finance.yahoo.com/quote/TEST2",
+                abstract="Script-heavy shell page.",
+                year=2026,
+                score=54.0,
+            ),
+        ]
+        worker.research_engine._search_financial_portals = lambda query, limit=10: []
+        worker.research_engine._search_sec_edgar = lambda query, limit=6: []
+        worker.research_engine._dedupe_sources = lambda sources: sources
+        worker.research_engine._rank_sources = lambda sources, query: []
+        worker._ai_browser_source_strategy = lambda objective: {"targeted_queries": []}
+        worker._deep_page_read = lambda url: ""
+        worker._browser_page_preview = lambda url: {
+            "page_title": "Please enable JavaScript",
+            "page_excerpt": "window.__INITIAL_STATE__ function() const document.body;",
+        }
+
+        findings = worker._reasoned_browser_findings(
+            "[multi-hour] Research current market opportunities as of now",
+            [],
+        )
+
+        self.assertGreaterEqual(len(findings["candidate_urls"]), 2)
+        self.assertEqual(findings["direct_urls"], [])
+        self.assertEqual(findings["judged_results"], [])
 
     def test_verification_flags_research_quality_warnings(self) -> None:
         result = WorkerResult(
@@ -1169,6 +1827,234 @@ class OrchestratorTests(unittest.TestCase):
             self.assertGreaterEqual(targets["max_retrieval_passes"], 48)
             self.assertGreaterEqual(targets["min_depth_passes"], 12)
             self.assertEqual(targets["min_runtime_seconds"], 0)
+
+    def test_worker_tasks_respect_dependencies_parallelism_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            orchestrator = ResearchOrchestrator(
+                policy=PermissionPolicy(
+                    {
+                        "default": "allow",
+                        "allow": {
+                            "actions": [],
+                            "paths": [],
+                            "network_hosts": [],
+                        },
+                        "forbid": {"actions": [], "paths": []},
+                        "require_approval": {"actions": []},
+                    }
+                ),
+                state_path=Path(temp_dir) / "state.sqlite3",
+                memory_path=Path(temp_dir) / "memory.sqlite3",
+                max_parallel_workers=2,
+            )
+            orchestrator._authorize_task = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            orchestrator._enforce_evidence_gate = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+            barrier = threading.Barrier(2)
+            attempts: dict[str, int] = {}
+
+            def fake_run(
+                run_id: str,
+                task: TaskSpec,
+                prior_results: list[WorkerResult],
+            ) -> WorkerResult:
+                del run_id
+                attempts[task.task_id] = attempts.get(task.task_id, 0) + 1
+                if task.task_id in {"task_a", "task_b"}:
+                    try:
+                        barrier.wait(timeout=1)
+                    except threading.BrokenBarrierError as exc:
+                        raise AssertionError(
+                            "ready tasks did not execute in parallel"
+                        ) from exc
+                if task.task_id == "task_retry" and attempts[task.task_id] == 1:
+                    raise RuntimeError("transient failure")
+                if task.task_id == "task_c":
+                    self.assertEqual(
+                        {item.task_id for item in prior_results},
+                        {"task_a", "task_b", "task_retry"},
+                    )
+                return WorkerResult(
+                    task_id=task.task_id,
+                    role=task.role,
+                    summary=f"completed {task.task_id}",
+                    evidence=[{"source": task.role, "claim": "ok"}],
+                    confidence=0.8,
+                )
+
+            orchestrator.worker.run = fake_run  # type: ignore[method-assign]
+
+            tasks = [
+                TaskSpec(
+                    task_id="task_a",
+                    role="planning",
+                    objective="plan",
+                    declared_actions=[],
+                    required_capabilities=["planning"],
+                    synthesis_contract={"section": "plan", "required": True},
+                ),
+                TaskSpec(
+                    task_id="task_b",
+                    role="pc-control",
+                    objective="snapshot",
+                    declared_actions=[],
+                    required_capabilities=["pc-control"],
+                    synthesis_contract={"section": "desktop", "required": False},
+                ),
+                TaskSpec(
+                    task_id="task_retry",
+                    role="data",
+                    objective="constraints",
+                    declared_actions=[],
+                    max_attempts=2,
+                    required_capabilities=["data-extraction"],
+                    synthesis_contract={
+                        "section": "constraints",
+                        "required": True,
+                    },
+                ),
+                TaskSpec(
+                    task_id="task_c",
+                    role="synthesis",
+                    objective="brief",
+                    declared_actions=[],
+                    depends_on=["task_a", "task_b", "task_retry"],
+                    required_capabilities=["synthesis"],
+                    synthesis_contract={"section": "brief", "required": True},
+                ),
+            ]
+
+            orchestrator.runtime.save_manifest(
+                "run_sched",
+                "test scheduling objective",
+                [asdict(task) for task in tasks],
+            )
+
+            results = orchestrator._execute_worker_tasks("run_sched", tasks)
+
+            self.assertEqual(
+                [result.task_id for result in results],
+                ["task_a", "task_b", "task_retry", "task_c"],
+            )
+            self.assertEqual(attempts["task_retry"], 2)
+            retry_result = next(
+                result for result in results if result.task_id == "task_retry"
+            )
+            self.assertEqual(retry_result.attempt_count, 2)
+            self.assertGreater(retry_result.provenance_score, 0.0)
+            synthesis_result = next(
+                result for result in results if result.task_id == "task_c"
+            )
+            self.assertEqual(
+                synthesis_result.metadata["depends_on"],
+                ["task_a", "task_b", "task_retry"],
+            )
+
+    def test_optional_task_skips_when_required_capability_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            orchestrator = ResearchOrchestrator(
+                policy=PermissionPolicy(
+                    {
+                        "default": "allow",
+                        "allow": {
+                            "actions": [],
+                            "paths": [],
+                            "network_hosts": [],
+                        },
+                        "forbid": {"actions": [], "paths": []},
+                        "require_approval": {"actions": []},
+                    }
+                ),
+                state_path=Path(temp_dir) / "state.sqlite3",
+                memory_path=Path(temp_dir) / "memory.sqlite3",
+            )
+            orchestrator._authorize_task = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            orchestrator.worker.available_capabilities = lambda: {"planning"}  # type: ignore[method-assign]
+
+            results = orchestrator._execute_worker_tasks(
+                "run_caps",
+                [
+                    TaskSpec(
+                        task_id="task_optional",
+                        role="pc-research",
+                        objective="optional research",
+                        declared_actions=[],
+                        inputs={"optional": True},
+                        required_capabilities=["sandbox.exec"],
+                    )
+                ],
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertIn("Skipped optional pc-research step", results[0].summary)
+
+    def test_synthesis_contract_captures_sections_and_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            orchestrator = ResearchOrchestrator(
+                policy=PermissionPolicy(
+                    {
+                        "default": "allow",
+                        "allow": {
+                            "actions": [],
+                            "paths": [],
+                            "network_hosts": [],
+                        },
+                        "forbid": {"actions": [], "paths": []},
+                        "require_approval": {"actions": []},
+                    }
+                ),
+                state_path=Path(temp_dir) / "state.sqlite3",
+                memory_path=Path(temp_dir) / "memory.sqlite3",
+            )
+            results = [
+                WorkerResult(
+                    task_id="task_plan",
+                    role="planning",
+                    summary="planned",
+                    confidence=0.8,
+                    provenance_score=0.72,
+                    metadata={
+                        "synthesis_contract": {
+                            "section": "research_plan",
+                            "required": True,
+                        }
+                    },
+                ),
+                WorkerResult(
+                    task_id="task_lit",
+                    role="literature",
+                    summary="evidence",
+                    confidence=0.9,
+                    provenance_score=0.83,
+                    metadata={
+                        "synthesis_contract": {
+                            "section": "authoritative_evidence",
+                            "required": True,
+                        }
+                    },
+                ),
+            ]
+            verification = WorkerResult(
+                task_id="verification",
+                role="verification",
+                summary="verified",
+                confidence=0.88,
+                provenance_score=0.9,
+            )
+
+            contract = orchestrator._build_synthesis_contract(
+                "run_contract",
+                "test objective",
+                [*results, verification],
+                verification,
+            )
+
+            self.assertEqual(
+                contract["resolved_sections"],
+                ["research_plan", "authoritative_evidence"],
+            )
+            self.assertEqual(contract["missing_sections"], [])
+            self.assertGreater(contract["provenance"]["average"], 0.7)
 
 
 if __name__ == "__main__":

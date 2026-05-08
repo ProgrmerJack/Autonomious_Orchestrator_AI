@@ -12,6 +12,7 @@ from agentos_orchestrator.os_control import (
 )
 from agentos_orchestrator.os_control.workflow import (
     DesktopWorkflowService,
+    WorkflowVerificationError,
 )
 from agentos_orchestrator.product import CommandRegistry
 
@@ -217,7 +218,17 @@ class GatewayCommandRouter:
                 )
             )
         self.workflow_service.ensure_universal_mode(backend, max_steps=8)
-        result = self.workflow_service.execute(objective, backend)
+        try:
+            result = self.workflow_service.execute(objective, backend)
+        except WorkflowVerificationError as exc:
+            return ChannelResponse(
+                "error",
+                f"Desktop workflow stopped on verification failure: {exc}",
+                {
+                    "status": "verification_failed",
+                    "failure": exc.asdict(),
+                },
+            )
         if result.get("status") == "clarification_required":
             questions = result["plan"].get("clarification_questions") or []
             message = "Clarification required before desktop execution."

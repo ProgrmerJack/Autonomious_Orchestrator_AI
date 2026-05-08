@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -423,6 +424,61 @@ class NoisyEnrichmentResearchEngine(StableLowNoveltyEngine):
         ]
 
 
+class SlowMarginalYieldEngine(StableLowNoveltyEngine):
+    def _search_query_across_providers(
+        self,
+        search_query: str,
+        allowed_providers: set[str],
+        per_provider_limit: int,
+    ) -> list[ResearchSource]:
+        del allowed_providers, per_provider_limit
+        self.search_calls.append(search_query)
+        source_index = len(self.search_calls)
+        return [
+            ResearchSource(
+                provider="google-news-rss",
+                title=f"NVIDIA (NVDA) catalyst update {source_index}",
+                url=f"https://finance.example.com/nvda-catalyst-{source_index}",
+                year=2026,
+                abstract=(
+                    "NVIDIA catalyst update with one incremental earnings or "
+                    "valuation detail per pass."
+                ),
+                score=5.0,
+            )
+        ]
+
+    def _refinement_variants(
+        self,
+        query: str,
+        selected: list[ResearchSource],
+        depth: str,
+        pass_index: int,
+        plan: dict[str, Any],
+    ) -> list[str]:
+        del query, selected, depth, pass_index, plan
+        return []
+
+    def _ai_evidence_gap_analysis(
+        self,
+        objective: str,
+        selected: list[ResearchSource],
+        pass_index: int,
+        force_new_domains: bool = False,
+        existing_domains: list[str] | None = None,
+        coverage: dict[str, Any] | None = None,
+    ) -> list[str]:
+        del (
+            objective,
+            selected,
+            pass_index,
+            force_new_domains,
+            existing_domains,
+            coverage,
+        )
+        return []
+
+
 class ResearchTests(unittest.TestCase):
     def test_deep_research_engine_writes_evidence_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -521,6 +577,74 @@ class ResearchTests(unittest.TestCase):
             self.assertGreater(claim_count, 0)
             self.assertGreater(domain_count, 0)
 
+    def test_persistent_query_hints_strip_instruction_fragments_and_portal_site_bias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+            objective = (
+                "As of right now, research which publicly traded companies have the highest "
+                "probability-adjusted upside potential over the next 12 to 24 months. Use all available "
+                "general-purpose research means, including browser-grounded web research, sandboxed exploration, "
+                "current-web evidence, company filings, earnings material, product signals, independent sources, "
+                "and cross-checking. Do not use finance-specific hardcoded templates or domain-specific shortcuts."
+            )
+            query = engine._query_from_objective(objective)
+
+            engine._record_crawl_observation(
+                ResearchSource(
+                    provider="web-search",
+                    title="Yahoo quote page",
+                    url="https://finance.yahoo.com/quote/TEST",
+                    abstract="Portal quote page.",
+                    year=2026,
+                    score=60.0,
+                ),
+                "Current market catalyst evidence and price moves. " * 20,
+                (
+                    "publicly traded companies highest probability-adjusted upside potential 12 24 months "
+                    "use all available general-purpose means including not"
+                ),
+                [
+                    "site:finance.yahoo.com publicly traded companies upside potential",
+                    (
+                        "publicly traded companies highest probability-adjusted upside potential 12 24 months "
+                        "use all available general-purpose means including not"
+                    ),
+                ],
+                [],
+                "worker-1",
+                False,
+            )
+            engine._record_crawl_observation(
+                ResearchSource(
+                    provider="web-search",
+                    title="SEC filing",
+                    url="https://www.sec.gov/Archives/example-filing",
+                    abstract="Primary filing evidence.",
+                    year=2026,
+                    score=80.0,
+                ),
+                "Company filing evidence and current catalysts. " * 20,
+                query,
+                ["site:sec.gov publicly traded companies upside potential"],
+                [],
+                "worker-1",
+                False,
+            )
+
+            hints = engine._persistent_evidence_query_hints(query, objective, limit=8)
+
+            self.assertTrue(hints)
+            self.assertFalse(any("use all available" in hint.lower() for hint in hints))
+            self.assertFalse(any("site:finance.yahoo.com" in hint.lower() for hint in hints))
+            self.assertTrue(
+                any(
+                    "sec" in hint.lower() and "gov" in hint.lower()
+                    for hint in hints
+                )
+            )
+
     def test_persistent_crawl_queue_claims_sources_across_instances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = DeepResearchEngine(workspace_root=temp_dir)
@@ -551,6 +675,32 @@ class ResearchTests(unittest.TestCase):
             statuses = {item["url"]: item["status"] for item in snapshot["queued"]}
             self.assertEqual(statuses[urls[0]], "claimed")
             self.assertEqual(statuses[urls[1]], "claimed")
+
+    def test_detached_crawl_worker_scaling_is_backlog_sensitive(self) -> None:
+        engine = DeepResearchEngine()
+
+        with patch("agentos_orchestrator.research.crawl_state.os.cpu_count", return_value=12):
+            self.assertEqual(engine._detached_crawl_worker_count(32), 1)
+            self.assertEqual(engine._detached_crawl_worker_count(160), 2)
+            self.assertEqual(engine._detached_crawl_worker_count(512), 4)
+            self.assertEqual(engine._detached_crawl_batch_size(32), 6)
+            self.assertEqual(engine._detached_crawl_batch_size(160), 8)
+            self.assertEqual(engine._detached_crawl_batch_size(512), 16)
+
+    def test_detached_crawl_auto_start_waits_for_meaningful_backlog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+
+            with (
+                patch.object(engine, "_auto_start_crawl_workers_enabled", return_value=True),
+                patch.object(engine, "_queued_crawl_backlog_count", return_value=8),
+                patch("agentos_orchestrator.product.CrawlWorkerServiceManager") as service_manager_cls,
+                patch("agentos_orchestrator.product.CrawlWorkerManager") as manager_cls,
+            ):
+                engine._maybe_start_detached_crawl_workers()
+
+            service_manager_cls.assert_not_called()
+            manager_cls.assert_not_called()
 
     def test_detached_crawl_worker_processes_queue_and_records_observations(
         self,
@@ -1503,6 +1653,542 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("retrieval-breadth", perspective_names)
         self.assertIn("evidence-quality", perspective_names)
 
+    def test_current_web_research_plan_strips_instruction_fragments(self) -> None:
+        objective = (
+            "As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months. Use all available "
+            "general-purpose research means, including browser-grounded web research, sandboxed exploration, "
+            "current-web evidence, company filings, earnings material, product signals, independent sources, "
+            "and cross-checking. Do not use finance-specific hardcoded templates or domain-specific shortcuts. "
+            "Produce an analyst-grade and scientist-grade report with ranked candidates, the evidence for and "
+            "against each thesis, uncertainty bounds, catalyst quality, execution risk, valuation-sensitive "
+            "considerations, and clear reasons for the ranking."
+        )
+        engine = FakeDeepResearchEngine()
+        engine._ai_research_strategy = lambda objective, query, depth: {
+            "reasoning_queries": [
+                "scientist-grade report with ranked candidates, the evidence for",
+                "against each thesis",
+                "publicly traded companies upside potential 12 24 months",
+            ]
+        }
+        engine._ai_research_axes = lambda objective, query, depth: {}
+
+        distilled_query = engine._query_from_objective(objective)
+        plan = engine._build_research_plan(
+            objective,
+            distilled_query,
+            "multi-hour",
+            {"browser_context_detected": False},
+        )
+
+        self.assertTrue(
+            any(
+                "publicly traded companies" in query.lower()
+                and "upside potential" in query.lower()
+                for query in plan["query_plan"]
+            )
+        )
+        self.assertFalse(
+            any("scientist-grade" in query.lower() for query in plan["query_plan"])
+        )
+        self.assertFalse(
+            any("against each thesis" in query.lower() for query in plan["query_plan"])
+        )
+
+    def test_current_web_query_sanitizer_rejects_scaffold_noise(self) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        cleaned = DeepResearchEngine._sanitize_query_variants(
+            [
+                "find which",
+                "use which",
+                "which over employment labor demographic",
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months site finance yahoo com"
+                ),
+                (
+                    "site arxiv org which publicly traded companies have highest "
+                    "probability-adjusted upside potential over next 12 24 months"
+                ),
+                (
+                    "site pubmed ncbi nlm nih gov which publicly traded companies "
+                    "have highest probability-adjusted upside potential over next "
+                    "12 24 months"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months primary evidence"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months site reuters com"
+                ),
+            ],
+            query,
+        )
+
+        self.assertNotIn("find which", cleaned)
+        self.assertNotIn("use which", cleaned)
+        self.assertNotIn("which over employment labor demographic", cleaned)
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months site finance yahoo com"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "site arxiv org which publicly traded companies have highest "
+                "probability-adjusted upside potential over next 12 24 months"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "site pubmed ncbi nlm nih gov which publicly traded companies "
+                "have highest probability-adjusted upside potential over next "
+                "12 24 months"
+            ),
+            cleaned,
+        )
+        self.assertIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months primary evidence"
+            ),
+            cleaned,
+        )
+        self.assertIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months site reuters com"
+            ),
+            cleaned,
+        )
+
+    def test_current_web_query_sanitizer_rejects_runtime_retrieval_noise(
+        self,
+    ) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        cleaned = DeepResearchEngine._sanitize_query_variants(
+            [
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months so fix code also"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months find authorita"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months jats title abstract jats"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months primary eviden"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months my knowledge this does"
+                ),
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months veritone which ai stock"
+                ),
+                (
+                    "site ai google dev which publicly traded companies have highest "
+                    "probability-adjusted upside potential over next 12 24 months"
+                ),
+                "this synthesis evaluates publicly traded companies upside potential",
+                "traded probability-adjusted gemini flash class attempt",
+                "traded probability-adjusted class attempt theme",
+                (
+                    "which publicly traded companies have highest probability-adjusted "
+                    "upside potential over next 12 24 months methodology"
+                ),
+            ],
+            query,
+        )
+
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months so fix code also"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months find authorita"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months jats title abstract jats"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months primary eviden"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months my knowledge this does"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months veritone which ai stock"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            (
+                "site ai google dev which publicly traded companies have highest "
+                "probability-adjusted upside potential over next 12 24 months"
+            ),
+            cleaned,
+        )
+        self.assertNotIn(
+            "this synthesis evaluates publicly traded companies upside potential",
+            cleaned,
+        )
+        self.assertNotIn(
+            "traded probability-adjusted gemini flash class attempt",
+            cleaned,
+        )
+        self.assertNotIn(
+            "traded probability-adjusted class attempt theme",
+            cleaned,
+        )
+        self.assertIn(
+            (
+                "which publicly traded companies have highest probability-adjusted "
+                "upside potential over next 12 24 months methodology"
+            ),
+            cleaned,
+        )
+
+    def test_market_query_variants_do_not_clip_axis_suffixes(self) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        with patch.object(DeepResearchEngine, "_ai_query_variants", return_value=[]):
+            variants = DeepResearchEngine._query_variants(query, "multi-hour")
+
+        self.assertTrue(any(variant.endswith("primary evidence") for variant in variants))
+        self.assertFalse(any(variant.endswith("primary eviden") for variant in variants))
+        self.assertFalse(any(variant.endswith("counterevidenc") for variant in variants))
+
+    def test_gemini_flash_provider_returns_no_evidence_sources(self) -> None:
+        # GENERALITY GUARD: an LLM tool observation is parametric-memory
+        # restatement, not a primary source.  The provider must NEVER inject
+        # ResearchSource records with a synthetic ai.google.dev URL.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+            try:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_API_KEY": "fake-key-for-test",
+                        "GOOGLE_API_KEY": "fake-key-for-test",
+                    },
+                ):
+                    sources = engine._search_gemini_observation(
+                        "any topic at all", "multi-hour"
+                    )
+            finally:
+                pass
+
+        self.assertEqual(sources, [])
+
+    def test_classify_query_never_returns_gemini_flash_as_provider(self) -> None:
+        # The gemini-flash *evidence* provider must be absent from every
+        # classification: market, scholarly, software, current-evidence,
+        # and non-academic fallbacks.
+        for query in (
+            "highest-potential public companies as of now",
+            "site:sec.gov AAPL latest 10-K filing",
+            "compare OpenHands OpenCode OpenClaw OSWorld WebArena",
+            "best chocolate chip cookie recipe with brown butter",
+            "transformer architecture scaling laws 2025",
+            "site:fred.stlouisfed.org unemployment rate latest",
+        ):
+            providers = DeepResearchEngine._classify_query(query)
+            self.assertNotIn(
+                "gemini-flash",
+                providers,
+                f"gemini-flash leaked into classification for: {query!r}",
+            )
+
+    def test_pc_browser_filter_drops_yahoo_when_authoritative_seed_exists(
+        self,
+    ) -> None:
+        from agentos_orchestrator.core.agents import WorkerAgent
+
+        # Build a minimal worker stub; only filter logic is exercised.
+        worker = WorkerAgent.__new__(WorkerAgent)
+
+        authoritative_seed = ResearchSource(
+            provider="pc-browser-research",
+            title="SEC EDGAR filing",
+            url="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany",
+            year=2026,
+            abstract="Primary regulatory filing.",
+        )
+        yahoo_source = ResearchSource(
+            provider="web-search",
+            title="Goldman raises Pitney Bowes",
+            url="https://finance.yahoo.com/markets/stocks/articles/foo.html",
+            year=2026,
+            abstract="Re-publication of analyst note.",
+        )
+        marketwatch_source = ResearchSource(
+            provider="web-search",
+            title="MarketWatch market summary",
+            url="https://www.marketwatch.com/story/bar",
+            year=2026,
+            abstract="Aggregated market wrap.",
+        )
+        reuters_source = ResearchSource(
+            provider="web-search",
+            title="Reuters primary report",
+            url="https://www.reuters.com/markets/companies/ABC",
+            year=2026,
+            abstract="First-party reporting.",
+        )
+
+        filtered = worker._filter_market_browser_sources(
+            [yahoo_source, marketwatch_source, reuters_source],
+            [authoritative_seed],
+        )
+        urls = [str(s.url) for s in filtered]
+        self.assertNotIn(yahoo_source.url, urls)
+        self.assertNotIn(marketwatch_source.url, urls)
+        self.assertIn(reuters_source.url, urls)
+
+    def test_pc_browser_filter_drops_yahoo_even_when_no_seeds_if_alternative_exists(
+        self,
+    ) -> None:
+        from agentos_orchestrator.core.agents import WorkerAgent
+
+        worker = WorkerAgent.__new__(WorkerAgent)
+
+        yahoo_source = ResearchSource(
+            provider="web-search",
+            title="Yahoo finance",
+            url="https://finance.yahoo.com/quote/AAPL",
+            year=2026,
+            abstract="Aggregated quote page.",
+        )
+        sec_source = ResearchSource(
+            provider="web-search",
+            title="SEC filing",
+            url="https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm",
+            year=2026,
+            abstract="Primary 10-K filing.",
+        )
+
+        filtered = worker._filter_market_browser_sources(
+            [yahoo_source, sec_source],
+            [],  # no navigation seeds at all
+        )
+        urls = [str(s.url) for s in filtered]
+        self.assertNotIn(yahoo_source.url, urls)
+        self.assertIn(sec_source.url, urls)
+
+    def test_pc_browser_filter_keeps_blocked_only_as_last_resort(self) -> None:
+        from agentos_orchestrator.core.agents import WorkerAgent
+
+        worker = WorkerAgent.__new__(WorkerAgent)
+
+        yahoo_source = ResearchSource(
+            provider="web-search",
+            title="Yahoo only",
+            url="https://finance.yahoo.com/quote/AAPL",
+            year=2026,
+            abstract="Aggregator-only page.",
+        )
+
+        filtered = worker._filter_market_browser_sources(
+            [yahoo_source],
+            [],  # nothing authoritative anywhere
+        )
+        # When zero authoritative alternatives exist anywhere, the blocked
+        # source is preserved (flagged) so the run does not stall.
+        self.assertEqual(len(filtered), 1)
+        self.assertIn("low-primary-signal-portal", filtered[0].quality_flags)
+
+    def test_market_portal_blocklist_covers_cross_topic_aggregators(self) -> None:
+        from agentos_orchestrator.core.agents import WorkerAgent
+
+        blocklist = WorkerAgent._market_portal_browser_domains()
+        # Cross-topic content farms and aggregators that re-publish content
+        # rather than originate it.
+        for host in (
+            "finance.yahoo.com",
+            "marketwatch.com",
+            "msn.com",
+            "businessinsider.com",
+            "fool.com",
+            "zacks.com",
+            "medium.com",
+            "substack.com",
+        ):
+            self.assertIn(host, blocklist, f"missing portal: {host}")
+
+    def test_sanitize_frontier_graph_drops_portal_checkpoint_leads(self) -> None:
+        from agentos_orchestrator.core.agents import WorkerAgent
+
+        worker = WorkerAgent.__new__(WorkerAgent)
+        frontier_graph = {
+            "urls": {
+                "https://finance.yahoo.com/quote/AAPL": {
+                    "url": "https://finance.yahoo.com/quote/AAPL",
+                    "domain": "finance.yahoo.com",
+                },
+                "https://www.reuters.com/markets": {
+                    "url": "https://www.reuters.com/markets",
+                    "domain": "reuters.com",
+                },
+            },
+            "domains": {
+                "finance.yahoo.com": {"urls": ["https://finance.yahoo.com/quote/AAPL"]},
+                "reuters.com": {"urls": ["https://www.reuters.com/markets"]},
+            },
+            "reasoning_checkpoints": [
+                {
+                    "cycle": 1,
+                    "follow_up_queries": [
+                        "perform sandboxed browser research actions for: [multi-hour] AAPL upside"
+                    ],
+                    "domain_leads": ["finance.yahoo.com", "reuters.com"],
+                    "url_leads": [
+                        "https://finance.yahoo.com/quote/AAPL",
+                        "https://www.reuters.com/markets",
+                    ],
+                    "missing_evidence": ["Need broader domain coverage."],
+                    "contradictions": [],
+                    "continue_research": True,
+                }
+            ],
+            "claims": {},
+        }
+
+        sanitized = worker._sanitize_frontier_graph(frontier_graph)
+
+        self.assertNotIn("https://finance.yahoo.com/quote/AAPL", sanitized["urls"])
+        self.assertNotIn("finance.yahoo.com", sanitized["domains"])
+        self.assertEqual(
+            sanitized["reasoning_checkpoints"][0]["domain_leads"],
+            ["reuters.com"],
+        )
+        self.assertEqual(
+            sanitized["reasoning_checkpoints"][0]["url_leads"],
+            ["https://www.reuters.com/markets"],
+        )
+
+    def test_pc_query_seeds_strip_frontier_meta_feedback_and_portal_sites(
+        self,
+    ) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+        engine = FakeDeepResearchEngine()
+
+        seeds = engine._pc_query_seeds(
+            {
+                "pc_findings": {
+                    "frontier_checkpoints": [
+                        {
+                            "follow_up_queries": [
+                                (
+                                    "bls bureau labor statistics release calendar "
+                                    "subscribe search button search menu"
+                                )
+                            ],
+                            "domain_leads": ["finance.yahoo.com", "reuters.com"],
+                            "missing_evidence": [
+                                "Need broader domain coverage beyond the current browser pages.",
+                                "Need more direct pages with substantive evidence extraction.",
+                                "Need independent verification of browser-derived claims.",
+                            ],
+                        }
+                    ]
+                }
+            },
+            query,
+        )
+
+        joined = " ".join(seeds).lower()
+        self.assertNotIn("finance yahoo com", joined)
+        self.assertNotIn("need broader domain coverage", joined)
+        self.assertNotIn("need more direct pages", joined)
+        self.assertNotIn("browser-derived claims", joined)
+        self.assertNotIn("release calendar subscribe", joined)
+        self.assertIn("site reuters com", joined)
+
+    def test_source_seed_urls_ignore_raw_pc_market_portal_candidates(self) -> None:
+        objective = (
+            "As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months."
+        )
+
+        seed_urls = DeepResearchEngine._source_seed_urls(
+            objective,
+            None,
+            {
+                "pc_findings": {
+                    "direct_urls": [
+                        "https://sec.gov",
+                        "https://reuters.com/markets",
+                        (
+                            "https://finance.yahoo.com/markets/stocks/articles/"
+                            "market-chatter-rivian-automotive-working-074150543.html"
+                        ),
+                    ],
+                    "judged_results": [
+                        {"url": "https://sec.gov"},
+                        {"url": "https://reuters.com/markets"},
+                    ],
+                    "candidate_urls": [
+                        (
+                            "https://finance.yahoo.com/markets/stocks/articles/"
+                            "freshworks-q1-adjusted-earnings-decline-074610525.html"
+                        )
+                    ],
+                }
+            },
+        )
+
+        self.assertIn("https://sec.gov", seed_urls)
+        self.assertIn("https://reuters.com/markets", seed_urls)
+        self.assertFalse(any("finance.yahoo.com" in url for url in seed_urls))
+
     def test_software_agent_source_seed_urls_include_authoritative_roots(
         self,
     ) -> None:
@@ -1745,7 +2431,17 @@ class ResearchTests(unittest.TestCase):
             self.assertIn("highest-potential public companies", brief.query.lower())
             self.assertEqual(plan["depth"], "multi-hour")
             self.assertIn("latest", joined_variants)
-            self.assertIn("current analysis", joined_variants)
+            # Verify recency-axis variants are emitted directly from the
+            # axis generator rather than depending on any single provider's
+            # textual output.  We check the canonical recency tokens
+            # (``latest`` is already asserted above; ``timeline`` and
+            # ``near-term`` come from the current-evidence axes list).
+            self.assertTrue(
+                "timeline" in joined_variants
+                or "near-term" in joined_variants
+                or "current" in joined_variants,
+                f"no recency axis token in variants: {joined_variants!r}",
+            )
             self.assertNotIn("literature", joined_variants)
             self.assertGreaterEqual(len(plan["query_variants"]), 5)
             self.assertGreaterEqual(len(metrics["passes"]), 4)
@@ -1755,12 +2451,54 @@ class ResearchTests(unittest.TestCase):
             "highest-potential public companies as of now"
         )
 
-        # Current-evidence queries use web-search + gemini-flash plus
-        # supplementary providers for richer coverage.
+        # Current-evidence queries use real web/news providers.  The
+        # ``gemini-flash`` evidence provider was intentionally removed: an
+        # LLM observation is a parametric-memory restatement, not primary
+        # evidence, so it must not appear in the provider rotation.
         self.assertIn("web-search", providers)
-        self.assertIn("gemini-flash", providers)
+        self.assertNotIn("gemini-flash", providers)
         self.assertNotIn("openalex", providers)
         self.assertNotIn("semantic-scholar", providers)
+        self.assertNotIn("seeking-alpha", providers)
+        self.assertNotIn("reddit-finance", providers)
+
+    def test_provider_order_is_topic_conditioned_not_static_template(self) -> None:
+        academic_order = DeepResearchEngine._provider_order(
+            "transformer scaling laws reproducibility survey",
+            {"openalex", "semantic-scholar", "crossref", "web-search"},
+        )
+        software_order = DeepResearchEngine._provider_order(
+            "compare OpenHands OpenCode OpenClaw OSWorld WebArena",
+            {"github-repositories", "web-search", "bing-search", "crossref"},
+        )
+        market_order = DeepResearchEngine._provider_order(
+            "which publicly traded companies have highest upside over next 12 months",
+            {"sec-edgar", "earnings-data", "web-search", "financial-portals"},
+        )
+
+        self.assertEqual(academic_order[:3], ("openalex", "semantic-scholar", "crossref"))
+        self.assertEqual(software_order[0], "github-repositories")
+        self.assertEqual(market_order[:2], ("sec-edgar", "earnings-data"))
+
+    def test_provider_diagnostics_flush_live_for_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = DeepResearchEngine(workspace_root=temp_dir)
+            engine._active_run_id = "run_live_diag"
+
+            engine._record_provider_diagnostic(
+                "web-search",
+                "ok",
+                "returned 3 results",
+            )
+
+            diagnostics_path = (
+                Path(temp_dir)
+                / "runs/run_live_diag/research/provider_diagnostics.json"
+            )
+            self.assertTrue(diagnostics_path.exists())
+            payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload[-1]["provider"], "web-search")
+            self.assertEqual(payload[-1]["status"], "ok")
 
     def test_current_evidence_low_diversity_expands_provider_mix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1795,22 +2533,41 @@ class ResearchTests(unittest.TestCase):
         overridden = DeepResearchEngine._current_web_target_overrides(
             {
                 "min_provider_count": 6,
+                "min_source_count": 18,
+                "min_strong_or_moderate": 0,
                 "min_scholarly_sources": 5,
                 "min_novelty_rate": 0.22,
             },
             "multi-hour",
         )
 
-        self.assertEqual(overridden["min_provider_count"], 1)
+        self.assertGreaterEqual(overridden["min_provider_count"], 6)
+        self.assertGreaterEqual(overridden["min_source_count"], 120)
+        self.assertGreaterEqual(overridden["min_strong_or_moderate"], 8)
         self.assertEqual(overridden["min_scholarly_sources"], 0)
         self.assertEqual(overridden["min_novelty_rate"], 0.0)
-        self.assertEqual(overridden["max_retrieval_passes"], 120)
+        self.assertEqual(overridden["max_retrieval_passes"], 48)
         self.assertGreater(
             DeepResearchEngine._effective_novelty_threshold(
                 "multi-hour",
                 overridden,
             ),
             0.0,
+        )
+
+    def test_multi_hour_current_web_parallelism_scales_up(self) -> None:
+        engine = DeepResearchEngine()
+        engine._active_objective = (
+            "[multi-hour] highest-potential public companies as of now"
+        )
+
+        self.assertGreaterEqual(
+            engine._query_parallel_worker_count("multi-hour", 120, 8),
+            16,
+        )
+        self.assertGreaterEqual(
+            engine._provider_parallel_worker_count(8),
+            4,
         )
 
     def test_generic_market_words_do_not_make_source_on_topic(self) -> None:
@@ -1894,6 +2651,36 @@ class ResearchTests(unittest.TestCase):
             "SEC filing revenue growth catalyst".lower(),
             " ".join(retrieval["query_variants"]).lower(),
         )
+
+    def test_current_web_low_marginal_yield_stops_before_full_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = SlowMarginalYieldEngine(workspace_root=temp_dir)
+            retrieval = engine._iterative_retrieval(
+                query="public stocks with highest potential to soar as of now",
+                settings=DeepResearchEngine._settings_for_depth("multi-hour"),
+                plan={
+                    "core_question": (
+                        "public stocks with highest potential to soar as of now"
+                    ),
+                    "query_plan": ["stocks earnings catalyst revisions"],
+                    "perspectives": [],
+                },
+                targets={
+                    "max_retrieval_passes": 24,
+                    "depth_pass_floor": 3,
+                    "max_low_marginal_yield_streak": 2,
+                    "min_marginal_unique_url_gain": 2,
+                    "min_marginal_title_gain": 2,
+                    "min_source_count": 50,
+                },
+                pc_context=None,
+                run_id="run_low_marginal_yield",
+            )
+
+        self.assertEqual(retrieval["stop_reason"], "marginal_yield_exhausted")
+        self.assertLess(len(retrieval["passes"]), 24)
+        self.assertEqual(retrieval["passes"][-1]["marginal_unique_url_gain"], 1)
+        self.assertEqual(retrieval["passes"][-1]["marginal_title_gain"], 1)
 
     def test_general_complex_objective_expands_standard_settings(self) -> None:
         settings = DeepResearchEngine._settings_for_general_complex_objective(

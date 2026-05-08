@@ -14,6 +14,10 @@ from typing import Any
 from agentos_orchestrator.core.types import utc_now
 
 
+_MAX_CRAWL_WORKER_COUNT = 4
+_MAX_CRAWL_BATCH_SIZE = 16
+
+
 @dataclass(slots=True)
 class CrawlWorkerRecord:
     status: str
@@ -141,7 +145,8 @@ class CrawlWorkerManager:
         default_domain_cooldown_seconds: float = 2.0,
         js_domain_cooldown_seconds: float = 8.0,
     ) -> CrawlWorkerRecord:
-        desired_count = max(1, min(int(worker_count), 8))
+        desired_count = _clamp_crawl_worker_count(worker_count)
+        desired_batch_size = _clamp_crawl_batch_size(batch_size)
         queue_path = (
             Path(queue_db_path)
             if queue_db_path is not None
@@ -193,7 +198,7 @@ class CrawlWorkerManager:
                 "--poll-interval",
                 str(poll_interval_seconds),
                 "--batch-size",
-                str(batch_size),
+                str(desired_batch_size),
                 "--claim-ttl",
                 str(claim_ttl_seconds),
             ]
@@ -240,7 +245,7 @@ class CrawlWorkerManager:
             log_paths=log_paths,
             started_at=utc_now(),
             poll_interval_seconds=float(poll_interval_seconds),
-            batch_size=int(batch_size),
+            batch_size=desired_batch_size,
             claim_ttl_seconds=int(claim_ttl_seconds),
             allow_js_required=bool(allow_js_required),
             prefer_js_required=bool(prefer_js_required),
@@ -272,7 +277,7 @@ class CrawlWorkerManager:
         default_domain_cooldown_seconds: float = 2.0,
         js_domain_cooldown_seconds: float = 8.0,
     ) -> CrawlWorkerRecord:
-        desired_count = max(1, min(int(worker_count), 8))
+        desired_count = _clamp_crawl_worker_count(worker_count)
         queue_path = (
             Path(queue_db_path)
             if queue_db_path is not None
@@ -497,12 +502,12 @@ class CrawlWorkerServiceManager:
         queue_path = self._resolve_queue_db_path(queue_db_path)
         payload = {
             "task_name": resolved_task_name,
-            "worker_count": max(1, min(int(worker_count), 8)),
+            "worker_count": _clamp_crawl_worker_count(worker_count),
             "queue_db_path": str(queue_path),
             "broker_url": str(broker_url or "").strip(),
             "broker_token": str(broker_token or ""),
             "poll_interval_seconds": float(poll_interval_seconds),
-            "batch_size": max(1, min(int(batch_size), 24)),
+            "batch_size": _clamp_crawl_batch_size(batch_size),
             "claim_ttl_seconds": max(60, min(int(claim_ttl_seconds), 7_200)),
             "allow_js_required": bool(allow_js_required),
             "prefer_js_required": bool(prefer_js_required),
@@ -542,10 +547,69 @@ class CrawlWorkerServiceManager:
     def start(
         self,
         task_name: str | None = None,
+        worker_count: int | None = None,
+        poll_interval_seconds: float | None = None,
+        batch_size: int | None = None,
+        claim_ttl_seconds: int | None = None,
     ) -> CrawlWorkerServiceRecord:
         if not self._is_supported():
             return self.status(task_name=task_name)
         resolved_task_name = self._resolve_task_name(task_name)
+        if any(
+            value is not None
+            for value in (
+                worker_count,
+                poll_interval_seconds,
+                batch_size,
+                claim_ttl_seconds,
+            )
+        ):
+            current_payload = self._read_config()
+            self.install(
+                worker_count=(
+                    worker_count
+                    if worker_count is not None
+                    else int(current_payload.get("worker_count") or 1)
+                ),
+                queue_db_path=str(current_payload.get("queue_db_path") or ""),
+                broker_url=str(current_payload.get("broker_url") or ""),
+                broker_token=str(current_payload.get("broker_token") or ""),
+                poll_interval_seconds=(
+                    float(poll_interval_seconds)
+                    if poll_interval_seconds is not None
+                    else float(current_payload.get("poll_interval_seconds") or 15.0)
+                ),
+                batch_size=(
+                    batch_size
+                    if batch_size is not None
+                    else int(current_payload.get("batch_size") or 6)
+                ),
+                claim_ttl_seconds=(
+                    claim_ttl_seconds
+                    if claim_ttl_seconds is not None
+                    else int(current_payload.get("claim_ttl_seconds") or 900)
+                ),
+                allow_js_required=bool(
+                    current_payload.get("allow_js_required", True)
+                ),
+                prefer_js_required=bool(
+                    current_payload.get("prefer_js_required", False)
+                ),
+                max_claims_per_domain=int(
+                    current_payload.get("max_claims_per_domain") or 2
+                ),
+                default_domain_cooldown_seconds=float(
+                    current_payload.get("default_domain_cooldown_seconds") or 2.0
+                ),
+                js_domain_cooldown_seconds=float(
+                    current_payload.get("js_domain_cooldown_seconds") or 8.0
+                ),
+                reconcile_interval_seconds=float(
+                    current_payload.get("reconcile_interval_seconds") or 30.0
+                ),
+                task_name=resolved_task_name,
+                start_now=False,
+            )
         result = self._run_schtasks(
             [
                 "/Run",
@@ -803,6 +867,20 @@ def _int_or_none(value: object) -> int | None:
         return int(str(value)) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _clamp_crawl_worker_count(value: object) -> int:
+    raw = _int_or_none(value)
+    if raw is None:
+        return 1
+    return max(1, min(raw, _MAX_CRAWL_WORKER_COUNT))
+
+
+def _clamp_crawl_batch_size(value: object) -> int:
+    raw = _int_or_none(value)
+    if raw is None:
+        return 1
+    return max(1, min(raw, _MAX_CRAWL_BATCH_SIZE))
 
 
 def _process_running(pid: int) -> bool:
