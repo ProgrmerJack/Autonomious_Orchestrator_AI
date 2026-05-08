@@ -2249,6 +2249,13 @@ class ResearchRetrievalMixin:
                 )
             )
         return sources
+    @staticmethod
+    def _json_request_headers() -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "User-Agent": "agentos-orchestrator/0.1",
+        }
+
     def _get_json(self, url: str) -> dict[str, Any]:
         try:
             import httpx  # type: ignore[import-not-found]
@@ -2263,12 +2270,40 @@ class ResearchRetrievalMixin:
             ) as client:
                 response = client.get(
                     url,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "agentos-orchestrator/0.1",
-                    },
+                    headers=self._json_request_headers(),
                     timeout=self.timeout_seconds,
                 )
                 return json.loads(response.text)
         except (Exception, json.JSONDecodeError):
             return {}
+
+    async def _get_json_async(
+        self,
+        url: str,
+        client: Any | None = None,
+    ) -> dict[str, Any]:
+        try:
+            import httpx  # type: ignore[import-not-found]
+        except ImportError:
+            return {}
+
+        async def _request(async_client: Any) -> dict[str, Any]:
+            try:
+                response = await async_client.get(
+                    url,
+                    headers=self._json_request_headers(),
+                    timeout=self.timeout_seconds,
+                )
+                return json.loads(response.text)
+            except (Exception, json.JSONDecodeError):
+                return {}
+
+        if client is not None:
+            return await _request(client)
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            http2=True,
+            verify=True,
+        ) as async_client:
+            return await _request(async_client)

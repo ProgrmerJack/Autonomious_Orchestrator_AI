@@ -459,6 +459,58 @@ class SlowMarginalYieldEngine(StableLowNoveltyEngine):
         del query, selected, depth, pass_index, plan
         return []
 
+
+class MixedProviderDispatchEngine(DeepResearchEngine):
+    def _provider_order(
+        self,
+        search_query: str = "",
+        allowed_providers: set[str] | None = None,
+    ) -> tuple[str, ...]:
+        del search_query, allowed_providers
+        return ("openalex", "web-search")
+
+    def _provider_parallel_worker_count(self, provider_count: int) -> int:
+        return provider_count
+
+    def _provider_searchers(self) -> dict[str, Any]:
+        return {
+            "openalex": self._search_openalex,
+            "web-search": self._search_web_results,
+        }
+
+    async def _search_openalex_async(
+        self,
+        query: str,
+        limit: int | None = None,
+        client: Any | None = None,
+    ) -> list[ResearchSource]:
+        del limit, client
+        return [
+            ResearchSource(
+                provider="openalex",
+                title=f"async {query}",
+                url="https://example.com/async",
+                abstract="async provider",
+                score=2.0,
+            )
+        ]
+
+    def _search_web_results(
+        self,
+        query: str,
+        limit: int | None = None,
+    ) -> list[ResearchSource]:
+        del limit
+        return [
+            ResearchSource(
+                provider="web-search",
+                title=f"sync {query}",
+                url="https://example.com/sync",
+                abstract="sync provider",
+                score=1.0,
+            )
+        ]
+
     def _ai_evidence_gap_analysis(
         self,
         objective: str,
@@ -2479,6 +2531,20 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(academic_order[:3], ("openalex", "semantic-scholar", "crossref"))
         self.assertEqual(software_order[0], "github-repositories")
         self.assertEqual(market_order[:2], ("sec-edgar", "earnings-data"))
+
+    def test_provider_dispatch_supports_mixed_async_and_sync_searchers(self) -> None:
+        engine = MixedProviderDispatchEngine()
+
+        sources = engine._search_query_across_providers(
+            "async provider mix",
+            {"openalex", "web-search"},
+            4,
+        )
+
+        self.assertEqual(
+            [source.provider for source in sources],
+            ["openalex", "web-search"],
+        )
 
     def test_provider_diagnostics_flush_live_for_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

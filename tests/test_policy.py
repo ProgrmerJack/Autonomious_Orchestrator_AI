@@ -93,6 +93,48 @@ class PermissionPolicyTests(unittest.TestCase):
                 rejected.reasons,
             )
 
+    def test_exact_approved_action_overrides_path_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.sqlite3"
+            policy = PermissionPolicy(
+                {
+                    "default": "deny",
+                    "allow": {"actions": ["os.act"], "paths": []},
+                    "forbid": {"actions": [], "paths": []},
+                    "require_approval": {"actions": ["os.act"]},
+                }
+            )
+            approvals = ApprovalStore(db_path)
+            middleware = AuthorizationMiddleware(
+                policy,
+                approvals,
+                TrustMonitor(db_path),
+            )
+
+            action = ActionRequest(
+                "agent",
+                "os.act",
+                "virtual-desktop-sandbox://workflow",
+            )
+            requested = middleware.authorize("run_1", action)
+
+            self.assertTrue(requested.requires_approval)
+            assert requested.approval is not None
+            approvals.approve(requested.approval.token)
+
+            approved = middleware.authorize(
+                "run_1",
+                ActionRequest(
+                    "agent",
+                    "os.act",
+                    "virtual-desktop-sandbox://workflow",
+                    approval_token=requested.approval.token,
+                ),
+            )
+
+            self.assertTrue(approved.allowed)
+            self.assertIn("approved by human token", approved.reasons)
+
     def test_sandbox_exec_without_hardening_evidence_is_trust_scored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.sqlite3"

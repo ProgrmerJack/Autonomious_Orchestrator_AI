@@ -29,6 +29,25 @@ class McpResearchHit:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class McpActionRecord:
+    action_type: str
+    target: str
+    status: str
+    server: str | None = None
+    tool: str | None = None
+    result_count: int = 0
+    error: str | None = None
+    stderr: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class McpResearchExecution:
+    hits: list[McpResearchHit] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    actions: list[McpActionRecord] = field(default_factory=list)
+
+
 def load_mcp_research_servers_from_env() -> list[McpResearchServer]:
     raw = os.environ.get("AGENTOS_MCP_SERVERS_JSON", "").strip()
     if not raw:
@@ -73,7 +92,15 @@ def run_mcp_research_query(
     query: str,
     limit: int = 5,
 ) -> tuple[list[McpResearchHit], list[dict[str, Any]]]:
-    return _run_async(_collect_research_hits(query, limit=limit))
+    execution = run_mcp_research_execution(query, limit=limit)
+    return execution.hits, execution.diagnostics
+
+
+def run_mcp_research_execution(
+    query: str,
+    limit: int = 5,
+) -> McpResearchExecution:
+    return _run_async(_collect_research_execution(query, limit=limit))
 
 
 def _run_async(coro: Any) -> Any:
@@ -89,13 +116,22 @@ def _run_async(coro: Any) -> Any:
         loop.close()
 
 
-async def _collect_research_hits(
+async def _collect_research_execution(
     query: str,
     limit: int = 5,
-) -> tuple[list[McpResearchHit], list[dict[str, Any]]]:
-    hits: list[McpResearchHit] = []
-    diagnostics: list[dict[str, Any]] = []
-    for server in load_mcp_research_servers_from_env():
+) -> McpResearchExecution:
+    execution = McpResearchExecution()
+    servers = load_mcp_research_servers_from_env()
+    execution.actions.append(
+        McpActionRecord(
+            action_type="mcp.list",
+            target="mcp://configured-servers",
+            status="ok" if servers else "empty",
+            result_count=len(servers),
+        )
+    )
+
+    for server in servers:
         config = McpServerConfig(
             name=server.name,
             command=server.command,
@@ -110,12 +146,22 @@ async def _collect_research_hits(
                 tools_payload = await client.list_tools()
                 tool_name = _resolve_tool_name(server, tools_payload)
                 if not tool_name:
-                    diagnostics.append(
+                    stderr = client.stderr_messages()
+                    execution.diagnostics.append(
                         {
                             "server": server.name,
                             "status": "no-research-tool",
-                            "stderr": client.stderr_messages(),
+                            "stderr": stderr,
                         }
+                    )
+                    execution.actions.append(
+                        McpActionRecord(
+                            action_type="mcp.call",
+                            target=_tool_target(server.name, None),
+                            status="no-research-tool",
+                            server=server.name,
+                            stderr=stderr,
+                        )
                     )
                     continue
                 arguments = dict(server.arguments)
@@ -123,26 +169,55 @@ async def _collect_research_hits(
                 arguments.setdefault("limit", limit)
                 result = await client.call_tool(tool_name, arguments)
                 normalized = _normalize_mcp_result(server.name, tool_name, result)
-                hits.extend(normalized)
-                diagnostics.append(
+                stderr = client.stderr_messages()
+                execution.hits.extend(normalized)
+                execution.diagnostics.append(
                     {
                         "server": server.name,
                         "status": "ok",
                         "tool": tool_name,
                         "result_count": len(normalized),
-                        "stderr": client.stderr_messages(),
+                        "stderr": stderr,
                     }
                 )
+                execution.actions.append(
+                    McpActionRecord(
+                        action_type="mcp.call",
+                        target=_tool_target(server.name, tool_name),
+                        status="ok",
+                        server=server.name,
+                        tool=tool_name,
+                        result_count=len(normalized),
+                        stderr=stderr,
+                    )
+                )
         except Exception as exc:
-            diagnostics.append(
+            stderr = client.stderr_messages() if client is not None else []
+            execution.diagnostics.append(
                 {
                     "server": server.name,
                     "status": "error",
                     "error": str(exc),
-                    "stderr": client.stderr_messages() if client is not None else [],
+                    "stderr": stderr,
                 }
             )
-    return hits, diagnostics
+            execution.actions.append(
+                McpActionRecord(
+                    action_type="mcp.call",
+                    target=_tool_target(server.name, server.research_tool),
+                    status="error",
+                    server=server.name,
+                    tool=server.research_tool,
+                    error=str(exc),
+                    stderr=stderr,
+                )
+            )
+    return execution
+
+
+def _tool_target(server_name: str, tool_name: str | None) -> str:
+    suffix = str(tool_name or "research").strip() or "research"
+    return f"mcp://{server_name}/{suffix}"
 
 
 def _resolve_tool_name(server: McpResearchServer, tools_payload: Any) -> str | None:

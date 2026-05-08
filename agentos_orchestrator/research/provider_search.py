@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,6 +72,62 @@ class ProviderSearchMixin:
         )
         return sources
 
+    async def _search_semantic_scholar_async(
+        self,
+        query: str,
+        limit: int | None = None,
+        client: Any | None = None,
+    ) -> list[ResearchSource]:
+        params = urllib.parse.urlencode(
+            {
+                "query": query,
+                "limit": str(limit or self.limit_per_provider),
+                "fields": ",".join(
+                    [
+                        "title",
+                        "abstract",
+                        "authors",
+                        "year",
+                        "url",
+                        "citationCount",
+                        "openAccessPdf",
+                    ]
+                ),
+            }
+        )
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{params}"
+        payload = await self._get_json_async(url, client=client)
+        sources: list[ResearchSource] = []
+        for item in payload.get("data", []):
+            title = html.unescape(str(item.get("title") or "").strip())
+            if not title:
+                continue
+            open_pdf = item.get("openAccessPdf") or {}
+            source_url = str(open_pdf.get("url") or item.get("url") or "")
+            citation_count = int(item.get("citationCount") or 0)
+            sources.append(
+                ResearchSource(
+                    provider="semantic-scholar",
+                    title=title,
+                    url=source_url,
+                    year=item.get("year"),
+                    authors=[
+                        str(author.get("name"))
+                        for author in item.get("authors", [])[:6]
+                        if author.get("name")
+                    ],
+                    abstract=str(item.get("abstract") or ""),
+                    citation_count=citation_count,
+                    score=float(citation_count),
+                )
+            )
+        self._record_provider_diagnostic(
+            "semantic-scholar",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} records",
+        )
+        return sources
+
     def _search_crossref(
         self,
         query: str,
@@ -84,6 +142,71 @@ class ProviderSearchMixin:
             }
         )
         payload = self._get_json(f"https://api.crossref.org/works?{params}")
+        message = payload.get("message") if isinstance(payload, dict) else {}
+        items = message.get("items") if isinstance(message, dict) else []
+        sources: list[ResearchSource] = []
+        for item in items or []:
+            title_list = item.get("title") or []
+            title = html.unescape(str(title_list[0] if title_list else "").strip())
+            if not title:
+                continue
+            doi = str(item.get("DOI") or "").strip()
+            source_url = str(
+                item.get("URL") or (f"https://doi.org/{doi}" if doi else "")
+            )
+            created = item.get("created") or {}
+            date_parts = created.get("date-parts") or []
+            year = None
+            if date_parts and isinstance(date_parts[0], list) and date_parts[0]:
+                try:
+                    year = int(date_parts[0][0])
+                except (TypeError, ValueError):
+                    year = None
+            authors = []
+            for author in item.get("author", [])[:6]:
+                given = str(author.get("given") or "").strip()
+                family = str(author.get("family") or "").strip()
+                name = f"{given} {family}".strip()
+                if name:
+                    authors.append(name)
+            citation_count = int(item.get("is-referenced-by-count") or 0)
+            sources.append(
+                ResearchSource(
+                    provider="crossref",
+                    title=title,
+                    url=source_url,
+                    year=year,
+                    authors=authors,
+                    abstract=str(item.get("abstract") or ""),
+                    citation_count=citation_count,
+                    score=float(citation_count),
+                )
+            )
+        self._record_provider_diagnostic(
+            "crossref",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} records",
+        )
+        return sources
+
+    async def _search_crossref_async(
+        self,
+        query: str,
+        limit: int | None = None,
+        client: Any | None = None,
+    ) -> list[ResearchSource]:
+        params = urllib.parse.urlencode(
+            {
+                "query.bibliographic": query,
+                "rows": str(limit or self.limit_per_provider),
+                "sort": "relevance",
+                "order": "desc",
+            }
+        )
+        payload = await self._get_json_async(
+            f"https://api.crossref.org/works?{params}",
+            client=client,
+        )
         message = payload.get("message") if isinstance(payload, dict) else {}
         items = message.get("items") if isinstance(message, dict) else []
         sources: list[ResearchSource] = []
@@ -2179,41 +2302,12 @@ class ProviderSearchMixin:
             parallel_workers = 1
 
         if parallel_workers > 1 and len(routed_providers) > 1:
-            provider_results_by_name: dict[str, list[ResearchSource]] = {}
-
-            def _run_provider(provider: str) -> tuple[str, list[ResearchSource]]:
-                return (
-                    provider,
-                    self._search_provider_results(
-                        provider,
-                        provider_searchers[provider],
-                        search_query,
-                        per_provider_limit,
-                    ),
-                )
-
-            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-                futures = {
-                    executor.submit(_run_provider, provider): provider
-                    for provider in routed_providers
-                }
-                for future in as_completed(futures):
-                    provider = futures[future]
-                    try:
-                        name, provider_results = future.result()
-                    except Exception as exc:
-                        self._record_provider_diagnostic(
-                            provider,
-                            "query-error",
-                            f"{type(exc).__name__}: {exc}",
-                        )
-                        name = provider
-                        provider_results = []
-                    provider_results_by_name[name] = provider_results
-
-            for provider in routed_providers:
-                sources.extend(provider_results_by_name.get(provider) or [])
-            return sources
+            return self._run_provider_dispatch_async(
+                routed_providers,
+                provider_searchers,
+                search_query,
+                per_provider_limit,
+            )
 
         for provider in routed_providers:
             sources.extend(
@@ -2225,6 +2319,108 @@ class ProviderSearchMixin:
                 )
             )
         return sources
+
+    def _run_provider_dispatch_async(
+        self,
+        routed_providers: list[str],
+        provider_searchers: dict[str, Any],
+        search_query: str,
+        per_provider_limit: int,
+    ) -> list[ResearchSource]:
+        async def _dispatch() -> list[ResearchSource]:
+            provider_results_by_name: dict[str, list[ResearchSource]] = {}
+            try:
+                import httpx  # type: ignore[import-not-found]
+            except ImportError:
+                httpx = None
+
+            if httpx is None:
+                for provider in routed_providers:
+                    provider_results_by_name[provider] = await asyncio.to_thread(
+                        self._search_provider_results,
+                        provider,
+                        provider_searchers[provider],
+                        search_query,
+                        per_provider_limit,
+                    )
+            else:
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    http2=True,
+                    verify=True,
+                ) as client:
+                    tasks = [
+                        self._search_provider_results_async(
+                            provider,
+                            provider_searchers[provider],
+                            search_query,
+                            per_provider_limit,
+                            client,
+                        )
+                        for provider in routed_providers
+                    ]
+                    for name, provider_results in await asyncio.gather(*tasks):
+                        provider_results_by_name[name] = provider_results
+
+            sources: list[ResearchSource] = []
+            for provider in routed_providers:
+                sources.extend(provider_results_by_name.get(provider) or [])
+            return sources
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(_dispatch())
+
+        container: dict[str, Any] = {}
+
+        def _runner() -> None:
+            container["value"] = asyncio.run(_dispatch())
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        return list(container.get("value") or [])
+
+    async def _search_provider_results_async(
+        self,
+        provider: str,
+        searcher: Any,
+        search_query: str,
+        per_provider_limit: int,
+        client: Any,
+    ) -> tuple[str, list[ResearchSource]]:
+        limit = (
+            min(per_provider_limit, 5)
+            if provider == "github-repositories"
+            else per_provider_limit
+        )
+        async_searcher = self._provider_async_searchers().get(provider)
+        if async_searcher is None:
+            return (
+                provider,
+                await asyncio.to_thread(
+                    self._search_provider_results,
+                    provider,
+                    searcher,
+                    search_query,
+                    per_provider_limit,
+                ),
+            )
+        try:
+            provider_results = await async_searcher(
+                search_query,
+                limit,
+                client,
+            )
+        except Exception as exc:
+            self._record_provider_diagnostic(
+                provider,
+                "query-error",
+                f"{type(exc).__name__}: {exc}",
+            )
+            return provider, []
+        return provider, provider_results
 
     def _search_provider_results(
         self,
@@ -2291,3 +2487,15 @@ class ProviderSearchMixin:
             "web-search": self._search_web_results,
             "github-repositories": self._search_github_repositories,
         }
+
+    def _provider_async_searchers(self) -> dict[str, Any]:
+        searchers: dict[str, Any] = {}
+        for provider, name in (
+            ("openalex", "_search_openalex_async"),
+            ("semantic-scholar", "_search_semantic_scholar_async"),
+            ("crossref", "_search_crossref_async"),
+        ):
+            searcher = getattr(self, name, None)
+            if callable(searcher):
+                searchers[provider] = searcher
+        return searchers

@@ -589,9 +589,7 @@ class CrawlWorkerServiceManager:
                     if claim_ttl_seconds is not None
                     else int(current_payload.get("claim_ttl_seconds") or 900)
                 ),
-                allow_js_required=bool(
-                    current_payload.get("allow_js_required", True)
-                ),
+                allow_js_required=bool(current_payload.get("allow_js_required", True)),
                 prefer_js_required=bool(
                     current_payload.get("prefer_js_required", False)
                 ),

@@ -17,12 +17,6 @@ from .policy import PermissionPolicy
 from .trust import TrustMonitor
 from .types import ActionRequest, RunReport, TaskSpec, WorkerResult, new_id
 from agentos_orchestrator.evals import UnsupervisedEvalEngine
-from agentos_orchestrator.os_control.directshell_backend import (
-    DirectShellBackend,
-)
-from agentos_orchestrator.os_control.touchpoint_backend import (
-    TouchpointBackend,
-)
 from agentos_orchestrator.os_control.virtual_desktop_sandbox_backend import (
     VirtualDesktopSandboxBackend,
 )
@@ -109,24 +103,20 @@ class ResearchOrchestrator:
         resolved_state_path = Path(state_path)
         if configured == "windows-uia":
             return WindowsUiaBackend()
-        if configured == "touchpoint":
-            return TouchpointBackend()
-        if configured == "directshell":
-            return DirectShellBackend(
-                resolved_state_path.with_name("directshell.sqlite3")
-            )
         if configured == "virtual-desktop-sandbox":
             return VirtualDesktopSandboxBackend(
                 resolved_state_path.with_name("virtual_desktop_sandbox.json")
+            )
+        if configured:
+            raise ValueError(
+                "Unknown AGENTOS_PC_BACKEND "
+                f"'{configured}'; expected 'windows-uia' or "
+                "'virtual-desktop-sandbox'"
             )
 
         windows_backend = WindowsUiaBackend()
         if windows_backend.available():
             return windows_backend
-
-        touchpoint_backend = TouchpointBackend()
-        if touchpoint_backend.available():
-            return touchpoint_backend
 
         return VirtualDesktopSandboxBackend(
             resolved_state_path.with_name("virtual_desktop_sandbox.json")

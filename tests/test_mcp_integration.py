@@ -11,6 +11,7 @@ from unittest.mock import patch
 from agentos_orchestrator.core.agents import WorkerAgent
 from agentos_orchestrator.core.checkpoint import CheckpointStore
 from agentos_orchestrator.core.events import DurableEventLog, EventBus
+from agentos_orchestrator.core.types import ActionRequest, TaskSpec
 from agentos_orchestrator.mcp import run_mcp_research_query
 from agentos_orchestrator.research import (
     DeepResearchEngine,
@@ -149,3 +150,62 @@ class McpIntegrationTests(unittest.TestCase):
             any(source.provider == "mcp:integration" for source in brief.sources)
         )
         self.assertEqual(brief.metadata["mcp"]["source_count"], 1)
+        self.assertEqual(len(brief.metadata["mcp"]["actions"]), 2)
+
+    def test_literature_worker_emits_first_party_mcp_action_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "mcp_integration_server.py"
+            script_path.write_text(_INTEGRATION_SERVER, encoding="utf-8")
+            payload = json.dumps(
+                [
+                    {
+                        "name": "integration",
+                        "command": [sys.executable, "-u", str(script_path)],
+                        "research_tool": "research.search",
+                    }
+                ]
+            )
+            event_log = DurableEventLog(Path(temp_dir) / "events.sqlite3")
+            worker = WorkerAgent(
+                EventBus(event_log),
+                CheckpointStore(Path(temp_dir) / "state.sqlite3"),
+                research_engine=_FakeResearchEngine(),
+            )
+            task = TaskSpec(
+                task_id="literature_task",
+                role="literature",
+                objective="test objective",
+                declared_actions=[
+                    ActionRequest(
+                        "literature-agent",
+                        "mcp.list",
+                        "mcp://configured-servers",
+                    ),
+                    ActionRequest(
+                        "literature-agent",
+                        "mcp.call",
+                        "mcp://research/search",
+                    ),
+                ],
+            )
+            with patch.dict("os.environ", {"AGENTOS_MCP_SERVERS_JSON": payload}):
+                result = worker.run("run_mcp_task", task, [])
+
+        mcp_evidence = [
+            item
+            for item in result.evidence
+            if str(item.get("source") or "").startswith("mcp://")
+        ]
+        self.assertTrue(
+            any(
+                item.get("metadata", {}).get("action_type") == "mcp.list"
+                for item in mcp_evidence
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("metadata", {}).get("action_type") == "mcp.call"
+                and item.get("metadata", {}).get("status") == "ok"
+                for item in mcp_evidence
+            )
+        )

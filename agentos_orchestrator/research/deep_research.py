@@ -1567,6 +1567,69 @@ class DeepResearchEngine(
         )
         return sources
 
+    async def _search_openalex_async(
+        self,
+        query: str,
+        limit: int | None = None,
+        client: Any | None = None,
+    ) -> list[ResearchSource]:
+        params = urllib.parse.urlencode(
+            {
+                "search": query,
+                "per-page": str(limit or self.limit_per_provider),
+                "select": ",".join(
+                    [
+                        "id",
+                        "display_name",
+                        "publication_year",
+                        "authorships",
+                        "abstract_inverted_index",
+                        "cited_by_count",
+                        "doi",
+                        "primary_location",
+                    ]
+                ),
+            }
+        )
+        payload = await self._get_json_async(
+            f"https://api.openalex.org/works?{params}",
+            client=client,
+        )
+        sources: list[ResearchSource] = []
+        for item in payload.get("results", []):
+            title = html.unescape(str(item.get("display_name") or "").strip())
+            if not title:
+                continue
+            location = item.get("primary_location") or {}
+            landing_page = location.get("landing_page_url") or item.get("doi")
+            url = str(landing_page or item.get("id") or "")
+            authors = [
+                str(author.get("author", {}).get("display_name"))
+                for author in item.get("authorships", [])[:6]
+                if author.get("author", {}).get("display_name")
+            ]
+            citation_count = int(item.get("cited_by_count") or 0)
+            sources.append(
+                ResearchSource(
+                    provider="openalex",
+                    title=title,
+                    url=url,
+                    year=item.get("publication_year"),
+                    authors=authors,
+                    abstract=self._openalex_abstract(
+                        item.get("abstract_inverted_index") or {}
+                    ),
+                    citation_count=citation_count,
+                    score=float(citation_count),
+                )
+            )
+        self._record_provider_diagnostic(
+            "openalex",
+            "ok" if sources else "empty",
+            f"returned {len(sources)} records",
+        )
+        return sources
+
     def _search_github_repositories(
         self,
         query: str,

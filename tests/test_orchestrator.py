@@ -6,6 +6,7 @@ import tempfile
 import threading
 import urllib.parse
 import unittest
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
@@ -637,6 +638,22 @@ class OrchestratorTests(unittest.TestCase):
             analysis["hypotheses"],
             ["Catalyst quality and valuation will dominate."],
         )
+
+    def test_ai_objective_analysis_quietly_falls_back_on_empty_response(self) -> None:
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker.research_engine._call_ai_text = lambda _system, _user: ""
+        objective = "Research current market risks and compare alternatives"
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                analysis = worker._ai_analyze_objective(objective)
+
+        self.assertEqual(
+            analysis,
+            worker._heuristic_objective_analysis(objective),
+        )
+        self.assertEqual(caught, [])
 
     def test_build_deep_plan_blocks_empty_hypotheses_without_opt_in(self) -> None:
         worker = WorkerAgent(None, None, FakeResearchEngine())

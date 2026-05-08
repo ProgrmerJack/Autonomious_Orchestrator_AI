@@ -37,310 +37,33 @@ import {
     isDesktopShell,
     type DaemonRecord
 } from './desktop';
+import {
+    approvalAction,
+    runProgressQuery,
+    runProgressSummary,
+    selectorFor
+} from './helpers';
+import type {
+    Approval,
+    ChannelDelivery,
+    EventPayload,
+    JsonMap,
+    LiveFireFailure,
+    LiveFireReviewPayload,
+    PcActionResponse,
+    ProductStatus,
+    ResearchArtifacts,
+    RunJob,
+    RunProgress,
+    RunRecord,
+    SelectorDebugReport,
+    ShadowTrainingSummary,
+    SystemStatus,
+    UiNode,
+    View,
+    WorkflowCommand
+} from './types';
 import './styles.css';
-
-type JsonMap = Record<string, unknown>;
-type View = 'research' | 'pc' | 'approvals' | 'runs' | 'events' | 'channels' | 'live-fire' | 'system';
-
-type Approval = {
-    approval_id: string;
-    token: string;
-    reasons: string[];
-    status: string;
-    action?: {
-        action_type: string;
-        target: string;
-        payload: {
-            action?: string;
-            value_present?: boolean;
-        };
-    };
-};
-
-type BackendStatus = {
-    name: string;
-    available: boolean;
-    error?: string;
-};
-
-type SystemStatus = {
-    status: string;
-    run_count: number;
-    pending_approvals: number;
-    jobs: RunJob[];
-    pc_backends: BackendStatus[];
-    daemon?: DaemonRecord;
-};
-
-type SetupCheck = {
-    check_id: string;
-    label: string;
-    status: string;
-    detail: string;
-    required: boolean;
-    repair_hint?: string;
-};
-
-type ProviderStatus = {
-    provider_id: string;
-    label: string;
-    kind: string;
-    configured: boolean;
-    detail: string;
-};
-
-type ChannelStatus = {
-    channel_id: string;
-    label: string;
-    endpoint: string;
-    configured: boolean;
-    detail: string;
-};
-
-type ProductStatus = {
-    checks: SetupCheck[];
-    providers: ProviderStatus[];
-    channels: ChannelStatus[];
-    benchmarks: JsonMap;
-};
-
-type RunRecord = {
-    run_id: string;
-    objective: string;
-    status: string;
-    created_at: string;
-    updated_at: string;
-};
-
-type RunJob = {
-    job_id: string;
-    objective: string;
-    status: string;
-    created_at: string;
-    updated_at: string;
-    run_id: string | null;
-    error: string | null;
-};
-
-type EventPayload = {
-    event?: {
-        type: string;
-        source: string;
-        created_at: string;
-        payload: JsonMap;
-    };
-    job?: JsonMap;
-};
-
-type UiNode = {
-    node_id: string;
-    role: string;
-    name: string;
-    bounds?: [number, number, number, number] | null;
-    enabled: boolean;
-    focused: boolean;
-    metadata: {
-        automation_id?: string;
-        class_name?: string;
-        process_id?: number;
-        parent?: string;
-    };
-};
-
-type ResearchArtifacts = {
-    run_id: string;
-    brief: string;
-    sources: Array<{
-        title: string;
-        provider: string;
-        url: string;
-        year?: number;
-        citation_count?: number;
-        score?: number;
-    }>;
-    artifacts: string[];
-};
-
-type RunProgress = {
-    run_id?: string;
-    depth?: string;
-    stage?: string;
-    pass_index?: number;
-    max_passes?: number;
-    query_index?: number;
-    query_total?: number;
-    active_query?: string;
-    recent_queries?: string[];
-    elapsed_seconds?: number;
-    sources_found?: number;
-    stop_reason?: string | null;
-    last_updated?: string;
-    cycle?: number;
-    max_cycles?: number;
-    worker_count?: number;
-    frontier_batch_size?: number;
-    frontier_url_count?: number;
-    direct_urls?: number;
-    judged_results?: number;
-    discovered_domains?: number;
-    novelty_rate?: number;
-    domain_count?: number;
-    passes?: JsonMap[];
-};
-
-type PcActionResponse = {
-    status: 'approval_required' | 'blocked' | 'executed';
-    decision?: {
-        approval?: Approval;
-        reasons?: string[];
-    };
-    receipt?: unknown;
-};
-
-type SelectorDebugReport = {
-    selector: string;
-    exact_matches: number;
-    ready: boolean;
-    guidance: string;
-    candidates: Array<{
-        selector: string;
-        role: string;
-        name: string;
-        score: number;
-        reasons: string[];
-    }>;
-};
-
-type WorkflowCommand = {
-    command_id: string;
-    label: string;
-    description: string;
-    template: string;
-    enabled: boolean;
-};
-
-type ChannelDelivery = {
-    created_at: string;
-    channel: string;
-    sender_id: string;
-    text: string;
-    status: string;
-};
-
-type LiveFireFailure = {
-    run_id: string;
-    task_id: string;
-    surface: string;
-    intent: string;
-    classification: string;
-    durable: boolean;
-    promotable: boolean;
-    failure_reason: string;
-    replay_payload: JsonMap;
-    existing_golden_trace?: string;
-};
-
-type LiveFireRunReview = {
-    run_id: string;
-    backend: string;
-    success: boolean;
-    passed: number;
-    failed: number;
-    task_count: number;
-    created_at: number;
-    failures: LiveFireFailure[];
-};
-
-type LiveFireReviewPayload = {
-    runs: LiveFireRunReview[];
-    failed_tasks: LiveFireFailure[];
-    milestone: {
-        real_windows_task_target: number;
-        durable_failure_target: number;
-        real_windows_tasks: number;
-        durable_promoted_failures: number;
-        unsafe_action_blocks: number;
-        ready_to_widen_scope: boolean;
-    };
-    triage_classes: string[];
-};
-
-type ShadowTrainingSummary = {
-    advisory_only: boolean;
-    ready_for_shadow_training: boolean;
-    head_order: string[];
-    total_examples: number;
-    heads: Record<string, {
-        path: string;
-        examples: number;
-        ready: boolean;
-        advisory_only: boolean;
-    }>;
-    source_paths?: string[];
-};
-
-function selectorFor(node: UiNode): string {
-    if (node.metadata.automation_id) {
-        return `automation_id=${node.metadata.automation_id}`;
-    }
-    if (node.name) {
-        return `name=${node.name}`;
-    }
-    return `role=${node.role}`;
-}
-
-function approvalAction(approval: Approval) {
-    const target = approval.action?.target || '';
-    const separator = target.indexOf('://');
-    return {
-        backend: separator >= 0 ? target.slice(0, separator) : 'windows-uia',
-        selector: separator >= 0 ? target.slice(separator + 3) : target,
-        action: approval.action?.payload?.action || 'focus',
-        hasHiddenValue: Boolean(approval.action?.payload?.value_present)
-    };
-}
-
-function runProgressSummary(progress: RunProgress | null): string {
-    if (!progress) {
-        return '';
-    }
-    const stage = String(progress.stage || '');
-    if (stage.startsWith('pc-research')) {
-        const cycle = progress.cycle ?? progress.pass_index ?? 0;
-        const maxCycles = progress.max_cycles ?? progress.max_passes;
-        const cycleText = maxCycles ? `${cycle}/${maxCycles}` : String(cycle);
-        return `Cycle ${cycleText} · ${progress.discovered_domains ?? 0} domains · ${progress.direct_urls ?? 0} reads`;
-    }
-    if (stage.startsWith('retrieval')) {
-        const pass = progress.pass_index ?? 0;
-        const maxPasses = progress.max_passes;
-        const passText = maxPasses ? `${pass}/${maxPasses}` : String(pass);
-        const queryText = progress.query_total
-            ? ` · query ${progress.query_index ?? 0}/${progress.query_total}`
-            : '';
-        const sourceText = typeof progress.sources_found === 'number'
-            ? ` · ${progress.sources_found} sources`
-            : '';
-        return `Pass ${passText}${queryText}${sourceText}`;
-    }
-    if (typeof progress.elapsed_seconds === 'number') {
-        return `${Math.round(progress.elapsed_seconds)}s elapsed`;
-    }
-    return stage || 'Progress available';
-}
-
-function runProgressQuery(progress: RunProgress | null): string {
-    if (!progress) {
-        return '';
-    }
-    if (progress.active_query) {
-        return progress.active_query;
-    }
-    const recent = Array.isArray(progress.recent_queries)
-        ? progress.recent_queries.find((query) => Boolean(query))
-        : '';
-    return recent || '';
-}
 
 function App() {
     const desktopShell = isDesktopShell();

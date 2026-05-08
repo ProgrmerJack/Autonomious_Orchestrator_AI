@@ -7,7 +7,10 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
-from .models import ResearchSource, extract_ticker_candidates as _extract_ticker_candidates
+from .models import (
+    ResearchSource,
+    extract_ticker_candidates as _extract_ticker_candidates,
+)
 from .query_policy import (
     blocked_irrelevant_site_hosts as _blocked_irrelevant_site_hosts_policy,
     blocked_market_query_site_hosts as _blocked_market_query_site_hosts_policy,
@@ -27,6 +30,7 @@ class ResearchPlanningSynthesisMixin:
             "weak": 1,
             "ungraded": 0,
         }.get(evidence_grade, 0)
+
     @staticmethod
     def _finding_confidence_rank(confidence: str) -> int:
         return {
@@ -35,6 +39,7 @@ class ResearchPlanningSynthesisMixin:
             "low": 2,
             "needs-verification": 1,
         }.get(confidence, 0)
+
     def _brief_markdown(
         self,
         objective: str,
@@ -85,6 +90,7 @@ class ResearchPlanningSynthesisMixin:
                 ]
             )
         return "\n".join(lines).rstrip() + "\n"
+
     @classmethod
     def _synthesis_source_limit(
         cls,
@@ -113,6 +119,7 @@ class ResearchPlanningSynthesisMixin:
         ):
             return max(1, min(source_count, 96))
         return max(1, min(source_count, limits.get(depth, 24)))
+
     def _build_synthesis_packet(
         self,
         objective: str,
@@ -169,6 +176,7 @@ class ResearchPlanningSynthesisMixin:
                 for source in synthesis_sources
             ],
         }
+
     def _summarize(
         self,
         objective: str,
@@ -270,6 +278,7 @@ class ResearchPlanningSynthesisMixin:
             f"Open gaps remain in: {missing_perspectives}. "
             f"Contradiction signals were observed in {conflict_count} finding clusters."
         )
+
     def _ai_scientist_synthesis(
         self,
         objective: str,
@@ -448,6 +457,7 @@ class ResearchPlanningSynthesisMixin:
                 + "follow-up studies based on your synthesis."
             )
         return self._call_ai_text(system, user)
+
     def _ai_durable_notes_synthesis(
         self,
         objective: str,
@@ -480,6 +490,7 @@ class ResearchPlanningSynthesisMixin:
             "contradiction analysis."
         )
         return self._call_ai_text(system, user)
+
     @staticmethod
     def _minimal_source_metadata_lines(sources: list[ResearchSource]) -> list[str]:
         lines: list[str] = []
@@ -492,6 +503,7 @@ class ResearchPlanningSynthesisMixin:
                 )[:320]
             )
         return lines
+
     @staticmethod
     def _resolve_final_synthesis_mode(depth: str, durable_notes: str) -> str:
         configured = (
@@ -500,6 +512,7 @@ class ResearchPlanningSynthesisMixin:
         if configured in {"hybrid", "durable-notes-only"}:
             return configured
         return "hybrid"
+
     def _initialize_durable_report(
         self,
         run_id: str,
@@ -532,6 +545,7 @@ class ResearchPlanningSynthesisMixin:
             except (OSError, ValueError):
                 self._durable_note_passes = set()
         return report_path
+
     def _append_durable_claim_notes(
         self,
         report_path: Path | None,
@@ -566,6 +580,7 @@ class ResearchPlanningSynthesisMixin:
         with report_path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
         self._durable_note_passes.add(pass_index)
+
     @classmethod
     def _compressed_claim(cls, source: ResearchSource, query: str = "") -> str:
         text = (source.abstract or source.title or "").strip()
@@ -631,6 +646,7 @@ class ResearchPlanningSynthesisMixin:
         if cls._text_signal_score(claim) < 0.07:
             return ""
         return claim[:260]
+
     def _load_durable_notes(self, run_id: str) -> str:
         report_path = self._durable_report_path(run_id)
         if report_path is None or not report_path.exists():
@@ -639,10 +655,12 @@ class ResearchPlanningSynthesisMixin:
             return report_path.read_text(encoding="utf-8")
         except OSError:
             return ""
+
     def _durable_report_path(self, run_id: str) -> Path | None:
         if not run_id:
             return None
         return self.workspace_root / "runs" / run_id / "workflows" / "report.md"
+
     def _build_research_plan(
         self,
         objective: str,
@@ -667,9 +685,7 @@ class ResearchPlanningSynthesisMixin:
         diagnostic_subquestions = self._software_agent_diagnostic_subquestions(
             objective
         )
-        diagnostic_authorities = self._software_agent_diagnostic_seed_urls(
-            objective
-        )
+        diagnostic_authorities = self._software_agent_diagnostic_seed_urls(objective)
 
         # ------------------------------------------------------------------
         # ADAPTIVE PLANNING: derive perspectives, comparative axes, and
@@ -816,9 +832,11 @@ class ResearchPlanningSynthesisMixin:
             "ai_authoritative_domains": merged_domains,
             "ai_causal_connections": ai_strategy.get("causal_connections") or [],
         }
+
     @staticmethod
     def _blocked_market_query_site_hosts() -> set[str]:
         return _blocked_market_query_site_hosts_policy()
+
     @classmethod
     def _blocked_irrelevant_site_hosts(cls, reference_query: str) -> set[str]:
         return _blocked_irrelevant_site_hosts_policy(
@@ -826,12 +844,15 @@ class ResearchPlanningSynthesisMixin:
             looks_like_market_query=cls._looks_like_market_query,
             looks_like_software_agent_query=cls._looks_like_software_agent_query,
         )
+
     @staticmethod
     def _trim_query_variant_text(candidate: str, limit: int = 240) -> str:
         return _trim_query_variant_text_policy(candidate, limit)
+
     @staticmethod
     def _has_query_scaffold_noise(text: str) -> bool:
         return _has_query_scaffold_noise_policy(text)
+
     @classmethod
     def _normalize_research_plan_query(
         cls,
@@ -847,6 +868,7 @@ class ResearchPlanningSynthesisMixin:
             is_low_signal_query_variant=cls._is_low_signal_query_variant,
             is_noisy_query_variant=cls._is_noisy_query_variant,
         )
+
     def _research_perspectives(
         self,
         query: str,
@@ -860,6 +882,7 @@ class ResearchPlanningSynthesisMixin:
         a hardcoded list — the AI derives what angles are relevant instead.
         """
         return self._ai_generate_perspectives(query, objective, depth)
+
     @classmethod
     def _entity_queries(cls, query: str, objective: str) -> list[str]:
         combined = " ".join(part for part in (query, objective) if part).strip()
@@ -946,6 +969,7 @@ class ResearchPlanningSynthesisMixin:
             seen_queries.add(normalized)
             deduped.append(text)
         return deduped[:18]
+
     @staticmethod
     def _question_to_keywords(question: str, query: str) -> str:
         """Convert a full subquestion sentence into a short keyword phrase
@@ -988,6 +1012,7 @@ class ResearchPlanningSynthesisMixin:
         keywords = [w for w in words if w not in stop_words]
         phrase = " ".join(keywords[:6])
         return phrase[:60].strip() if len(phrase) >= 6 else ""
+
     @staticmethod
     def _clean_objective(objective: str) -> str:
         cleaned = re.sub(r"\s+", " ", objective).strip()
@@ -1000,6 +1025,7 @@ class ResearchPlanningSynthesisMixin:
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix) :].strip()
         return cleaned
+
     def _pc_context_summary(
         self,
         pc_context: dict[str, Any] | None,
@@ -1071,6 +1097,7 @@ class ResearchPlanningSynthesisMixin:
             "direct_urls": direct_urls[:6],
             "discovered_domains": discovered_domains[:6],
         }
+
     def _analysis_report_markdown(
         self,
         objective: str,
@@ -1170,6 +1197,7 @@ class ResearchPlanningSynthesisMixin:
             ]
         )
         return "\n".join(lines).rstrip() + "\n"
+
     @classmethod
     def _query_from_objective(cls, objective: str) -> str:
         cleaned = re.sub(r"\s+", " ", objective).strip()
@@ -1180,13 +1208,12 @@ class ResearchPlanningSynthesisMixin:
         )
         for prefix in prefixes:
             cleaned = cleaned.replace(prefix, "")
-        diagnostic_queries = cls._software_agent_diagnostic_queries(
-            cleaned
-        )
+        diagnostic_queries = cls._software_agent_diagnostic_queries(cleaned)
         if diagnostic_queries:
             return diagnostic_queries[0]
         distilled = cls._query_core_terms(cleaned)
         return distilled[:240].strip() or cleaned[:240].strip() or objective[:240]
+
     @classmethod
     def _software_agent_diagnostic_queries(cls, objective: str) -> list[str]:
         if not cls._looks_like_software_agent_diagnostic_objective(objective):
@@ -1246,7 +1273,9 @@ class ResearchPlanningSynthesisMixin:
         if "mcp" in lower:
             queries.append("model context protocol research agent tool routing")
         if "browser" in lower or "sandbox" in lower:
-            queries.append("computer use browser automation research agent architecture")
+            queries.append(
+                "computer use browser automation research agent architecture"
+            )
 
         deduped: list[str] = []
         seen: set[str] = set()
@@ -1258,6 +1287,7 @@ class ResearchPlanningSynthesisMixin:
             seen.add(normalized)
             deduped.append(text)
         return deduped[:14]
+
     @classmethod
     def _software_agent_diagnostic_seed_urls(cls, objective: str) -> list[str]:
         if not cls._looks_like_software_agent_diagnostic_objective(objective):
@@ -1280,6 +1310,7 @@ class ResearchPlanningSynthesisMixin:
             if candidate not in deduped:
                 deduped.append(candidate)
         return deduped[:8]
+
     @classmethod
     def _software_agent_diagnostic_perspectives(
         cls,
@@ -1372,6 +1403,7 @@ class ResearchPlanningSynthesisMixin:
                 }
             )
         return perspectives[:5]
+
     @classmethod
     def _software_agent_diagnostic_subquestions(cls, objective: str) -> list[str]:
         if not cls._looks_like_software_agent_diagnostic_objective(objective):
@@ -1387,6 +1419,7 @@ class ResearchPlanningSynthesisMixin:
                 "Which crawl, frontier, or queue limits prevent broad multi-thousand URL coverage?"
             )
         return questions[:5]
+
     @classmethod
     def _split_depth(cls, objective: str) -> tuple[str, str]:
         match = re.search(r"\[(quick|standard|multi-hour|adaptive)\]\s*", objective)
@@ -1398,10 +1431,12 @@ class ResearchPlanningSynthesisMixin:
         if marker == "adaptive":
             return cls.adaptive_depth_for_objective(cleaned), cleaned
         return marker, cleaned
+
     @classmethod
     def research_depth_for_objective(cls, objective: str) -> str:
         depth, _cleaned = cls._split_depth(objective)
         return depth
+
     @classmethod
     def adaptive_depth_for_objective(cls, objective: str) -> str:
         """Infer research effort from task complexity using AI.
@@ -1451,6 +1486,7 @@ class ResearchPlanningSynthesisMixin:
                 return resolved
         except Exception as _depth_exc:
             import warnings
+
             warnings.warn(
                 f"AI research-depth classification failed ({_depth_exc!r}); "
                 "falling back to heuristic depth classification.",
@@ -1482,6 +1518,7 @@ class ResearchPlanningSynthesisMixin:
         if any(c in lower for c in ("compare", "analyze", "benchmark")):
             return "standard"
         return "quick"
+
     @staticmethod
     def _looks_like_simple_lookup(lower: str) -> bool:
         if len(lower.split()) <= 10 and any(
@@ -1509,6 +1546,7 @@ class ResearchPlanningSynthesisMixin:
                 "single source",
             )
         )
+
     @staticmethod
     def _looks_like_comprehensive_research(lower: str) -> bool:
         comprehensive_cues = (
@@ -1546,6 +1584,7 @@ class ResearchPlanningSynthesisMixin:
             )
             >= 3
         )
+
     @classmethod
     def _query_variants(cls, query: str, depth: str = "standard") -> list[str]:
         """Return query variants generated from objective terms, not fixed templates."""
@@ -1617,6 +1656,7 @@ class ResearchPlanningSynthesisMixin:
             if len(deduped) >= max_variants:
                 break
         return deduped
+
     @classmethod
     def _ai_query_variants(cls, query: str, depth: str = "standard") -> list[str]:
         """Generate search queries using AI.
@@ -1704,6 +1744,7 @@ class ResearchPlanningSynthesisMixin:
         except Exception:
             pass
         return []
+
     @classmethod
     def _query_core_terms(cls, query: str) -> str:
         """Distill long prompts into domain terms while removing orchestration boilerplate."""

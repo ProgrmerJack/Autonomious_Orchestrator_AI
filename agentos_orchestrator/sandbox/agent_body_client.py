@@ -84,11 +84,13 @@ def resolve_agent_body_invocation(
     # The Rust crate is an experimental state proxy, not a native OS backend.
     # Do not auto-discover and run it just because the repo happens to contain
     # a Cargo manifest. Using it must be an explicit choice via metadata or env.
-    if not agent_body_manifest and os.environ.get("AGENTOS_ENABLE_AGENT_BODY", "") != "1":
+    if (
+        not agent_body_manifest
+        and os.environ.get("AGENTOS_ENABLE_AGENT_BODY", "") != "1"
+    ):
         return []
     manifest = Path(
-        agent_body_manifest
-        or str(Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
+        agent_body_manifest or str(Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
     )
     if not manifest.exists() or shutil.which("cargo") is None:
         return []

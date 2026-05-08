@@ -58,6 +58,9 @@ class SemanticEmbedder:
         if not texts:
             return
         processed = [self._preprocess(t) for t in texts]
+        if len(set(processed)) < 2:
+            self._is_fitted = False
+            return
         # Adjust max_df for tiny corpora to avoid ValueError
         n_docs = len(processed)
         if n_docs == 1:
@@ -76,6 +79,9 @@ class SemanticEmbedder:
         )
         tfidf_matrix = self.vectorizer.fit_transform(processed)
         n_features = tfidf_matrix.shape[1]
+        if n_features < 2:
+            self._is_fitted = False
+            return
         n_components = min(n_features, self.n_components, n_docs)
         if n_components < 1:
             self._is_fitted = False
@@ -153,6 +159,27 @@ class SemanticEpisodicMemory:
         self._events: list[dict[str, Any]] = []
         self._embeddings: list[np.ndarray] = []
 
+    @staticmethod
+    def _event_text_payload(
+        objective: str,
+        action: UiAction,
+        observation: str,
+        outcome: str,
+    ) -> str:
+        return (
+            f"{objective} {action.action_type} {action.selector} "
+            f"{observation} {outcome}"
+        )
+
+    @classmethod
+    def _stored_event_text(cls, event: dict[str, Any]) -> str:
+        return cls._event_text_payload(
+            str(event["objective"]),
+            event["action"],
+            str(event["observation"]),
+            str(event["outcome"]),
+        )
+
     def record(
         self,
         objective: str,
@@ -164,10 +191,14 @@ class SemanticEpisodicMemory:
     ) -> str:
         """Record an event with its semantic embedding."""
         event_id = f"sem_{len(self._events)}"
-        text = f"{objective} {action.action_type} {action.selector} {observation} {outcome}"
-        # Auto-fit on first record so embeddings are meaningful
+        text = self._event_text_payload(objective, action, observation, outcome)
+        # Fit on the accumulated corpus once there is enough vocabulary/variance.
         if not self.embedder._is_fitted:
-            self.embedder.fit([text])
+            existing_texts = [self._stored_event_text(event) for event in self._events]
+            all_texts = [*existing_texts, text]
+            self.embedder.fit(all_texts)
+            if self.embedder._is_fitted and existing_texts:
+                self._embeddings = [self.embedder.embed(item) for item in existing_texts]
         embedding = self.embedder.embed(text)
         self._events.append(
             {
@@ -183,10 +214,7 @@ class SemanticEpisodicMemory:
         self._embeddings.append(embedding)
         # Refit embedder periodically as vocabulary grows
         if len(self._events) % 20 == 0:
-            all_texts = [
-                f"{e['objective']} {e['action'].action_type} {e['action'].selector} {e['observation']} {e['outcome']}"
-                for e in self._events
-            ]
+            all_texts = [self._stored_event_text(event) for event in self._events]
             self.embedder.fit(all_texts)
             # Re-embed all events with updated model
             self._embeddings = [self.embedder.embed(t) for t in all_texts]

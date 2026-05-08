@@ -1,20 +1,46 @@
 from __future__ import annotations
 
-import base64
-import binascii
+import ctypes
+import io
 import json
 import platform
-import shutil
 import subprocess
-from pathlib import Path
+import time
+from typing import Any
 
 from .base import BackendUnavailable, UiAction, UiNode
 
+try:
+    from comtypes import COMError  # type: ignore[import-not-found]
+
+    _ComError = COMError
+except ImportError:
+    _UIA_EXCEPTIONS: tuple[type[BaseException], ...] = (
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    )
+else:
+    _UIA_EXCEPTIONS = (
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        _ComError,
+    )
+
 
 class WindowsUiaBackend:
-    """Windows UI Automation backend through PowerShell/.NET."""
+    """Windows UI Automation backend through in-process UIA/Win32 APIs."""
 
     name = "windows-uia"
+
+    _MOUSEEVENTF_MOVE = 0x0001
+    _MOUSEEVENTF_LEFTDOWN = 0x0002
+    _MOUSEEVENTF_LEFTUP = 0x0004
 
     def __init__(
         self,
@@ -23,466 +49,416 @@ class WindowsUiaBackend:
         max_depth: int = 7,
         max_nodes: int = 2000,
     ) -> None:
-        self.powershell_path = powershell_path or self._find_powershell()
+        # Preserve the parameter for compatibility with older call sites and
+        # tests, but the backend no longer shells out through PowerShell.
+        self.powershell_path = powershell_path
         self.timeout_seconds = timeout_seconds
         self.max_depth = max_depth
         self.max_nodes = max_nodes
 
     def available(self) -> bool:
-        is_windows = platform.system() == "Windows"
-        return is_windows and self.powershell_path is not None
+        if platform.system() != "Windows":
+            return False
+        try:
+            self._automation_module()
+        except BackendUnavailable:
+            return False
+        return True
 
     def snapshot(self) -> list[UiNode]:
         self._ensure_available()
-        payload = self._run_json(self._snapshot_script())
-        nodes: list[UiNode] = []
-        for item in payload.get("nodes", []):
-            bounds = None
-            if item.get("x") is not None:
-                bounds = (
-                    int(item["x"]),
-                    int(item["y"]),
-                    int(item["width"]),
-                    int(item["height"]),
-                )
-            nodes.append(
-                UiNode(
-                    node_id=str(item.get("node_id", "")),
-                    role=str(item.get("role", "unknown")).replace(
-                        "ControlType.",
-                        "",
-                    ),
-                    name=str(item.get("name", "")),
-                    bounds=bounds,
-                    enabled=bool(item.get("enabled", True)),
-                    focused=bool(item.get("focused", False)),
-                    metadata=dict(item.get("metadata") or {}),
-                )
-            )
-        return nodes
+        return [node for _control, node in self._live_controls()]
 
     def capture(self) -> bytes:
         self._ensure_available()
-        payload = self._run_text(self._capture_script())
+        payload = self._capture_png_bytes()
         if not payload:
             return b""
-        try:
-            return base64.b64decode(payload)
-        except (ValueError, binascii.Error) as exc:
-            raise BackendUnavailable("Windows screenshot payload was invalid") from exc
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise BackendUnavailable("Windows screenshot payload was invalid")
+        return payload
 
     def perform(self, action: UiAction) -> str:
         self._ensure_available()
-        payload = self._run_json(
-            self._perform_script(
-                action.action_type,
-                action.selector,
-                action.value,
+        if action.action_type == "launch_app":
+            return json.dumps(self._launch_app(action), sort_keys=True)
+        if action.action_type == "hotkey":
+            return json.dumps(self._send_hotkey(action), sort_keys=True)
+
+        matched = self._find_target(action.selector)
+        if matched is None:
+            raise BackendUnavailable(
+                f"No UI element matched selector '{action.selector}'"
             )
-        )
-        return json.dumps(payload, sort_keys=True)
+        target, node = matched
+        focus_error = None
+        status = "matched"
+        try:
+            target.SetFocus()
+            status = "focused"
+        except _UIA_EXCEPTIONS as exc:
+            focus_error = str(exc)
 
-    def _run_json(self, script: str) -> dict:
-        output = self._run_text(script)
-        if not output:
-            return {}
-        return json.loads(output)
+        draw_path: list[dict[str, int]] | None = None
+        if action.action_type == "draw_path" and focus_error is not None:
+            try:
+                target.GetTopLevelControl().SetFocus()
+            except _UIA_EXCEPTIONS:
+                pass
 
-    def _run_text(self, script: str) -> str:
-        if self.powershell_path is None:
-            raise BackendUnavailable("PowerShell is not available")
-        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        result = subprocess.run(
-            [
-                self.powershell_path,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                encoded,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise BackendUnavailable(result.stderr.strip() or result.stdout)
-        return result.stdout.strip()
+        if action.action_type in {"invoke", "click"}:
+            self._invoke_click(target)
+            status = "invoked"
+        elif action.action_type in {"type", "set_text", "set_value"}:
+            status = self._set_text(target, str(action.value or ""))
+        elif action.action_type == "open_url":
+            status = self._open_url(target, str(action.value or ""))
+        elif action.action_type == "cell_edit":
+            status = self._edit_cell(target, action)
+        elif action.action_type == "draw_path":
+            draw_path = self._draw_path(target, str(action.value or ""))
+            status = "drawn"
+        elif action.action_type != "focus":
+            raise BackendUnavailable(
+                "Windows UI Automation action "
+                f"'{action.action_type}' is not supported"
+            )
 
-    def _capture_script(self) -> str:
-        return """
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$Bitmap = New-Object System.Drawing.Bitmap $Bounds.Width, $Bounds.Height
-$Graphics = [System.Drawing.Graphics]::FromImage($Bitmap)
-try {
-  $Graphics.CopyFromScreen(
-    $Bounds.Left,
-    $Bounds.Top,
-    0,
-    0,
-    $Bitmap.Size,
-    [System.Drawing.CopyPixelOperation]::SourceCopy
-  )
-  $Stream = New-Object System.IO.MemoryStream
-  try {
-    $Bitmap.Save($Stream, [System.Drawing.Imaging.ImageFormat]::Png)
-    [Convert]::ToBase64String($Stream.ToArray())
-  } finally {
-    $Stream.Dispose()
-  }
-} finally {
-  $Graphics.Dispose()
-  $Bitmap.Dispose()
-}
-"""
-
-    def _snapshot_script(self) -> str:
-        return f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-$MaxDepth = {self.max_depth}
-$MaxNodes = {self.max_nodes}
-$Items = New-Object System.Collections.Generic.List[object]
-
-function Add-Node($Element, [int]$Depth, [string]$ParentId) {{
-  if ($Items.Count -ge $MaxNodes) {{ return }}
-  try {{
-    $Current = $Element.Current
-    $Rect = $Current.BoundingRectangle
-    $NodeId = ('{{0}}:{{1}}:{{2}}' -f `
-      $Depth,
-      $Items.Count,
-      $Current.AutomationId
-    )
-    $Items.Add([pscustomobject]@{{
-      node_id = $NodeId
-      role = $Current.ControlType.ProgrammaticName
-      name = $Current.Name
-      x = [int]$Rect.X
-      y = [int]$Rect.Y
-      width = [int]$Rect.Width
-      height = [int]$Rect.Height
-      enabled = [bool]$Current.IsEnabled
-      focused = [bool]$Current.HasKeyboardFocus
-      metadata = @{{
-        automation_id = $Current.AutomationId
-        class_name = $Current.ClassName
-        process_id = $Current.ProcessId
-        parent = $ParentId
-      }}
-    }})
-    if ($Depth -ge $MaxDepth) {{ return }}
-    $Children = $Element.FindAll(
-      [System.Windows.Automation.TreeScope]::Children,
-      [System.Windows.Automation.Condition]::TrueCondition
-    )
-    foreach ($Child in $Children) {{ Add-Node $Child ($Depth + 1) $NodeId }}
-  }} catch {{ }}
-}}
-
-$Root = [System.Windows.Automation.AutomationElement]::RootElement
-$Windows = $Root.FindAll(
-  [System.Windows.Automation.TreeScope]::Children,
-  [System.Windows.Automation.Condition]::TrueCondition
-)
-foreach ($Window in $Windows) {{ Add-Node $Window 0 '' }}
-[pscustomobject]@{{ nodes = $Items }} | ConvertTo-Json -Depth 8 -Compress
-"""
-
-    def _perform_script(
-        self,
-        action_type: str,
-        selector: str,
-        value: str | None,
-    ) -> str:
-        selector_b64 = self._b64(selector)
-        action_b64 = self._b64(action_type)
-        value_b64 = self._b64(value or "")
-        return f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type @"
-using System.Runtime.InteropServices;
-public static class AgentOSMouse {{
-  [DllImport("user32.dll")]
-  public static extern bool SetCursorPos(int X, int Y);
-  [DllImport("user32.dll")]
-  public static extern void mouse_event(
-    int dwFlags,
-    int dx,
-    int dy,
-    int data,
-    int extraInfo
-  );
-}}
-"@
-$Selector = [Text.Encoding]::UTF8.GetString(
-  [Convert]::FromBase64String('{selector_b64}')
-)
-$ActionType = [Text.Encoding]::UTF8.GetString(
-  [Convert]::FromBase64String('{action_b64}')
-)
-$Value = [Text.Encoding]::UTF8.GetString(
-  [Convert]::FromBase64String('{value_b64}')
-)
-$IgnoreCase = [System.StringComparison]::OrdinalIgnoreCase
-
-if ($ActionType -eq 'launch_app') {{
-  $LaunchTarget = if ([string]::IsNullOrWhiteSpace($Value)) {{
-    $Selector
-  }} else {{
-    $Value
-  }}
-  $Process = Start-Process -FilePath $LaunchTarget -PassThru
-  [pscustomobject]@{{
-    status = 'launched'
-    action_type = $ActionType
-    selector = $Selector
-    launched = $LaunchTarget
-    process_id = $Process.Id
-  }} | ConvertTo-Json -Depth 4 -Compress
-  return
-}}
-
-if ($ActionType -eq 'hotkey') {{
-  [System.Windows.Forms.SendKeys]::SendWait($Value)
-  [pscustomobject]@{{
-    status = 'hotkey-sent'
-    action_type = $ActionType
-    selector = $Selector
-    value = $Value
-  }} | ConvertTo-Json -Depth 4 -Compress
-  return
-}}
-
-function Get-Needle($Prefix) {{
-  if ($Selector.StartsWith($Prefix)) {{
-    return $Selector.Substring($Prefix.Length)
-  }}
-  return $null
-}}
-
-function Matches-Clause($Element, [string]$Clause) {{
-  try {{
-    $Current = $Element.Current
-    $Name = [string]$Current.Name
-    $AutomationId = [string]$Current.AutomationId
-    $Role = [string]$Current.ControlType.ProgrammaticName
-    $ClassName = [string]$Current.ClassName
-    $ProcessId = [string]$Current.ProcessId
-    if ($Clause.StartsWith('name=')) {{
-      $Needle = $Clause.Substring(5)
-      return $Name.IndexOf($Needle, $IgnoreCase) -ge 0
-    }}
-    if ($Clause.StartsWith('automation_id=')) {{
-      $Needle = $Clause.Substring(14)
-      return $AutomationId.IndexOf($Needle, $IgnoreCase) -ge 0
-    }}
-    if ($Clause.StartsWith('role=')) {{
-      $Needle = $Clause.Substring(5)
-      return $Role.IndexOf($Needle, $IgnoreCase) -ge 0
-    }}
-    if ($Clause.StartsWith('class_name=')) {{
-      $Needle = $Clause.Substring(11)
-      return $ClassName.IndexOf($Needle, $IgnoreCase) -ge 0
-    }}
-    if ($Clause.StartsWith('process_id=')) {{
-      $Needle = $Clause.Substring(11)
-      return $ProcessId -eq $Needle
-    }}
-    return (
-      $Name.IndexOf($Clause, $IgnoreCase) -ge 0 -or
-      $AutomationId.IndexOf($Clause, $IgnoreCase) -ge 0 -or
-      $ClassName.IndexOf($Clause, $IgnoreCase) -ge 0
-    )
-  }} catch {{ }}
-  return $false
-}}
-
-function Matches($Element) {{
-  $Clauses = $Selector -split '&&'
-  foreach ($Clause in $Clauses) {{
-    $Trimmed = $Clause.Trim()
-    if ([string]::IsNullOrWhiteSpace($Trimmed)) {{ continue }}
-    if (-not (Matches-Clause $Element $Trimmed)) {{ return $false }}
-  }}
-  return $true
-}}
-
-function Find-Target() {{
-  $Root = [System.Windows.Automation.AutomationElement]::RootElement
-  $Queue = New-Object System.Collections.Queue
-  $Children = $Root.FindAll(
-    [System.Windows.Automation.TreeScope]::Children,
-    [System.Windows.Automation.Condition]::TrueCondition
-  )
-  foreach ($Child in $Children) {{ $Queue.Enqueue($Child) }}
-  $Visited = 0
-  while ($Queue.Count -gt 0 -and $Visited -lt {self.max_nodes * 10}) {{
-    $Visited += 1
-    $Element = $Queue.Dequeue()
-    if (Matches $Element) {{ return $Element }}
-    try {{
-      $Children = $Element.FindAll(
-        [System.Windows.Automation.TreeScope]::Children,
-        [System.Windows.Automation.Condition]::TrueCondition
-      )
-      foreach ($Child in $Children) {{ $Queue.Enqueue($Child) }}
-    }} catch {{ }}
-  }}
-  return $null
-}}
-
-function Find-WindowAncestor($Element) {{
-  $Walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-  $CurrentElement = $Element
-  while ($null -ne $CurrentElement) {{
-    try {{
-      if ($CurrentElement.Current.ControlType -eq
-          [System.Windows.Automation.ControlType]::Window) {{
-        return $CurrentElement
-      }}
-      $CurrentElement = $Walker.GetParent($CurrentElement)
-    }} catch {{ return $null }}
-  }}
-  return $null
-}}
-
-function Get-PointValue($Point, [string]$Name, [int]$Index) {{
-  if ($null -ne $Point.PSObject.Properties[$Name]) {{
-    return [double]$Point.$Name
-  }}
-  return [double]$Point[$Index]
-}}
-
-function Resolve-Coordinate([double]$Raw, [double]$Origin, [double]$Size) {{
-  if ([Math]::Abs($Raw) -le 1.0) {{
-    return [int][Math]::Round($Origin + ($Raw * $Size))
-  }}
-  return [int][Math]::Round($Raw)
-}}
-
-function Invoke-DrawPath($Element, [string]$PathJson) {{
-  $Rect = $Element.Current.BoundingRectangle
-  if ($Rect.Width -le 0 -or $Rect.Height -le 0) {{
-    throw "Cannot draw on a target with empty bounds"
-  }}
-  $Parsed = $PathJson | ConvertFrom-Json
-  if ($null -ne $Parsed.PSObject.Properties['points']) {{
-    $Points = @($Parsed.points)
-  }} else {{
-    $Points = @($Parsed)
-  }}
-  if ($Points.Count -lt 2) {{ throw "draw_path requires at least two points" }}
-
-  $Resolved = New-Object System.Collections.Generic.List[object]
-  foreach ($Point in $Points) {{
-    $RawX = Get-PointValue $Point 'x' 0
-    $RawY = Get-PointValue $Point 'y' 1
-    $X = Resolve-Coordinate $RawX $Rect.X $Rect.Width
-    $Y = Resolve-Coordinate $RawY $Rect.Y $Rect.Height
-    $Resolved.Add([pscustomobject]@{{ x = $X; y = $Y }})
-  }}
-
-  [AgentOSMouse]::SetCursorPos($Resolved[0].x, $Resolved[0].y) | Out-Null
-  [AgentOSMouse]::mouse_event(0x0002, 0, 0, 0, 0)
-  Start-Sleep -Milliseconds 40
-  $CurrentX = $Resolved[0].x
-  $CurrentY = $Resolved[0].y
-  for ($Index = 1; $Index -lt $Resolved.Count; $Index += 1) {{
-    $Previous = $Resolved[$Index - 1]
-    $Point = $Resolved[$Index]
-    $Dx = $Point.x - $Previous.x
-    $Dy = $Point.y - $Previous.y
-    $Steps = [Math]::Max(1, [int][Math]::Ceiling(
-      [Math]::Max([Math]::Abs($Dx), [Math]::Abs($Dy)) / 18.0
-    ))
-    for ($Step = 1; $Step -le $Steps; $Step += 1) {{
-      $X = [int][Math]::Round($Previous.x + (($Dx * $Step) / $Steps))
-      $Y = [int][Math]::Round($Previous.y + (($Dy * $Step) / $Steps))
-      [AgentOSMouse]::mouse_event(0x0001, $X - $CurrentX, $Y - $CurrentY, 0, 0)
-      $CurrentX = $X
-      $CurrentY = $Y
-      Start-Sleep -Milliseconds 8
-    }}
-  }}
-  [AgentOSMouse]::mouse_event(0x0004, 0, 0, 0, 0)
-  return $Resolved
-}}
-
-$Target = Find-Target
-if ($null -eq $Target) {{ throw "No UI element matched selector '$Selector'" }}
-$FocusError = $null
-$Status = 'matched'
-try {{
-  $Target.SetFocus()
-  $Status = 'focused'
-}} catch {{
-  $FocusError = $_.Exception.Message
-}}
-if ($ActionType -eq 'draw_path' -and $null -ne $FocusError) {{
-  $WindowTarget = Find-WindowAncestor $Target
-  if ($null -ne $WindowTarget) {{
-    try {{ $WindowTarget.SetFocus() }} catch {{ }}
-  }}
-}}
-if ($ActionType -eq 'invoke' -or $ActionType -eq 'click') {{
-  $Pattern = $null
-  if ($Target.TryGetCurrentPattern(
-      [System.Windows.Automation.InvokePattern]::Pattern,
-      [ref]$Pattern
-  )) {{
-    $Pattern.Invoke()
-    $Status = 'invoked'
-  }}
-}}
-if ($ActionType -eq 'set_text' -or $ActionType -eq 'type') {{
-  $Pattern = $null
-  if ($Target.TryGetCurrentPattern(
-      [System.Windows.Automation.ValuePattern]::Pattern,
-      [ref]$Pattern
-  )) {{
-    $Pattern.SetValue($Value)
-    $Status = 'value-set'
-  }} else {{
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
-    $Status = 'typed'
-  }}
-}}
-$DrawPath = $null
-if ($ActionType -eq 'draw_path') {{
-  $DrawPath = Invoke-DrawPath $Target $Value
-  $Status = 'drawn'
-}}
-[pscustomobject]@{{
-  status = $Status
-  action_type = $ActionType
-  selector = $Selector
-  matched_name = $Target.Current.Name
-  matched_role = $Target.Current.ControlType.ProgrammaticName
-  focus_error = $FocusError
-  draw_path = $DrawPath
-}} | ConvertTo-Json -Depth 4 -Compress
-"""
+        receipt: dict[str, Any] = {
+            "status": status,
+            "action_type": action.action_type,
+            "selector": action.selector,
+            "matched_name": node.name,
+            "matched_role": node.role,
+            "focus_error": focus_error,
+            "draw_path": draw_path,
+        }
+        if action.action_type == "cell_edit":
+            sandbox_receipt = dict(
+                action.metadata.get("sandbox_receipt") or {}
+            )
+            if sandbox_receipt:
+                receipt["cell_edit"] = sandbox_receipt
+        return json.dumps(receipt, sort_keys=True)
 
     def _ensure_available(self) -> None:
         if not self.available():
-            raise BackendUnavailable("Windows UI Automation is not available")
+            raise BackendUnavailable(
+                "Windows UI Automation is not available; install the "
+                "'uiautomation' package on Windows."
+            )
 
     @staticmethod
-    def _b64(value: str) -> str:
-        return base64.b64encode(value.encode("utf-8")).decode("ascii")
+    def _automation_module() -> Any:
+        try:
+            import uiautomation as auto  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BackendUnavailable("uiautomation is not installed") from exc
+        return auto
 
-    @staticmethod
-    def _find_powershell() -> str | None:
-        for name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
-            path = shutil.which(name)
-            if path:
-                return str(Path(path))
+    def _capture_png_bytes(self) -> bytes:
+        try:
+            import mss  # type: ignore[import-not-found]
+            from PIL import Image
+        except ImportError:
+            try:
+                from PIL import ImageGrab
+            except ImportError as exc:
+                raise BackendUnavailable(
+                    "No in-process screen capture backend is installed"
+                ) from exc
+            image = ImageGrab.grab(all_screens=True)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        with mss.mss() as sct:
+            monitor = sct.monitors[0]
+            shot = sct.grab(monitor)
+            image = Image.frombytes("RGB", shot.size, shot.rgb)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+
+    def _live_controls(self) -> list[tuple[Any, UiNode]]:
+        auto = self._automation_module()
+        try:
+            root = auto.GetRootControl()
+            top_level = list(root.GetChildren())
+        except _UIA_EXCEPTIONS as exc:
+            raise BackendUnavailable(
+                "Could not enumerate Windows UIA controls"
+            ) from exc
+
+        controls: list[tuple[Any, UiNode]] = []
+        for child in top_level:
+            self._collect_controls(child, 0, "", controls)
+            if len(controls) >= self.max_nodes:
+                break
+        return controls
+
+    def _collect_controls(
+        self,
+        control: Any,
+        depth: int,
+        parent_id: str,
+        controls: list[tuple[Any, UiNode]],
+    ) -> None:
+        if depth > self.max_depth or len(controls) >= self.max_nodes:
+            return
+        try:
+            automation_id = str(getattr(control, "AutomationId", "") or "")
+            node_id = f"{depth}:{len(controls)}:{automation_id}"
+            node = UiNode(
+                node_id=node_id,
+                role=self._control_role(control),
+                name=str(getattr(control, "Name", "") or ""),
+                bounds=self._control_bounds(control),
+                enabled=bool(getattr(control, "IsEnabled", True)),
+                focused=bool(getattr(control, "HasKeyboardFocus", False)),
+                metadata={
+                    "automation_id": automation_id,
+                    "class_name": str(getattr(control, "ClassName", "") or ""),
+                    "process_id": getattr(control, "ProcessId", None),
+                    "parent": parent_id,
+                },
+            )
+        except _UIA_EXCEPTIONS:
+            return
+
+        controls.append((control, node))
+        if depth >= self.max_depth or len(controls) >= self.max_nodes:
+            return
+        try:
+            children = list(control.GetChildren())
+        except _UIA_EXCEPTIONS:
+            return
+        for child in children:
+            self._collect_controls(child, depth + 1, node.node_id, controls)
+            if len(controls) >= self.max_nodes:
+                return
+
+    def _find_target(self, selector: str) -> tuple[Any, UiNode] | None:
+        cleaned = str(selector or "").strip()
+        if not cleaned:
+            return None
+        for control, node in self._live_controls():
+            if self._selector_matches(cleaned, node):
+                return control, node
         return None
+
+    @staticmethod
+    def _selector_matches(selector: str, node: UiNode) -> bool:
+        for clause in selector.split("&&"):
+            cleaned = clause.strip()
+            if not cleaned:
+                continue
+            if not WindowsUiaBackend._selector_clause_matches(cleaned, node):
+                return False
+        return True
+
+    @staticmethod
+    def _selector_clause_matches(clause: str, node: UiNode) -> bool:
+        values = {
+            "name": node.name,
+            "automation_id": str(node.metadata.get("automation_id") or ""),
+            "role": node.role,
+            "class_name": str(node.metadata.get("class_name") or ""),
+            "process_id": str(node.metadata.get("process_id") or ""),
+            "node_id": node.node_id,
+        }
+        if "=" in clause:
+            field, expected = clause.split("=", 1)
+            normalized_field = field.strip().lower()
+            if normalized_field in values:
+                return WindowsUiaBackend._contains_match(
+                    values[normalized_field],
+                    expected,
+                )
+        return any(
+            WindowsUiaBackend._contains_match(value, clause)
+            for value in values.values()
+        )
+
+    @staticmethod
+    def _contains_match(actual: Any, expected: Any) -> bool:
+        actual_text = str(actual or "").strip().lower()
+        expected_text = str(expected or "").strip().lower()
+        if not actual_text or not expected_text:
+            return False
+        return expected_text in actual_text
+
+    @staticmethod
+    def _control_role(control: Any) -> str:
+        role = str(getattr(control, "ControlTypeName", "Unknown") or "Unknown")
+        if role.endswith("Control"):
+            return role[: -len("Control")]
+        return role.replace("ControlType.", "")
+
+    @staticmethod
+    def _control_bounds(control: Any) -> tuple[int, int, int, int] | None:
+        try:
+            rect = getattr(control, "BoundingRectangle", None)
+            if rect is None:
+                return None
+            width = int(getattr(rect, "width", 0) or 0)
+            height = int(getattr(rect, "height", 0) or 0)
+            if width <= 0 or height <= 0:
+                return None
+            return (
+                int(getattr(rect, "left", 0) or 0),
+                int(getattr(rect, "top", 0) or 0),
+                width,
+                height,
+            )
+        except _UIA_EXCEPTIONS:
+            return None
+
+    def _launch_app(self, action: UiAction) -> dict[str, Any]:
+        launch_target = str(action.value or action.selector or "").strip()
+        if not launch_target:
+            raise BackendUnavailable(
+                "launch_app requires an executable target"
+            )
+        try:
+            process = subprocess.Popen(launch_target)
+        except OSError:
+            process = subprocess.Popen(launch_target, shell=True)
+        return {
+            "status": "launched",
+            "action_type": action.action_type,
+            "selector": action.selector,
+            "launched": launch_target,
+            "process_id": process.pid,
+        }
+
+    def _send_hotkey(self, action: UiAction) -> dict[str, Any]:
+        auto = self._automation_module()
+        hotkey = str(action.value or "")
+        auto.SendKeys(hotkey, waitTime=0.05, charMode=False)
+        return {
+            "status": "hotkey-sent",
+            "action_type": action.action_type,
+            "selector": action.selector,
+            "value": hotkey,
+        }
+
+    def _invoke_click(self, target: Any) -> None:
+        try:
+            target.Click(simulateMove=False, waitTime=0.05)
+            return
+        except _UIA_EXCEPTIONS:
+            pass
+        bounds = self._control_bounds(target)
+        if bounds is None:
+            raise BackendUnavailable("Target has no clickable bounds")
+        left, top, width, height = bounds
+        self._mouse_left_click(left + width // 2, top + height // 2)
+
+    def _set_text(self, target: Any, value: str) -> str:
+        try:
+            target.GetValuePattern().SetValue(value)
+            return "value-set"
+        except _UIA_EXCEPTIONS:
+            target.SendKeys(value, waitTime=0.05)
+            return "typed"
+
+    def _open_url(self, target: Any, value: str) -> str:
+        self._set_text(target, value)
+        try:
+            target.SendKeys("{Enter}", waitTime=0.05, charMode=False)
+        except _UIA_EXCEPTIONS:
+            auto = self._automation_module()
+            auto.SendKeys("{Enter}", waitTime=0.05, charMode=False)
+        return "navigated"
+
+    def _edit_cell(self, target: Any, action: UiAction) -> str:
+        value = str(action.value or "")
+        try:
+            target.SendKeys(value, waitTime=0.05)
+        except _UIA_EXCEPTIONS:
+            return self._set_text(target, value)
+        return "cell-edited"
+
+    def _draw_path(self, target: Any, path_json: str) -> list[dict[str, int]]:
+        bounds = self._control_bounds(target)
+        if bounds is None:
+            raise BackendUnavailable(
+                "Cannot draw on a target with empty bounds"
+            )
+        left, top, width, height = bounds
+        parsed = json.loads(path_json)
+        points = parsed.get("points") if isinstance(parsed, dict) else parsed
+        if not isinstance(points, list) or len(points) < 2:
+            raise BackendUnavailable("draw_path requires at least two points")
+        resolved = [
+            self._resolve_point(point, left, top, width, height)
+            for point in points
+        ]
+        first = resolved[0]
+        self._set_cursor_pos(first["x"], first["y"])
+        self._mouse_event(self._MOUSEEVENTF_LEFTDOWN)
+        time.sleep(0.04)
+        previous = first
+        for point in resolved[1:]:
+            dx = point["x"] - previous["x"]
+            dy = point["y"] - previous["y"]
+            steps = max(1, int((max(abs(dx), abs(dy)) / 18.0) + 0.999))
+            for step in range(1, steps + 1):
+                x = round(previous["x"] + ((dx * step) / steps))
+                y = round(previous["y"] + ((dy * step) / steps))
+                self._mouse_event(
+                    self._MOUSEEVENTF_MOVE,
+                    dx=x - previous["x"],
+                    dy=y - previous["y"],
+                )
+                previous = {"x": int(x), "y": int(y)}
+                time.sleep(0.008)
+        self._mouse_event(self._MOUSEEVENTF_LEFTUP)
+        return resolved
+
+    @staticmethod
+    def _resolve_point(
+        point: Any,
+        origin_x: int,
+        origin_y: int,
+        width: int,
+        height: int,
+    ) -> dict[str, int]:
+        if isinstance(point, dict):
+            raw_x = float(point.get("x", 0.0))
+            raw_y = float(point.get("y", 0.0))
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            raw_x = float(point[0])
+            raw_y = float(point[1])
+        else:
+            raise BackendUnavailable("draw_path contains an invalid point")
+        return {
+            "x": WindowsUiaBackend._resolve_coordinate(raw_x, origin_x, width),
+            "y": WindowsUiaBackend._resolve_coordinate(
+                raw_y,
+                origin_y,
+                height,
+            ),
+        }
+
+    @staticmethod
+    def _resolve_coordinate(raw: float, origin: int, size: int) -> int:
+        if abs(raw) <= 1.0:
+            return int(round(origin + (raw * size)))
+        return int(round(raw))
+
+    @staticmethod
+    def _set_cursor_pos(x: int, y: int) -> None:
+        user32 = ctypes.windll.user32
+        if not user32.SetCursorPos(int(x), int(y)):
+            raise BackendUnavailable("Failed to move the mouse cursor")
+
+    def _mouse_left_click(self, x: int, y: int) -> None:
+        self._set_cursor_pos(x, y)
+        self._mouse_event(self._MOUSEEVENTF_LEFTDOWN)
+        self._mouse_event(self._MOUSEEVENTF_LEFTUP)
+
+    @staticmethod
+    def _mouse_event(flags: int, dx: int = 0, dy: int = 0) -> None:
+        ctypes.windll.user32.mouse_event(int(flags), int(dx), int(dy), 0, 0)

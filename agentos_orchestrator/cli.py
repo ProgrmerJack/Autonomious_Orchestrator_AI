@@ -34,12 +34,10 @@ from .os_control import (
     DEFAULT_NOTEPAD_FILE_NAME,
     DEFAULT_NOTEPAD_PAYLOAD,
     DEFAULT_PAINT_FILE_NAME,
-    DirectShellBackend,
     NotepadLiveFireConfig,
     NotepadLiveFireTrial,
     PaintLiveFireConfig,
     PaintLiveFireTrial,
-    TouchpointBackend,
     UiAction,
     VirtualDesktopSandboxBackend,
     WindowsUiaBackend,
@@ -489,7 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read structured PC UI state through an OS-control backend.",
         parents=[runtime_parent],
     )
-    snapshot_parser.add_argument("--backend", default="windows-uia")
+    snapshot_parser.add_argument(
+        "--backend",
+        choices=("windows-uia", "virtual-desktop-sandbox"),
+        default="windows-uia",
+    )
     snapshot_parser.add_argument("--limit", type=int, default=120)
 
     act_parser = subparsers.add_parser(
@@ -497,7 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Perform a guarded PC UI action through an OS-control backend.",
         parents=[runtime_parent],
     )
-    act_parser.add_argument("--backend", default="windows-uia")
+    act_parser.add_argument(
+        "--backend",
+        choices=("windows-uia", "virtual-desktop-sandbox"),
+        default="windows-uia",
+    )
     act_parser.add_argument("--action", required=True)
     act_parser.add_argument("--selector", required=True)
     act_parser.add_argument("--value")
@@ -508,7 +514,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the guarded Notepad sim-to-real smoke trial.",
         parents=[runtime_parent],
     )
-    live_fire_parser.add_argument("--backend", default="windows-uia")
+    live_fire_parser.add_argument(
+        "--backend",
+        choices=("windows-uia", "virtual-desktop-sandbox"),
+        default="windows-uia",
+    )
     live_fire_parser.add_argument(
         "--payload",
         default=DEFAULT_NOTEPAD_PAYLOAD,
@@ -525,7 +535,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the guarded Paint sim-to-real drawing trial.",
         parents=[runtime_parent],
     )
-    paint_live_fire_parser.add_argument("--backend", default="windows-uia")
+    paint_live_fire_parser.add_argument(
+        "--backend",
+        choices=("windows-uia", "virtual-desktop-sandbox"),
+        default="windows-uia",
+    )
     paint_live_fire_parser.add_argument(
         "--file-name",
         default=DEFAULT_PAINT_FILE_NAME,
@@ -973,15 +987,14 @@ def main(argv: list[str] | None = None) -> int:
 def _pc_backend(name: str, state_path: str | Path):
     if name == "windows-uia":
         return WindowsUiaBackend()
-    if name == "touchpoint":
-        return TouchpointBackend()
-    if name == "directshell":
-        return DirectShellBackend(Path(state_path).with_name("directshell.sqlite3"))
     if name == "virtual-desktop-sandbox":
         return VirtualDesktopSandboxBackend(
             Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
-    raise ValueError(f"Unknown PC backend: {name}")
+    raise ValueError(
+        f"Unknown PC backend: {name}. Expected 'windows-uia' or "
+        "'virtual-desktop-sandbox'."
+    )
 
 
 def _launch_dashboard(args: argparse.Namespace) -> int:

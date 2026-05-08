@@ -13,6 +13,7 @@ import io
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -431,6 +432,22 @@ class SemanticMemoryTests(unittest.TestCase):
         vecs = embedder.embed_batch(["hello world", "foo bar"])
         self.assertEqual(vecs.shape, (2, 16))
         self.assertTrue(np.allclose(np.linalg.norm(vecs, axis=1), 1.0))
+
+    def test_semantic_memory_first_record_avoids_degenerate_svd_warning(self) -> None:
+        memory = SemanticEpisodicMemory()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            memory.record(
+                objective="test objective",
+                action=UiAction(action_type="click", selector="submit_btn"),
+                observation="clicked submit",
+                outcome="success",
+                reward=1.0,
+            )
+
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(runtime_warnings, [])
 
 
 # --------------------------------------------------------------------------- #
