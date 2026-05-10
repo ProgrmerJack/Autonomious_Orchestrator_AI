@@ -71,9 +71,7 @@ class ResearchOrchestrator:
         )
         self.memory = SemanticMemory(memory_path)
         self.supervisor = SupervisorAgent()
-        resolved_pc_backend = (
-            pc_backend or self._default_pc_backend(self.state_path)
-        )
+        resolved_pc_backend = pc_backend or self._default_pc_backend(self.state_path)
         self.worker = WorkerAgent(
             self.event_bus,
             self.checkpoints,

@@ -338,9 +338,17 @@ class ProviderSearchMixin:
         except ImportError:
             return ""
 
+        # http2=True requires the optional 'h2' package; fall back to http/1.1
+        # when it is absent so SEC EDGAR calls never crash with ImportError.
+        try:
+            import h2  # noqa: F401  # type: ignore[import-not-found]
+            _http2 = True
+        except ImportError:
+            _http2 = False
+
         with httpx.Client(
             follow_redirects=True,
-            http2=True,
+            http2=_http2,
             verify=True,
         ) as client:
             for delay in retry_delays:
@@ -1036,6 +1044,22 @@ class ProviderSearchMixin:
         target_limit = max(1, int(limit or self.limit_per_provider))
         seen_urls: set[str] = set()
 
+        # Bing requires realistic browser headers to avoid bot-detection responses.
+        bing_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.bing.com/",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
         for page in range(min(3, (target_limit + 9) // 10)):
             first_param = page * 10
             params = urllib.parse.urlencode(
@@ -1044,57 +1068,75 @@ class ProviderSearchMixin:
                     "first": str(first_param) if first_param > 0 else "1",
                     "setlang": "en-US",
                     "cc": "US",
+                    "mkt": "en-US",
                 }
             )
             raw = self._get_text(
                 f"https://www.bing.com/search?{params}",
                 accept="text/html,application/xhtml+xml",
-                max_bytes=150_000,
-                timeout_seconds=8,
+                max_bytes=200_000,
+                timeout_seconds=10,
+                extra_headers=bing_headers,
             )
             if not raw:
                 break
 
-            # Bing results: <li class="b_algo"> ... <h2><a href="...">title</a></h2>
-            for match in re.finditer(
-                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
-                raw,
-                flags=re.IGNORECASE | re.DOTALL,
-            ):
-                url = match.group(1).strip()
-                title = self._html_to_text(match.group(2)).strip()
-                if not url or not title:
-                    continue
-                if not self._is_safe_public_url(url):
-                    continue
-                if "bing.com" in url or "microsoft.com" in url:
-                    continue
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                # Extract snippet from following text
-                tail = raw[match.end() : match.end() + 2000]
-                snippet_m = re.search(
-                    r'<p[^>]*class="[^"]*b_algoSlug[^"]*"[^>]*>(.*?)</p>',
-                    tail,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-                snippet = self._html_to_text(snippet_m.group(1)) if snippet_m else ""
-                host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
-                score = max(target_limit - len(sources), 1)
-                sources.append(
-                    ResearchSource(
-                        provider="bing-search",
-                        title=title[:160],
-                        url=url,
-                        authors=[host] if host else [],
-                        abstract=(snippet or f"Bing result: {title}")[:800],
-                        score=float(score),
-                    )
-                )
-                if len(sources) >= target_limit:
-                    break
-            if len(sources) >= target_limit:
+            added_this_page = 0
+            # Bing 2024+ results: multiple possible result structures.
+            # Pattern 1: <h2><a href="...">title</a></h2> inside .b_algo
+            # Pattern 2: data-href attributes in newer layouts
+            patterns = [
+                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"&]+)"[^>]*>(.*?)</a>',
+                r'<a[^>]+class="[^"]*tilk[^"]*"[^>]+href="(https?://[^"&]+)"[^>]*>(.*?)</a>',
+                r'cite[^>]*>(https?://[^<]+)</cite>',
+            ]
+            # Use the richest pattern that gives results
+            for pattern in patterns:
+                matches = list(re.finditer(pattern, raw, flags=re.IGNORECASE | re.DOTALL))
+                if matches:
+                    for match in matches:
+                        if len(match.groups()) == 2:
+                            url = match.group(1).strip()
+                            title = self._html_to_text(match.group(2)).strip()
+                        else:
+                            url = "https://" + match.group(1).strip().lstrip("https://")
+                            title = self._label_from_url(url)
+                        if not url or not title:
+                            continue
+                        if not self._is_safe_public_url(url):
+                            continue
+                        if "bing.com" in url or "microsoft.com" in url:
+                            continue
+                        if url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                        # Extract snippet from surrounding HTML
+                        match_end = match.end()
+                        tail = raw[match_end: match_end + 3000]
+                        snippet_m = re.search(
+                            r'<p[^>]*(?:class="[^"]*(?:b_algoSlug|b_paractl|snippet)[^"]*")?[^>]*>(.*?)</p>',
+                            tail,
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        snippet = self._html_to_text(snippet_m.group(1)).strip() if snippet_m else ""
+                        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+                        score = max(target_limit - len(sources), 1)
+                        sources.append(
+                            ResearchSource(
+                                provider="bing-search",
+                                title=title[:160],
+                                url=url,
+                                authors=[host] if host else [],
+                                abstract=(snippet or f"Bing result: {title}")[:800],
+                                score=float(score),
+                            )
+                        )
+                        added_this_page += 1
+                        if len(sources) >= target_limit:
+                            break
+                    if sources:  # found results with this pattern
+                        break
+            if len(sources) >= target_limit or added_this_page == 0:
                 break
 
         self._record_provider_diagnostic(
@@ -1122,13 +1164,24 @@ class ProviderSearchMixin:
             {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
         )
         rss_url = f"https://news.google.com/rss/search?{params}"
+        # Google News blocks plain Python user-agents; use a realistic browser UA.
         raw = self._get_text(
             rss_url,
-            accept="application/rss+xml,text/xml,*/*",
+            accept="application/rss+xml,text/xml,application/xml,*/*;q=0.8",
             max_bytes=200_000,
-            timeout_seconds=8,
+            timeout_seconds=10,
+            extra_headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://news.google.com/",
+                "Cache-Control": "no-cache",
+            },
         )
-        if not raw:
+        if not raw or len(raw) < 100:
             self._record_provider_diagnostic(
                 "google-news-rss", "empty", "no RSS response"
             )
@@ -2153,28 +2206,34 @@ class ProviderSearchMixin:
         )
         preview_fetches = 0
 
+        # DuckDuckGo HTML requires realistic browser headers to return results.
+        ddg_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://html.duckduckgo.com/",
+        }
+
         for page_index in range(max_pages):
             page_start = page_index * page_stride
-            params = {"q": query}
+            params: dict[str, str] = {"q": query}
             if page_start > 0:
                 params["s"] = str(page_start)
                 params["dc"] = str(page_start)
             search_url = (
                 f"https://html.duckduckgo.com/html/?{urllib.parse.urlencode(params)}"
             )
-            try:
-                raw_html = self._get_text(
-                    search_url,
-                    accept="text/html,application/xhtml+xml",
-                    max_bytes=120_000,
-                    timeout_seconds=6,
-                )
-            except TypeError:
-                raw_html = self._get_text(
-                    search_url,
-                    accept="text/html,application/xhtml+xml",
-                    max_bytes=120_000,
-                )
+            raw_html = self._get_text(
+                search_url,
+                accept="text/html,application/xhtml+xml",
+                max_bytes=200_000,
+                timeout_seconds=10,
+                extra_headers=ddg_headers,
+            )
             if not raw_html:
                 break
 
@@ -2184,25 +2243,31 @@ class ProviderSearchMixin:
             seen_pages.add(page_fingerprint)
 
             added_this_page = 0
-            for match in re.finditer(
-                (
-                    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"'
-                    r"[^>]*>(.*?)</a>"
-                ),
-                raw_html,
-                flags=re.IGNORECASE | re.DOTALL,
-            ):
-                raw_url = self._normalize_web_result_url(match.group(1))
+            # DuckDuckGo HTML: multiple possible result patterns (class names change)
+            ddg_patterns = [
+                r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                r'<a[^>]+class="[^"]*result-link[^"]*"[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+            ]
+            url_title_pairs: list[tuple[str, str, int]] = []
+            added_this_page = 0
+            for ddg_pat in ddg_patterns:
+                for match in re.finditer(ddg_pat, raw_html, flags=re.IGNORECASE | re.DOTALL):
+                    raw_url = self._normalize_web_result_url(match.group(1))
+                    title = self._html_to_text(match.group(2)) or self._label_from_url(raw_url)
+                    if raw_url and title:
+                        url_title_pairs.append((raw_url, title, match.end()))
+                if url_title_pairs:
+                    break
+
+            for raw_url, title, match_end in url_title_pairs:
                 if not self._is_safe_public_url(raw_url):
                     continue
                 if raw_url in seen_urls:
                     continue
-                title = self._html_to_text(match.group(2)) or self._label_from_url(
-                    raw_url
-                )
-                tail = raw_html[match.end() : match.end() + 1500]
+                tail = raw_html[match_end: match_end + 1500]
                 snippet_match = re.search(
-                    r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+                    r'class="[^"]*(?:result__snippet|result-snippet|snippet)[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
                     tail,
                     flags=re.IGNORECASE | re.DOTALL,
                 )
@@ -2214,19 +2279,12 @@ class ProviderSearchMixin:
                 quality_flags: list[str] = []
                 if not snippet.strip() and preview_fetches < preview_fetch_budget:
                     preview_fetches += 1
-                    try:
-                        preview = self._get_text(
-                            raw_url,
-                            accept="text/html,application/xhtml+xml,*/*",
-                            max_bytes=30_000,
-                            timeout_seconds=4,
-                        )
-                    except TypeError:
-                        preview = self._get_text(
-                            raw_url,
-                            accept="text/html,application/xhtml+xml,*/*",
-                            max_bytes=30_000,
-                        )
+                    preview = self._get_text(
+                        raw_url,
+                        accept="text/html,application/xhtml+xml,*/*",
+                        max_bytes=30_000,
+                        timeout_seconds=4,
+                    )
                     preview_text = self._html_to_text(preview)
                     tickers = _extract_ticker_candidates(f"{title} {preview_text}")
                     if tickers:
@@ -2344,9 +2402,15 @@ class ProviderSearchMixin:
                         per_provider_limit,
                     )
             else:
+                try:
+                    import h2  # noqa: F401  # type: ignore[import-not-found]
+                    _http2_dispatch = True
+                except ImportError:
+                    _http2_dispatch = False
+
                 async with httpx.AsyncClient(
                     follow_redirects=True,
-                    http2=True,
+                    http2=_http2_dispatch,
                     verify=True,
                 ) as client:
                     tasks = [

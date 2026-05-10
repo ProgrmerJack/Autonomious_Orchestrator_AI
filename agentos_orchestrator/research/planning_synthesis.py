@@ -247,37 +247,142 @@ class ResearchPlanningSynthesisMixin:
         if ai_synthesis:
             return ai_synthesis
 
-        # Fallback template summary when AI is unavailable.
-        leading_findings = "; ".join(
-            f"{finding['perspective']}: {finding['finding']}"
-            for finding in findings[:3]
-        ) or "; ".join(source.title for source in sources[:3])
-        missing_perspectives = (
-            ", ".join(perspective_coverage["missing"][:3])
-            or "no major uncovered perspectives detected"
+        # Fallback: produce a structured analyst-grade report from raw sources
+        # when AI synthesis is unavailable (no Gemini API key configured).
+        return self._structured_fallback_report(
+            objective=objective,
+            sources=sources,
+            findings=findings,
+            plan=plan,
+            perspective_coverage=perspective_coverage,
+            market_signal_lines=list(packet.get("market_signals") or []),
+            depth=depth,
+            durable_notes=durable_notes,
         )
-        market_signal_lines = list(packet.get("market_signals") or [])
-        market_snapshot_text = (
-            "Market signal snapshot: " + "; ".join(market_signal_lines[:5]) + ". "
-            if market_signal_lines
-            else ""
+
+    def _structured_fallback_report(
+        self,
+        objective: str,
+        sources: list[ResearchSource],
+        findings: list[dict[str, Any]],
+        plan: dict[str, Any] | None,
+        perspective_coverage: dict[str, Any],
+        market_signal_lines: list[str],
+        depth: str,
+        durable_notes: str = "",
+    ) -> str:
+        """Generate a structured analyst-style report from raw sources.
+
+        This runs when no AI key is configured. It extracts all material
+        evidence from source abstracts, durable notes, and market signals into
+        a readable, structured markdown report — not a generic template string.
+        """
+        lines: list[str] = []
+        market_mode = self._looks_like_market_query(objective)
+
+        lines.append(f"# Research Report: {objective}")
+        lines.append("")
+        lines.append(
+            f"**Depth**: {depth} | **Sources**: {len(sources)} | "
+            f"**Perspectives covered**: "
+            f"{perspective_coverage.get('count', 0)}/"
+            f"{perspective_coverage.get('total', 0)}"
         )
-        conflict_count = sum(
-            int(finding.get("contradiction_count") or 0) for finding in findings
+        lines.append("")
+
+        # Executive summary from durable notes (best quality content)
+        if durable_notes and len(durable_notes.strip()) > 200:
+            lines.append("## Key Findings (Distilled from Deep Research)")
+            lines.append("")
+            # Extract bullet points from durable notes
+            note_bullets = [
+                ln.strip()
+                for ln in durable_notes.splitlines()
+                if ln.strip().startswith("- [") or ln.strip().startswith("- **")
+            ][:25]
+            if note_bullets:
+                for bullet in note_bullets:
+                    lines.append(bullet)
+                lines.append("")
+            else:
+                # Fallback: take first 2000 chars of durable notes
+                lines.append(durable_notes[:2000])
+                lines.append("")
+
+        # Market signals / ticker candidates
+        if market_mode and market_signal_lines:
+            lines.append("## Market Candidates Identified")
+            lines.append("")
+            lines.append(
+                "The following companies/tickers were identified as candidates "
+                "meeting the stated criteria:"
+            )
+            lines.append("")
+            for sig in market_signal_lines[:20]:
+                lines.append(f"- {sig}")
+            lines.append("")
+
+        # Per-perspective findings
+        if findings:
+            lines.append("## Evidence by Research Angle")
+            lines.append("")
+            for f in findings[:8]:
+                perspective = f.get("perspective", "General")
+                finding_text = f.get("finding", "")
+                confidence = f.get("confidence", "unknown")
+                n_sources = f.get("support_count", 0)
+                contradictions = f.get("contradiction_count", 0)
+                lines.append(
+                    f"### {perspective} [confidence: {confidence}, "
+                    f"{n_sources} sources"
+                    + (f", {contradictions} contradictions" if contradictions else "")
+                    + "]"
+                )
+                lines.append("")
+                lines.append(finding_text)
+                lines.append("")
+
+        # Source evidence table
+        if sources:
+            lines.append("## Source Evidence")
+            lines.append("")
+            top_sources = sorted(
+                sources, key=lambda s: float(s.score or 0), reverse=True
+            )[:20]
+            for i, src in enumerate(top_sources, 1):
+                title = src.title or "Untitled"
+                url = src.url or ""
+                provider = src.provider or "unknown"
+                abstract = (src.abstract or "").strip()[:500]
+                year = f" ({src.year})" if src.year else ""
+                link = f"[{title}]({url})" if url else title
+                lines.append(f"**{i}. {link}** [{provider}]{year}")
+                if abstract:
+                    lines.append(f"> {abstract}")
+                lines.append("")
+
+        # Missing coverage
+        missing = perspective_coverage.get("missing") or []
+        if missing:
+            lines.append("## Research Gaps")
+            lines.append("")
+            lines.append(
+                "The following perspectives were not covered by available sources "
+                "and warrant additional investigation:"
+            )
+            lines.append("")
+            for m in missing[:6]:
+                lines.append(f"- {m}")
+            lines.append("")
+
+        # AI upgrade notice
+        lines.append("---")
+        lines.append(
+            "*Note: AI synthesis (Gemini) was not available. Set `GEMINI_API_KEY` "
+            "in your `.env` file to enable institutional-quality analyst narrative.*"
         )
-        return (
-            f"Collected {len(sources)} evidence-backed sources in {depth} "
-            "mode for: "
-            f"{objective}. "
-            f"The research plan tracked {subquestion_count} subquestions. "
-            "Perspective coverage reached "
-            f"{perspective_coverage['count']}/{perspective_coverage['total']} "
-            "planned angles. "
-            f"Most-supported findings are: {leading_findings}. "
-            f"{market_snapshot_text}"
-            f"Open gaps remain in: {missing_perspectives}. "
-            f"Contradiction signals were observed in {conflict_count} finding clusters."
-        )
+
+        return "\n".join(lines)
 
     def _ai_scientist_synthesis(
         self,

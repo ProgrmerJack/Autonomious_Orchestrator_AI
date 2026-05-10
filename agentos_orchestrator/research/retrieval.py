@@ -218,7 +218,7 @@ class ResearchRetrievalMixin:
                 #  (a) get real content and re-score above the 0.1 floor, and
                 #  (b) generate their own sub-chains added to _chained_sources
                 #      for the *next* pass — creating a self-feeding expansion.
-                if settings.depth == "multi-hour":
+                if settings.depth in {"standard", "multi-hour"}:
                     _priority_finance_hosts = {
                         "sec.gov",
                         "edgar.sec.gov",
@@ -273,15 +273,22 @@ class ResearchRetrievalMixin:
                         if any(
                             h in (s.url or "").lower() for h in _priority_finance_hosts
                         )
-                    ][:80]
+                    ]
+                    # Standard mode uses smaller chain batches to stay within time budget;
+                    # multi-hour expands aggressively for 100k+ URL coverage.
+                    if settings.depth == "multi-hour":
+                        priority_chain = priority_chain[:80]
+                    else:
+                        priority_chain = priority_chain[:20]
                     # Also include non-priority chained sources for breadth.
                     seen_chain_urls = {s.url for s in priority_chain}
                     other_chain = [s for s in chained if s.url not in seen_chain_urls][
-                        :40
+                        : (40 if settings.depth == "multi-hour" else 10)
                     ]
-                    # 120 chains per pass × 120 passes = up to 14,400 chain fetches.
-                    # This is the primary mechanism for 100k+ URL coverage.
-                    chain_expansion_batch = (priority_chain + other_chain)[:120]
+                    # 120 chains per pass × N passes = large URL coverage.
+                    # For standard mode: 30 per pass for efficiency.
+                    max_chain = 120 if settings.depth == "multi-hour" else 30
+                    chain_expansion_batch = (priority_chain + other_chain)[:max_chain]
                     if chain_expansion_batch:
                         chain_eq = self._enrich_top_sources(
                             chain_expansion_batch, query
@@ -298,6 +305,20 @@ class ResearchRetrievalMixin:
             )
             if queued_sources:
                 all_sources.extend(queued_sources)
+
+            # --- SEED URL IMMEDIATE ENRICHMENT (pass 0 only) -----------------
+            # Seed URLs pre-loaded by pc-browser and seed-url providers arrive
+            # with score≈0.1 (empty abstract). Without immediate enrichment they
+            # get filtered below the ranking threshold and are never read.
+            # Enriching them on pass 0 gives them real content + a score boost,
+            # so they compete properly against provider results.
+            if pass_index == 0:
+                seed_candidates = [
+                    s for s in all_sources
+                    if s.url and (not s.abstract or len(s.abstract) < 80)
+                ][:24]
+                if seed_candidates:
+                    self._enrich_top_sources(seed_candidates, query)
 
             unique_url_count = self._unique_source_url_count(all_sources)
 
@@ -1343,10 +1364,18 @@ class ResearchRetrievalMixin:
         except ImportError:
             return ""
 
+        # http2=True requires the optional 'h2' package; detect and downgrade
+        # gracefully so every web fetch never crashes with ImportError.
+        try:
+            import h2  # noqa: F401  # type: ignore[import-not-found]
+            _http2 = True
+        except ImportError:
+            _http2 = False
+
         try:
             with httpx.Client(
                 follow_redirects=True,
-                http2=True,
+                http2=_http2,
                 verify=True,
             ) as client:
                 with client.stream(
@@ -2266,9 +2295,15 @@ class ResearchRetrievalMixin:
             return {}
 
         try:
+            import h2  # noqa: F401  # type: ignore[import-not-found]
+            _http2 = True
+        except ImportError:
+            _http2 = False
+
+        try:
             with httpx.Client(
                 follow_redirects=True,
-                http2=True,
+                http2=_http2,
                 verify=True,
             ) as client:
                 response = client.get(
@@ -2304,9 +2339,15 @@ class ResearchRetrievalMixin:
         if client is not None:
             return await _request(client)
 
+        try:
+            import h2  # noqa: F401  # type: ignore[import-not-found]
+            _http2_async = True
+        except ImportError:
+            _http2_async = False
+
         async with httpx.AsyncClient(
             follow_redirects=True,
-            http2=True,
+            http2=_http2_async,
             verify=True,
         ) as async_client:
             return await _request(async_client)

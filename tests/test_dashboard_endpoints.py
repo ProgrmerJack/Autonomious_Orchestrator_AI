@@ -326,9 +326,7 @@ class DashboardEndpointsTests(unittest.TestCase):
             with client as api:
                 headers = self._auth_headers(api, app)
                 calls: dict[str, object] = {}
-                original_ensure = (
-                    app.state.workflow_service.ensure_universal_mode
-                )
+                original_ensure = app.state.workflow_service.ensure_universal_mode
                 original_execute = app.state.workflow_service.execute
 
                 def stub_ensure(backend, max_steps=12):
@@ -375,9 +373,7 @@ class DashboardEndpointsTests(unittest.TestCase):
                         headers=headers,
                     ).json()
                 finally:
-                    app.state.workflow_service.ensure_universal_mode = (
-                        original_ensure
-                    )
+                    app.state.workflow_service.ensure_universal_mode = original_ensure
                     app.state.workflow_service.execute = original_execute
 
                 self.assertEqual(payload["status"], "executed")

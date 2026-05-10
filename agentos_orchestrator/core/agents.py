@@ -130,6 +130,7 @@ class SupervisorAgent:
                     )
         except Exception as _role_exc:
             import warnings
+
             warnings.warn(
                 f"AI role selection failed ({_role_exc!r}); falling back to "
                 "heuristic role assignment. Check AI API connectivity.",
@@ -1890,8 +1891,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                 clean_url
                 for item in (checkpoint.get("url_leads") or [])
                 for clean_url in [str(item or "").strip()]
-                if clean_url
-                and not self._is_low_primary_signal_portal_url(clean_url)
+                if clean_url and not self._is_low_primary_signal_portal_url(clean_url)
             ]
         )[:16]
         sanitized["missing_evidence"] = self._dedupe_list(
@@ -1908,9 +1908,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                 if str(item).strip()
             ]
         )[:16]
-        sanitized["continue_research"] = bool(
-            checkpoint.get("continue_research", True)
-        )
+        sanitized["continue_research"] = bool(checkpoint.get("continue_research", True))
         return sanitized
 
     def _filter_browser_findings_portals(
@@ -1983,7 +1981,9 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                 continue
             cleaned_payload = dict(payload or {})
             cleaned_payload["urls"] = [
-                url for url in (cleaned_payload.get("urls") or []) if url in allowed_urls
+                url
+                for url in (cleaned_payload.get("urls") or [])
+                if url in allowed_urls
             ]
             sanitized_domains[clean_domain] = cleaned_payload
         sanitized["domains"] = sanitized_domains
@@ -2361,45 +2361,49 @@ class WorkerAgent(ObjectiveAnalysisMixin):
             end = raw.rfind("}") + 1
             if start >= 0 and end > start:
                 parsed = json.loads(raw[start:end])
-                return self._sanitize_browser_reasoning_checkpoint_payload({
-                    "cycle": cycle_index + 1,
-                    "follow_up_queries": self._dedupe_list(
-                        [
-                            str(item)[:240]
-                            for item in (parsed.get("follow_up_queries") or [])
-                            if str(item).strip()
-                        ]
-                    )[:18],
-                    "domain_leads": self._dedupe_list(
-                        [
-                            str(item).strip()
-                            for item in (parsed.get("domain_leads") or [])
-                            if str(item).strip()
-                        ]
-                    )[:16],
-                    "url_leads": self._dedupe_public_urls(
-                        [
-                            str(item).strip()
-                            for item in (parsed.get("url_leads") or [])
-                            if str(item).strip()
-                        ]
-                    )[:16],
-                    "missing_evidence": self._dedupe_list(
-                        [
-                            str(item)[:240]
-                            for item in (parsed.get("missing_evidence") or [])
-                            if str(item).strip()
-                        ]
-                    )[:16],
-                    "contradictions": self._dedupe_list(
-                        [
-                            str(item)[:280]
-                            for item in (parsed.get("contradictions") or [])
-                            if str(item).strip()
-                        ]
-                    )[:16],
-                    "continue_research": bool(parsed.get("continue_research", True)),
-                })
+                return self._sanitize_browser_reasoning_checkpoint_payload(
+                    {
+                        "cycle": cycle_index + 1,
+                        "follow_up_queries": self._dedupe_list(
+                            [
+                                str(item)[:240]
+                                for item in (parsed.get("follow_up_queries") or [])
+                                if str(item).strip()
+                            ]
+                        )[:18],
+                        "domain_leads": self._dedupe_list(
+                            [
+                                str(item).strip()
+                                for item in (parsed.get("domain_leads") or [])
+                                if str(item).strip()
+                            ]
+                        )[:16],
+                        "url_leads": self._dedupe_public_urls(
+                            [
+                                str(item).strip()
+                                for item in (parsed.get("url_leads") or [])
+                                if str(item).strip()
+                            ]
+                        )[:16],
+                        "missing_evidence": self._dedupe_list(
+                            [
+                                str(item)[:240]
+                                for item in (parsed.get("missing_evidence") or [])
+                                if str(item).strip()
+                            ]
+                        )[:16],
+                        "contradictions": self._dedupe_list(
+                            [
+                                str(item)[:280]
+                                for item in (parsed.get("contradictions") or [])
+                                if str(item).strip()
+                            ]
+                        )[:16],
+                        "continue_research": bool(
+                            parsed.get("continue_research", True)
+                        ),
+                    }
+                )
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         return self._browser_reasoning_checkpoint_fallback(
@@ -2509,20 +2513,22 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                     or f"{objective} {contradiction}"
                 )[:240]
             )
-        return self._sanitize_browser_reasoning_checkpoint_payload({
-            "cycle": cycle_index + 1,
-            "follow_up_queries": self._dedupe_list(follow_up_queries)[:18],
-            "domain_leads": domain_leads[:16],
-            "url_leads": self._dedupe_public_urls(url_leads)[:16],
-            "missing_evidence": missing_evidence[:16],
-            "contradictions": self._dedupe_list(contradictions)[:16],
-            "continue_research": bool(
-                url_leads
-                or follow_up_queries
-                or missing_evidence
-                or graph_contradictions
-            ),
-        })
+        return self._sanitize_browser_reasoning_checkpoint_payload(
+            {
+                "cycle": cycle_index + 1,
+                "follow_up_queries": self._dedupe_list(follow_up_queries)[:18],
+                "domain_leads": domain_leads[:16],
+                "url_leads": self._dedupe_public_urls(url_leads)[:16],
+                "missing_evidence": missing_evidence[:16],
+                "contradictions": self._dedupe_list(contradictions)[:16],
+                "continue_research": bool(
+                    url_leads
+                    or follow_up_queries
+                    or missing_evidence
+                    or graph_contradictions
+                ),
+            }
+        )
 
     def _urls_from_browser_checkpoint(
         self,
@@ -2706,7 +2712,9 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         minimum_domain_target = (
             4
             if is_market_query and str(budget["mode"]) == "expansive"
-            else 3 if str(budget["mode"]) == "expansive" else 2
+            else 3
+            if str(budget["mode"]) == "expansive"
+            else 2
         )
         ranked = self._augment_browser_domain_coverage(
             ranked,
@@ -3021,9 +3029,9 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         )
         if fallback:
             queries.append(fallback)
-        query_context = fallback or DeepResearchEngine._query_from_objective(
-            cleaned
-        ) or cleaned
+        query_context = (
+            fallback or DeepResearchEngine._query_from_objective(cleaned) or cleaned
+        )
         queries = WorkerAgent._sanitize_browser_search_queries(
             queries,
             query_context,
@@ -3265,8 +3273,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         # alternative exists we drop blocked aggregators completely — they
         # never strengthen the evidence base, only dilute it.
         has_authoritative_seed = any(
-            not _is_blocked(str(seed.url or ""))
-            for seed in navigation_seed_sources
+            not _is_blocked(str(seed.url or "")) for seed in navigation_seed_sources
         )
         if preferred or has_authoritative_seed:
             return preferred
@@ -3913,6 +3920,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                     return [str(c)[:400] for c in claims if str(c).strip()][:4]
         except Exception as _claim_exc:
             import warnings
+
             warnings.warn(
                 f"AI evidence-claim ranking failed ({_claim_exc!r}); "
                 "using top-scored candidates as fallback.",
@@ -3978,9 +3986,8 @@ class WorkerAgent(ObjectiveAnalysisMixin):
                 payload = None
             if isinstance(payload, dict) and payload.get("sandbox"):
                 return backend
-        if (
-            callable(getattr(backend, "snapshot", None))
-            and callable(getattr(backend, "perform", None))
+        if callable(getattr(backend, "snapshot", None)) and callable(
+            getattr(backend, "perform", None)
         ):
             return backend
         if "sandbox" in getattr(backend, "name", "").lower():
@@ -4754,7 +4761,9 @@ class WorkerAgent(ObjectiveAnalysisMixin):
             preview.get("page_title")
             or self.research_engine._label_from_url(str(url or ""))[:160]
         ).strip()
-        text = str(self._deep_page_read(url) or preview.get("page_excerpt") or "").strip()
+        text = str(
+            self._deep_page_read(url) or preview.get("page_excerpt") or ""
+        ).strip()
         if not title and not text:
             return {
                 "status": "empty",

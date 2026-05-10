@@ -326,7 +326,14 @@ class FourLaneActionRouter:
 
 
 class PreActionVerifier:
-    """Post-policy, pre-action verifier with deterministic diagnostics."""
+    """Post-policy, pre-action verifier with deterministic diagnostics.
+
+    Layers (innermost-first):
+    1. FormalSafetyVerifier   — static pattern gates (blocklist keywords, paths)
+    2. IntentVerifier         — intent-constraint compiler guards (payment, creds…)
+    3. RiskGuardian           — policy-matrix risk score with approval threshold
+    4. GoalLock conflict      — anti-drift check
+    """
 
     def __init__(
         self,
@@ -342,6 +349,27 @@ class PreActionVerifier:
             )
         )
 
+        # Phase 4 — intent verifier (lazy import to avoid circular deps)
+        try:
+            from agentos_orchestrator.cognition.intent_verifier import (  # type: ignore[import]
+                compile_intent,
+                verify_action_intent,
+            )
+            self._compile_intent = compile_intent
+            self._verify_action_intent = verify_action_intent
+        except ImportError:
+            self._compile_intent = None
+            self._verify_action_intent = None
+
+        # Phase 4 — risk guardian (lazy import)
+        try:
+            from agentos_orchestrator.cognition.risk_guardian import (  # type: ignore[import]
+                assess_action_risk,
+            )
+            self._assess_action_risk = assess_action_risk
+        except ImportError:
+            self._assess_action_risk = None
+
     def verify(
         self,
         *,
@@ -352,6 +380,7 @@ class PreActionVerifier:
         goal_lock: GoalLock | None = None,
         approval_token: str | None = None,
     ) -> PreActionDecision:
+        # ── Layer 1: formal safety gates ────────────────────────────────── #
         safety = self.safety_verifier.verify_action(
             action,
             objective=objective,
@@ -359,6 +388,96 @@ class PreActionVerifier:
         )
         if not safety.allowed:
             return _decision_from_safety(safety, proposal)
+
+        # ── Layer 2: intent-constraint verifier (Phase 4) ────────────────── #
+        if self._compile_intent is not None and self._verify_action_intent is not None:
+            try:
+                constraints = self._compile_intent(objective)
+                intent_decision = self._verify_action_intent(
+                    action, objective, constraints, proposal, goal_lock
+                )
+                diag = getattr(intent_decision, "diagnostician", "execute")
+                if diag in ("abort",):
+                    reason = getattr(intent_decision, "reason", "Intent constraint violated.")
+                    return PreActionDecision(
+                        allowed=False,
+                        decision="abort",
+                        reason=reason,
+                        risk_score=max(proposal.risk_score, 0.9),
+                        required_approval=True,
+                        approval_state="missing",
+                        diagnostician="abort",
+                        evidence={
+                            "proposal_id": proposal.proposal_id,
+                            "intent_violated": getattr(
+                                intent_decision, "violated_constraints", []
+                            ),
+                        },
+                    )
+                if diag in ("confirm",) and not approval_token:
+                    reason = getattr(intent_decision, "reason", "Action requires approval.")
+                    return PreActionDecision(
+                        allowed=False,
+                        decision="confirm",
+                        reason=reason,
+                        risk_score=max(proposal.risk_score, 0.75),
+                        required_approval=True,
+                        approval_state="missing",
+                        diagnostician="confirm",
+                        evidence={
+                            "proposal_id": proposal.proposal_id,
+                            "intent_violated": getattr(
+                                intent_decision, "violated_constraints", []
+                            ),
+                        },
+                    )
+            except Exception:
+                pass  # never block on verifier crash
+
+        # ── Layer 3: risk guardian (Phase 4) ─────────────────────────────── #
+        if self._assess_action_risk is not None:
+            try:
+                assessment = self._assess_action_risk(
+                    action, proposal, observation, objective
+                )
+                if assessment.adjusted_risk >= 0.92:
+                    return PreActionDecision(
+                        allowed=False,
+                        decision="abort",
+                        reason=(
+                            f"RiskGuardian: risk {assessment.adjusted_risk:.2f} "
+                            "exceeds abort threshold."
+                        ),
+                        risk_score=assessment.adjusted_risk,
+                        required_approval=True,
+                        approval_state="missing",
+                        diagnostician="abort",
+                        evidence={
+                            "proposal_id": proposal.proposal_id,
+                            "risk_level": assessment.risk_level,
+                        },
+                    )
+                if assessment.approval_required and not approval_token:
+                    return PreActionDecision(
+                        allowed=False,
+                        decision="confirm",
+                        reason=(
+                            f"RiskGuardian: risk {assessment.adjusted_risk:.2f} "
+                            "requires explicit approval."
+                        ),
+                        risk_score=assessment.adjusted_risk,
+                        required_approval=True,
+                        approval_state="missing",
+                        diagnostician="confirm",
+                        evidence={
+                            "proposal_id": proposal.proposal_id,
+                            "risk_level": assessment.risk_level,
+                        },
+                    )
+            except Exception:
+                pass  # never block on guardian crash
+
+        # ── Approval gate (original) ─────────────────────────────────────── #
         if proposal.required_approval and not approval_token:
             return PreActionDecision(
                 allowed=False,
@@ -370,6 +489,8 @@ class PreActionVerifier:
                 diagnostician="confirm",
                 evidence={"proposal_id": proposal.proposal_id},
             )
+
+        # ── Layer 4: goal-lock conflict check ────────────────────────────── #
         lock = goal_lock or build_goal_lock(
             objective=objective,
             observation=observation,

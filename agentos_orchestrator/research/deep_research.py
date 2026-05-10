@@ -561,18 +561,17 @@ class DeepResearchEngine(
         depth: str,
     ) -> bool:
         combined = f"{objective} {query}".strip()
+        # Always use PC browser for software agent diagnostic queries.
         if cls._looks_like_software_agent_diagnostic_objective(combined):
             return True
+        # Always use PC browser for current-evidence queries (stock prices,
+        # earnings, analyst ratings) regardless of depth — live data matters.
+        if cls._looks_like_current_evidence_query(combined):
+            return True
+        # For general queries, only use PC browser in multi-hour mode.
         if depth != "multi-hour":
             return False
-        if not cls._looks_like_current_evidence_query(combined):
-            return False
-        return bool(
-            re.search(
-                r"\b(browser|sandbox|pc control|computer use|desktop|local pc)\b",
-                combined.lower(),
-            )
-        )
+        return True
 
     @classmethod
     def _pc_context_priority_urls(

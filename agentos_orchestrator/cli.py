@@ -66,9 +66,7 @@ def _configure_dashboard_event_loop_policy() -> None:
     if os.name != "nt":
         return
     requested_policy = (
-        os.getenv("AGENTOS_DASHBOARD_EVENT_LOOP_POLICY", "")
-        .strip()
-        .lower()
+        os.getenv("AGENTOS_DASHBOARD_EVENT_LOOP_POLICY", "").strip().lower()
     )
     current_policy = asyncio.get_event_loop_policy()
     if requested_policy == "selector":
@@ -729,9 +727,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.allowed else 2
 
     backend = (
-        _pc_backend(args.backend, args.state)
-        if getattr(args, "backend", "")
-        else None
+        _pc_backend(args.backend, args.state) if getattr(args, "backend", "") else None
     )
 
     orchestrator = ResearchOrchestrator.from_paths(

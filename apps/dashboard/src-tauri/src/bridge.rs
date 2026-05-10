@@ -484,3 +484,76 @@ fn python_launchers(workspace_root: &Path) -> Vec<PythonLauncher> {
         },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn authenticated_status(
+        api_base: &str,
+        session: &DashboardSession,
+    ) -> Result<Value, DesktopBridgeError> {
+        ureq::get(&format!("{api_base}/status"))
+            .set("Authorization", &format!("Bearer {}", session.session_token))
+            .set("X-AgentOS-Csrf", &session.csrf_token)
+            .call()
+            .map_err(|error| DesktopBridgeError::startup(format!(
+                "authenticated status request failed: {error}"
+            )))?
+            .into_json::<Value>()
+            .map_err(|error| DesktopBridgeError::startup(format!(
+                "authenticated status response was invalid: {error}"
+            )))
+    }
+
+    #[test]
+    fn desktop_bridge_bootstrap_restart_and_reestablishes_session() {
+        let bridge = DesktopBridge::new();
+        let first = bridge
+            .bootstrap("main")
+            .expect("desktop bootstrap should start the loopback dashboard backend");
+        let first_pid = first
+            .daemon
+            .launcher_pid
+            .expect("desktop daemon should expose a launcher pid after bootstrap");
+        assert_eq!(first.daemon.status, "running");
+        assert_eq!(first.daemon.api_url, first.api_base);
+        assert!(!first.session.session_token.is_empty());
+
+        let first_status = authenticated_status(&first.api_base, &first.session)
+            .expect("desktop bootstrap should return a working authenticated session");
+        assert_eq!(first_status.get("status").and_then(Value::as_str), Some("online"));
+
+        let restarted = bridge
+            .daemon_control("main", &first.ipc_token, "restart")
+            .expect("desktop daemon restart should succeed through the bridge");
+        assert_eq!(restarted.status, "running");
+        let restarted_pid = restarted
+            .launcher_pid
+            .expect("desktop daemon should expose a launcher pid after restart");
+        assert_ne!(
+            restarted_pid, first_pid,
+            "desktop restart should replace the managed backend process"
+        );
+
+        let second = bridge
+            .bootstrap("main")
+            .expect("desktop bootstrap should re-establish a session after restart");
+        assert_eq!(second.daemon.status, "running");
+        assert_eq!(second.daemon.api_url, second.api_base);
+        assert_ne!(
+            second.session.session_token, first.session.session_token,
+            "desktop bootstrap should mint a fresh dashboard session after restart"
+        );
+
+        let second_status = authenticated_status(&second.api_base, &second.session)
+            .expect("re-established desktop session should authenticate against the restarted backend");
+        assert_eq!(second_status.get("status").and_then(Value::as_str), Some("online"));
+
+        let stopped = bridge
+            .daemon_control("main", &first.ipc_token, "stop")
+            .expect("desktop daemon stop should succeed after the restart validation");
+        assert_eq!(stopped.status, "stopped");
+    }
+}
