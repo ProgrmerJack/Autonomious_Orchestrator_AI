@@ -27,6 +27,7 @@ from .models import (
     ResearchBrief,
     ResearchSettings,
     ResearchSource,
+    extract_ticker_candidates as _extract_ticker_candidates,
 )
 
 
@@ -156,6 +157,14 @@ class DeepResearchEngine(
             planning_context,
             pc_context,
         )
+        discovery_seed_urls = self._live_discovery_seed_urls(
+            research_objective,
+            query,
+            list(plan.get("query_plan") or []),
+            limit=min(24, max(8, settings.max_sources // 3)),
+        )
+        if discovery_seed_urls:
+            seed_urls = self._persistent_unique_urls(seed_urls + discovery_seed_urls)
         if persistent_seed_urls:
             seed_urls = self._persistent_unique_urls(persistent_seed_urls + seed_urls)
         if seed_urls:
@@ -437,7 +446,9 @@ class DeepResearchEngine(
         candidates.extend(cls._software_agent_diagnostic_seed_urls(objective))
         candidates.extend(cls._collect_urls(objective))
         if planning_context:
-            candidates.extend(cls._collect_urls(planning_context))
+            candidates.extend(
+                cls._planning_context_seed_urls(planning_context, objective)
+            )
 
         deduped: list[str] = []
         seen: set[str] = set()
@@ -455,6 +466,199 @@ class DeepResearchEngine(
             deduped.append(cleaned)
         return deduped[:48]
 
+    @classmethod
+    def _planning_context_seed_urls(
+        cls,
+        planning_context: dict[str, Any],
+        objective: str,
+    ) -> list[str]:
+        candidates: list[str] = []
+        for key in ("source_seeds", "seed_urls", "anchor_urls", "direct_urls"):
+            value = planning_context.get(key)
+            if isinstance(value, (list, tuple, set)):
+                candidates.extend(
+                    str(item).strip() for item in value if str(item).strip()
+                )
+        browser_plan = planning_context.get("browser_research") or {}
+        if isinstance(browser_plan, dict):
+            for key in ("seed_urls", "direct_urls", "candidate_urls"):
+                value = browser_plan.get(key)
+                if isinstance(value, (list, tuple, set)):
+                    candidates.extend(
+                        str(item).strip() for item in value if str(item).strip()
+                    )
+
+        blocked_hosts = cls._blocked_irrelevant_site_hosts(objective)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            cleaned = candidate.rstrip(").,;]}>\"'")
+            if not cleaned:
+                continue
+            if not re.match(r"^[a-z]+://", cleaned, flags=re.IGNORECASE):
+                cleaned = f"https://{cleaned.lstrip('/')}"
+            if not cls._is_safe_public_url(cleaned):
+                continue
+            if cls._is_low_signal_seed_url(cleaned) or cls._is_search_result_url(cleaned):
+                continue
+            host = urllib.parse.urlparse(cleaned).netloc.lower().lstrip("www.")
+            if any(
+                host == blocked or host.endswith(f".{blocked}")
+                for blocked in blocked_hosts
+            ):
+                continue
+            if cleaned in seen:
+                continue
+            seen.add(cleaned)
+            deduped.append(cleaned)
+        return deduped[:24]
+
+    def _seed_discovery_queries(
+        self,
+        objective: str,
+        query: str,
+        plan_queries: list[str] | None = None,
+        limit: int = 6,
+    ) -> list[str]:
+        market_context = " ".join(part for part in (objective, query) if part).strip()
+        candidates: list[str] = list(plan_queries or [])
+        candidates.extend(self._entity_queries(query, objective))
+        core = self._query_core_terms(objective)
+        if core:
+            candidates.insert(0, core)
+        if query:
+            candidates.insert(0, query)
+
+        if self._looks_like_market_query(market_context):
+            original_entity_binding = self._extract_company_binding(query or objective)
+            # Add evidence-axis expansions for broad market discovery without hard-coding tickers.
+            reference_query = query or objective
+            entity = self._extract_company_binding(reference_query)
+            if not entity:
+                tickers = _extract_ticker_candidates(reference_query)
+                if tickers:
+                    entity = tickers[0]
+
+            if entity and self._looks_like_public_security_query(market_context):
+                market_axes = (
+                    f"{entity} analyst coverage price target revisions",
+                    f"{entity} earnings guidance revenue growth",
+                    f"{entity} form 10-k 10-q filing",
+                )
+            else:
+                market_axes = (
+                    "analyst coverage price target revisions",
+                    "earnings guidance revenue growth",
+                    "public company filings 10-k 10-q",
+                    "analyst upgrades downgrades public stocks",
+                    "consensus price target upside public companies",
+                    "earnings estimate revision public companies",
+                )
+
+            base_market_query = self._normalize_research_plan_query(
+                reference_query,
+                reference_query,
+            )
+            for axis in market_axes:
+                expanded = self._normalize_research_plan_query(
+                    f"{base_market_query} {axis}",
+                    reference_query,
+                )
+                if expanded:
+                    candidates.append(expanded)
+
+            if not original_entity_binding:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if not self._extract_company_binding(candidate)
+                    or self._normalize_title(candidate) == self._normalize_title(reference_query)
+                ]
+
+        return self._sanitize_query_variants(candidates, query or objective)[:limit]
+
+    @classmethod
+    def _seed_discovery_providers(
+        cls,
+        objective: str,
+        query: str,
+    ) -> set[str]:
+        combined = " ".join(part for part in (objective, query) if part).strip()
+        providers = {"web-search", "bing-search", "google-news-rss"}
+        if cls._looks_like_software_agent_query(combined):
+            providers.add("github-repositories")
+        if cls._looks_like_market_query(combined):
+            providers.update({"financial-portals", "sec-edgar"})
+        return providers
+
+    def _live_discovery_seed_urls(
+        self,
+        objective: str,
+        query: str,
+        plan_queries: list[str] | None = None,
+        limit: int = 12,
+    ) -> list[str]:
+        market_context = " ".join(part for part in (objective, query) if part).strip()
+        is_market = self._looks_like_market_query(market_context)
+        discovery_queries = self._seed_discovery_queries(
+            objective,
+            query,
+            plan_queries,
+            limit=max(3, min(limit, 10 if is_market else 6)),
+        )
+        if not discovery_queries:
+            return []
+        allowed_providers = self._seed_discovery_providers(objective, query)
+        per_provider_limit = max(2, min(self.limit_per_provider, 8 if is_market else 4))
+        discovered_sources: list[ResearchSource] = []
+        for discovery_query in discovery_queries[: (8 if is_market else 4)]:
+            discovered_sources.extend(
+                self._search_query_across_providers(
+                    discovery_query,
+                    allowed_providers,
+                    per_provider_limit,
+                )
+            )
+            if len(discovered_sources) >= limit * 4:
+                break
+        ranked_sources = self._rank_sources(
+            self._dedupe_sources(discovered_sources),
+            query or objective,
+        )
+        if not ranked_sources and discovered_sources:
+            ranked_sources = self._dedupe_sources(discovered_sources)
+        blocked_hosts = self._blocked_irrelevant_site_hosts(query or objective)
+        urls: list[str] = []
+        seen: set[str] = set()
+        host_counts: dict[str, int] = {}
+        per_host_cap = 4 if is_market else 3
+        sec_host_cap = 2 if self._looks_like_public_security_query(market_context) else 3
+        for source in ranked_sources:
+            cleaned = str(source.url or "").strip().rstrip(").,;]}>\"'")
+            if not cleaned or cleaned in seen:
+                continue
+            if not self._is_safe_public_url(cleaned):
+                continue
+            if self._is_low_signal_seed_url(cleaned) or self._is_search_result_url(cleaned):
+                continue
+            host = urllib.parse.urlparse(cleaned).netloc.lower().lstrip("www.")
+            if any(
+                host == blocked or host.endswith(f".{blocked}")
+                for blocked in blocked_hosts
+            ):
+                continue
+            count = host_counts.get(host, 0)
+            if host == "sec.gov" and count >= sec_host_cap:
+                continue
+            if count >= per_host_cap:
+                continue
+            seen.add(cleaned)
+            host_counts[host] = count + 1
+            urls.append(cleaned)
+            if len(urls) >= limit:
+                break
+        return urls
+
     def _auto_pc_context_for_run(
         self,
         objective: str,
@@ -467,7 +671,22 @@ class DeepResearchEngine(
         if not self._should_auto_pc_context_for_run(objective, query, depth):
             return None
 
-        direct_urls = self._source_seed_urls(objective, None, None)[:8]
+        search_query_limit = 12 if depth == "multi-hour" else 6
+        search_queries = self._seed_discovery_queries(
+            objective,
+            query,
+            limit=search_query_limit,
+        )
+        url_limit = 48 if depth == "multi-hour" else 16
+        direct_urls = self._persistent_unique_urls(
+            self._source_seed_urls(objective, None, None)
+            + self._live_discovery_seed_urls(
+                objective,
+                query,
+                search_queries,
+                limit=url_limit,
+            )
+        )[:url_limit]
         if not direct_urls:
             return None
 
@@ -479,7 +698,8 @@ class DeepResearchEngine(
         judged_results: list[dict[str, Any]] = []
         discovered_domains: list[str] = []
         kept_urls: list[str] = []
-        search_queries = self._software_agent_diagnostic_queries(objective) or [query]
+        if not search_queries:
+            search_queries = self._software_agent_diagnostic_queries(objective) or [query]
 
         for url in direct_urls:
             rendered = self._strip_dom_noise_tokens(str(rendered_pages.get(url) or ""))
@@ -597,12 +817,7 @@ class DeepResearchEngine(
             if not cls._is_safe_public_url(cleaned):
                 continue
             host = urllib.parse.urlsplit(cleaned).netloc.lower().lstrip("www.")
-            if host in {
-                "finance.yahoo.com",
-                "marketwatch.com",
-                "cnbc.com",
-                "news.google.com",
-            }:
+            if host == "news.google.com":
                 continue
             if cls._is_search_result_url(cleaned):
                 continue
@@ -1211,6 +1426,8 @@ class DeepResearchEngine(
             text = cls._normalize_research_plan_query(str(variant or ""), query)
             if not text:
                 continue
+            if not cls._query_variant_matches_intent(text, query):
+                continue
             normalized = cls._normalize_title(text)
             if not normalized or normalized in seen:
                 continue
@@ -1371,6 +1588,9 @@ class DeepResearchEngine(
             return False
         if source.score <= 0.0 and source.provider != "gemini-flash":
             return False
+        cls._assign_source_semantics(source, query)
+        if not cls._matches_intent_spec(source, query):
+            return False
         text = cls._strip_dom_noise_tokens(f"{source.title} {source.abstract}")
         if not text:
             return False
@@ -1380,12 +1600,28 @@ class DeepResearchEngine(
         if cls._looks_like_market_query(query):
             market_signal = cls._has_market_signal(text)
             actionable_market_signal = cls._has_actionable_market_signal(text)
+            signal_strength = cls._market_signal_strength(text)
             if not market_signal and entity_hits == 0:
                 return False
             if entity_hits > 0:
                 return deterministic or alignment >= 0.2
             if cls._looks_like_public_security_query(query):
-                if not actionable_market_signal and alignment < 0.45:
+                if source.subject_kind not in {"public-company", "market-basket"}:
+                    return False
+                if source.subject_kind == "market-basket" and source.evidence_kind not in {
+                    "analyst-coverage",
+                    "market-analysis",
+                    "market-data",
+                    "current-news",
+                    "earnings-news",
+                    "company-profile",
+                }:
+                    return False
+                # Reject lexical collisions that only share a thin word like
+                # "upside" without broader market evidence context.
+                if signal_strength < 2 and not actionable_market_signal and alignment < 0.24:
+                    return False
+                if not actionable_market_signal and alignment < 0.32:
                     return False
                 if not actionable_market_signal and any(
                     flag in (source.quality_flags or [])
@@ -1395,7 +1631,7 @@ class DeepResearchEngine(
                     )
                 ):
                     return False
-            return (deterministic and actionable_market_signal) or alignment >= 0.35
+            return deterministic or actionable_market_signal or alignment >= 0.32
         if source.provider == "gemini-flash":
             return alignment >= 0.25 or entity_hits > 0 or source.relevance >= 0.55
         return deterministic or alignment >= 0.35 or entity_hits > 0
@@ -2542,6 +2778,44 @@ class DeepResearchEngine(
     @staticmethod
     def _settings_for_current_web(settings: ResearchSettings) -> ResearchSettings:
         return _settings_policy.settings_for_current_web(settings)
+
+    @staticmethod
+    def _local_browser_pressure_caps() -> dict[str, int]:
+        caps = {
+            "pc_navigation_limit": 24,
+            "pc_cycle_count": 8,
+            "pc_parallel_workers": 4,
+            "pc_batch_limit": 12,
+            "headless_browser_workers": 6,
+        }
+        if os.name == "nt":
+            # Windows desktops are more prone to local instability when deep
+            # research fans out into many concurrent browser processes.
+            caps.update(
+                {
+                    "pc_navigation_limit": 10,
+                    "pc_cycle_count": 3,
+                    "pc_parallel_workers": 2,
+                    "pc_batch_limit": 5,
+                    "headless_browser_workers": 2,
+                }
+            )
+
+        env_map = {
+            "pc_navigation_limit": "AGENTOS_PC_BROWSER_NAV_LIMIT",
+            "pc_cycle_count": "AGENTOS_PC_BROWSER_CYCLES",
+            "pc_parallel_workers": "AGENTOS_PC_BROWSER_WORKERS",
+            "pc_batch_limit": "AGENTOS_PC_BROWSER_BATCH_LIMIT",
+        }
+        for key, env_name in env_map.items():
+            raw_value = os.environ.get(env_name, "").strip()
+            if not raw_value:
+                continue
+            try:
+                caps[key] = max(1, int(raw_value))
+            except ValueError:
+                continue
+        return caps
 
     @classmethod
     def _settings_for_general_complex_objective(

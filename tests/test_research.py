@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from agentos_orchestrator.product import CrawlBrokerServer, CrawlWorkerServiceRecord
 from agentos_orchestrator.research import DeepResearchEngine, ResearchSource
+from agentos_orchestrator.research.models import extract_ticker_candidates
 from agentos_orchestrator.research.crawl_worker import (
     CrawlWorkerLoopConfig,
     ResearchCrawlWorker,
@@ -689,12 +690,11 @@ class ResearchTests(unittest.TestCase):
 
             self.assertTrue(hints)
             self.assertFalse(any("use all available" in hint.lower() for hint in hints))
-            self.assertFalse(any("site:finance.yahoo.com" in hint.lower() for hint in hints))
+            self.assertFalse(
+                any("site:finance.yahoo.com" in hint.lower() for hint in hints)
+            )
             self.assertTrue(
-                any(
-                    "sec" in hint.lower() and "gov" in hint.lower()
-                    for hint in hints
-                )
+                any("sec" in hint.lower() and "gov" in hint.lower() for hint in hints)
             )
 
     def test_persistent_crawl_queue_claims_sources_across_instances(self) -> None:
@@ -731,7 +731,9 @@ class ResearchTests(unittest.TestCase):
     def test_detached_crawl_worker_scaling_is_backlog_sensitive(self) -> None:
         engine = DeepResearchEngine()
 
-        with patch("agentos_orchestrator.research.crawl_state.os.cpu_count", return_value=12):
+        with patch(
+            "agentos_orchestrator.research.crawl_state.os.cpu_count", return_value=12
+        ):
             self.assertEqual(engine._detached_crawl_worker_count(32), 1)
             self.assertEqual(engine._detached_crawl_worker_count(160), 2)
             self.assertEqual(engine._detached_crawl_worker_count(512), 4)
@@ -744,9 +746,13 @@ class ResearchTests(unittest.TestCase):
             engine = DeepResearchEngine(workspace_root=temp_dir)
 
             with (
-                patch.object(engine, "_auto_start_crawl_workers_enabled", return_value=True),
+                patch.object(
+                    engine, "_auto_start_crawl_workers_enabled", return_value=True
+                ),
                 patch.object(engine, "_queued_crawl_backlog_count", return_value=8),
-                patch("agentos_orchestrator.product.CrawlWorkerServiceManager") as service_manager_cls,
+                patch(
+                    "agentos_orchestrator.product.CrawlWorkerServiceManager"
+                ) as service_manager_cls,
                 patch("agentos_orchestrator.product.CrawlWorkerManager") as manager_cls,
             ):
                 engine._maybe_start_detached_crawl_workers()
@@ -1654,7 +1660,9 @@ class ResearchTests(unittest.TestCase):
         self.assertNotIn("Source 120", engine.last_user)
 
     def test_multi_hour_synthesis_defaults_to_hybrid_with_durable_notes(self) -> None:
-        with patch.dict("os.environ", {"AGENTOS_FINAL_SYNTHESIS_MODE": ""}, clear=False):
+        with patch.dict(
+            "os.environ", {"AGENTOS_FINAL_SYNTHESIS_MODE": ""}, clear=False
+        ):
             self.assertEqual(
                 DeepResearchEngine._resolve_final_synthesis_mode(
                     "multi-hour",
@@ -1747,6 +1755,32 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(
             any("against each thesis" in query.lower() for query in plan["query_plan"])
         )
+
+    def test_question_to_keywords_drops_generic_meta_subquestions(self) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        self.assertEqual(
+            DeepResearchEngine._question_to_keywords(
+                "What exact problem statement defines the topic?",
+                query,
+            ),
+            "",
+        )
+        self.assertEqual(
+            DeepResearchEngine._question_to_keywords(
+                "Which causal drivers and mechanisms recur across the evidence?",
+                query,
+            ),
+            "",
+        )
+        keyword_query = DeepResearchEngine._question_to_keywords(
+            "Which companies recently announced buybacks or raised guidance?",
+            query,
+        )
+        self.assertIn("buybacks", keyword_query)
 
     def test_current_web_query_sanitizer_rejects_scaffold_noise(self) -> None:
         query = (
@@ -1951,9 +1985,15 @@ class ResearchTests(unittest.TestCase):
         with patch.object(DeepResearchEngine, "_ai_query_variants", return_value=[]):
             variants = DeepResearchEngine._query_variants(query, "multi-hour")
 
-        self.assertTrue(any(variant.endswith("primary evidence") for variant in variants))
-        self.assertFalse(any(variant.endswith("primary eviden") for variant in variants))
-        self.assertFalse(any(variant.endswith("counterevidenc") for variant in variants))
+        self.assertTrue(
+            any(variant.endswith("primary evidence") for variant in variants)
+        )
+        self.assertFalse(
+            any(variant.endswith("primary eviden") for variant in variants)
+        )
+        self.assertFalse(
+            any(variant.endswith("counterevidenc") for variant in variants)
+        )
 
     def test_gemini_flash_provider_returns_no_evidence_sources(self) -> None:
         # GENERALITY GUARD: an LLM tool observation is parametric-memory
@@ -2239,7 +2279,68 @@ class ResearchTests(unittest.TestCase):
 
         self.assertIn("https://sec.gov", seed_urls)
         self.assertIn("https://reuters.com/markets", seed_urls)
-        self.assertFalse(any("finance.yahoo.com" in url for url in seed_urls))
+        # Article-level Yahoo Finance URLs from PC context should NOT be seeded
+        # (they are volatile, page-specific, and unreliable as seed anchors).
+        # General discovery URLs are allowed, but raw article-level portal links are not.
+        self.assertFalse(
+            any("finance.yahoo.com" in url and "articles/" in url for url in seed_urls)
+        )
+
+    def test_market_source_seed_urls_reject_blocked_planning_hosts(self) -> None:
+        objective = (
+            "As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months."
+        )
+        planning_context = {
+            "browser_research": {
+                "seed_urls": [
+                    "https://sec.gov",
+                    "https://reuters.com/markets",
+                    "https://arxiv.org/abs/2604.25791",
+                    "https://ai.google.dev/gemini-api/docs",
+                    "https://fred.stlouisfed.org",
+                ]
+            }
+        }
+
+        urls = DeepResearchEngine._source_seed_urls(objective, planning_context, None)
+
+        self.assertIn("https://sec.gov", urls)
+        self.assertIn("https://reuters.com/markets", urls)
+        self.assertFalse(any("arxiv.org" in url for url in urls))
+        self.assertFalse(any("ai.google.dev" in url for url in urls))
+        self.assertFalse(any("fred.stlouisfed.org" in url for url in urls))
+
+    def test_financial_portals_uses_live_news_results_without_templates(self) -> None:
+        class YahooNewsEngine(DeepResearchEngine):
+            def _get_json(self, url: str) -> dict[str, Any]:
+                if "finance/search" in url:
+                    return {
+                        "quotes": [],
+                        "news": [
+                            {
+                                "title": "Analysts see upside in semiconductor stocks",
+                                "link": "https://example.com/semis-upside",
+                                "publisher": "Reuters",
+                                "providerPublishTime": 1760000000,
+                            }
+                        ],
+                    }
+                return {}
+
+            def _fetch_yf_fundamentals_abstract(self, symbol: str, name: str) -> str:
+                del symbol, name
+                return ""
+
+        engine = YahooNewsEngine()
+        sources = engine._search_financial_portals(
+            "which publicly traded companies have highest probability-adjusted upside potential over next 12 24 months",
+            limit=5,
+        )
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].url, "https://example.com/semis-upside")
+        self.assertEqual(sources[0].provider, "financial-portals")
 
     def test_software_agent_source_seed_urls_include_authoritative_roots(
         self,
@@ -2285,7 +2386,9 @@ class ResearchTests(unittest.TestCase):
 
         sources = engine._pc_finding_seed_sources(pc_context)
 
-        self.assertTrue(any(source.provider == "pc-browser-research" for source in sources))
+        self.assertTrue(
+            any(source.provider == "pc-browser-research" for source in sources)
+        )
 
     def test_static_asset_urls_are_excluded_from_persistent_url_sets(self) -> None:
         engine = FakeDeepResearchEngine()
@@ -2358,9 +2461,7 @@ class ResearchTests(unittest.TestCase):
                 provider="crossref",
                 title=f"Deep research agent study {index}",
                 url=f"https://doi.org/10.1000/test-{index}",
-                abstract=(
-                    "Deep research agent architecture and retrieval evidence."
-                ),
+                abstract=("Deep research agent architecture and retrieval evidence."),
                 score=100.0 - index,
                 relevance=0.9,
                 credibility_score=0.7,
@@ -2393,6 +2494,79 @@ class ResearchTests(unittest.TestCase):
         self.assertIn(
             "pc-browser-research",
             {source.provider for source in selected},
+        )
+
+    def test_select_balanced_top_caps_single_domain_for_market_query(self) -> None:
+        query = "highest probability-adjusted upside stocks over next 12 months"
+        ranked: list[ResearchSource] = []
+        for index in range(8):
+            ranked.append(
+                ResearchSource(
+                    provider="web-search",
+                    title=f"NVDA upside screen candidate {index}",
+                    url=f"https://stockanalysis.com/stocks/nvda/forecast/{index}",
+                    abstract="Analyst upside screen and price target summary.",
+                    score=100.0 - index,
+                    relevance=0.8,
+                    credibility_score=0.45,
+                    evidence_grade="weak",
+                )
+            )
+        ranked.extend(
+            [
+                ResearchSource(
+                    provider="bing-search",
+                    title="NVDA quote and valuation",
+                    url="https://finance.yahoo.com/quote/NVDA",
+                    abstract="Price, valuation metrics, and analyst target snapshot.",
+                    score=89.0,
+                    relevance=0.82,
+                    credibility_score=0.58,
+                    evidence_grade="moderate",
+                ),
+                ResearchSource(
+                    provider="bing-search",
+                    title="NVDA earnings date and history",
+                    url="https://www.marketbeat.com/stocks/NASDAQ/NVDA/earnings/",
+                    abstract="Earnings dates, estimates, and historical surprise data.",
+                    score=88.5,
+                    relevance=0.79,
+                    credibility_score=0.55,
+                    evidence_grade="moderate",
+                ),
+                ResearchSource(
+                    provider="pc-browser-research",
+                    title="NVDA analyst consensus target",
+                    url="https://www.tipranks.com/stocks/nvda/forecast",
+                    abstract="Analyst consensus and distribution of price targets.",
+                    score=88.0,
+                    relevance=0.8,
+                    credibility_score=0.52,
+                    evidence_grade="moderate",
+                    quality_flags=["browser-judged-source"],
+                ),
+            ]
+        )
+
+        selected = DeepResearchEngine._select_balanced_top(
+            ranked,
+            max_sources=10,
+            query=query,
+        )
+        stockanalysis_count = sum(
+            1 for source in selected if "stockanalysis.com" in source.url
+        )
+
+        self.assertLessEqual(stockanalysis_count, 5)
+        self.assertGreaterEqual(
+            len(
+                {
+                    DeepResearchEngine._source_domain(source.url)
+                    for source in selected
+                    if source.url
+                }
+            ),
+            3,
         )
 
     def test_run_writes_synthesis_packet_artifact(self) -> None:
@@ -2528,7 +2702,9 @@ class ResearchTests(unittest.TestCase):
             {"sec-edgar", "earnings-data", "web-search", "financial-portals"},
         )
 
-        self.assertEqual(academic_order[:3], ("openalex", "semantic-scholar", "crossref"))
+        self.assertEqual(
+            academic_order[:3], ("openalex", "semantic-scholar", "crossref")
+        )
         self.assertEqual(software_order[0], "github-repositories")
         self.assertEqual(market_order[:2], ("sec-edgar", "earnings-data"))
 
@@ -2558,8 +2734,7 @@ class ResearchTests(unittest.TestCase):
             )
 
             diagnostics_path = (
-                Path(temp_dir)
-                / "runs/run_live_diag/research/provider_diagnostics.json"
+                Path(temp_dir) / "runs/run_live_diag/research/provider_diagnostics.json"
             )
             self.assertTrue(diagnostics_path.exists())
             payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
@@ -2636,6 +2811,19 @@ class ResearchTests(unittest.TestCase):
             4,
         )
 
+    def test_headless_browser_pool_respects_local_browser_cap(self) -> None:
+        engine = DeepResearchEngine()
+        engine._active_objective = (
+            "[multi-hour] highest-potential public companies as of now"
+        )
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+
+        self.assertLessEqual(
+            engine._headless_browser_pool_size(24),
+            int(caps["headless_browser_workers"]),
+        )
+        self.assertGreaterEqual(engine._headless_browser_pool_size(24), 1)
+
     def test_generic_market_words_do_not_make_source_on_topic(self) -> None:
         query = "public stocks with highest potential to soar as of now"
         generic = ResearchSource(
@@ -2687,6 +2875,278 @@ class ResearchTests(unittest.TestCase):
         self.assertNotIn("stocks public timeline", cleaned)
         self.assertNotIn("stocks public uncertainty", cleaned)
         self.assertIn("stocks earnings catalyst revisions", cleaned)
+
+    def test_public_company_intent_rejects_app_store_and_storymaps(self) -> None:
+        query = "public stocks with highest potential to soar as of now"
+        app_listing = ResearchSource(
+            provider="web-search",
+            title="Upside - Cash Back App on the App Store",
+            url="https://apps.apple.com/us/app/upside-cash-back-gas-food/id1099997190",
+            year=2026,
+            abstract="Public company upside offers for gas and restaurants in the app store.",
+            score=20.0,
+        )
+        story_map = ResearchSource(
+            provider="web-search",
+            title="Public companies upside StoryMap",
+            url="https://storymaps.arcgis.com/stories/company-upside",
+            year=2026,
+            abstract="Interactive ArcGIS story map covering public companies and upside themes.",
+            score=20.0,
+        )
+
+        self.assertFalse(DeepResearchEngine._matches_intent_spec(app_listing, query))
+        self.assertFalse(DeepResearchEngine._matches_intent_spec(story_map, query))
+
+    def test_market_intent_rejects_sec_navigation_pages(self) -> None:
+        query = "which publicly traded companies have highest probability-adjusted upside potential over next 12 24 months"
+        sec_nav = ResearchSource(
+            provider="web-search",
+            title="SEC rules and regulations",
+            url="https://sec.gov/rules-regulations",
+            abstract="SEC rules and regulations index page.",
+            score=20.0,
+        )
+        sec_filing = ResearchSource(
+            provider="web-search",
+            title="NVIDIA 10-Q filing",
+            url="https://www.sec.gov/ixviewer/ix.html?doc=/Archives/edgar/data/1045810/000104581025000123/nvda-20250430x10q.htm",
+            abstract="Form 10-Q filing with revenue and guidance sections.",
+            score=20.0,
+        )
+
+        self.assertFalse(DeepResearchEngine._matches_intent_spec(sec_nav, query))
+        self.assertTrue(DeepResearchEngine._matches_intent_spec(sec_filing, query))
+
+    def test_public_security_rejects_single_word_upside_lexical_collisions(self) -> None:
+        query = (
+            "which publicly traded companies have the highest probability-adjusted "
+            "upside potential over the next 12 to 24 months"
+        )
+        lexical_collision = ResearchSource(
+            provider="web-search",
+            title="Upside Story Map",
+            url="https://storymaps.arcgis.com/stories/upside",
+            abstract="A public map project named Upside with community places.",
+            score=20.0,
+        )
+        valid_market_basket = ResearchSource(
+            provider="web-search",
+            title="Analysts lift price targets for semiconductor stocks",
+            url="https://www.reuters.com/markets/us/analysts-lift-price-targets-semiconductor-stocks-2026-05-10/",
+            abstract=(
+                "Analyst upgrades, consensus price targets, valuation, and earnings "
+                "guidance trends across listed chip stocks."
+            ),
+            score=20.0,
+        )
+
+        self.assertFalse(
+            DeepResearchEngine._source_is_on_topic(lexical_collision, query)
+        )
+        self.assertTrue(
+            DeepResearchEngine._source_is_on_topic(valid_market_basket, query)
+        )
+
+    def test_seed_discovery_queries_expand_broad_market_axes(self) -> None:
+        engine = DeepResearchEngine()
+        objective = (
+            "As of right now, research which publicly traded companies have the "
+            "highest probability-adjusted upside potential over the next 12 to 24 months."
+        )
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        queries = engine._seed_discovery_queries(
+            objective,
+            query,
+            plan_queries=[],
+            limit=10,
+        )
+
+        joined = "\n".join(queries).lower()
+        self.assertIn("analyst upgrades downgrades", joined)
+        self.assertIn("consensus price target upside", joined)
+        self.assertIn("earnings estimate revision", joined)
+
+    def test_seed_discovery_queries_keep_broad_market_objective_basket_level(self) -> None:
+        engine = DeepResearchEngine()
+        objective = (
+            "As of right now, research which publicly traded companies have the "
+            "highest probability-adjusted upside potential over the next 12 to 24 months."
+        )
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+        plan_queries = [
+            "nvidia stock forecast analysts see 35 upside for nvda over the next 12 months",
+            "which publicly traded companies have highest probability-adjusted upside potential over next 12 24 months",
+        ]
+
+        queries = engine._seed_discovery_queries(
+            objective,
+            query,
+            plan_queries=plan_queries,
+            limit=10,
+        )
+
+        self.assertFalse(any("nvda" in item.lower() for item in queries))
+
+    def test_extract_company_binding_rejects_ui_noise_labels(self) -> None:
+        self.assertEqual(
+            DeepResearchEngine._extract_company_binding(
+                "Stock Screener Why analysts raised targets across the market"
+            ),
+            "",
+        )
+
+    def test_public_security_rejects_market_navigation_pages(self) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+        source = ResearchSource(
+            provider="pc-browser-research",
+            title="Highest Upside Stocks | Stock Screener",
+            url="https://www.chartmill.com/stock/markets/usa/screener/highest-upside-stocks",
+            abstract="Download indicators, symbol, company, price change, upside rating.",
+        )
+
+        DeepResearchEngine._assign_source_semantics(source, query)
+
+        self.assertEqual(source.evidence_kind, "market-navigation")
+        self.assertFalse(DeepResearchEngine._matches_intent_spec(source, query))
+
+    def test_broad_public_company_query_skips_content_chained_queries(self) -> None:
+        query = (
+            "which publicly traded companies have highest probability-adjusted upside "
+            "potential over next 12 24 months"
+        )
+
+        queries = DeepResearchEngine._content_to_new_queries(
+            "Higher forecasted upside stocks. Highest analyst upside list. Symbol price change upside rating market cap.",
+            "Stocks With Highest Analyst Upside Potential | StockTi",
+            query,
+            "https://stockti.com/stocks/higher-forecasted-upside",
+        )
+
+        self.assertEqual(queries, [])
+
+    def test_extract_ticker_candidates_excludes_sec_artifacts(self) -> None:
+        text = (
+            "SEC EDGAR HTTPS filing data for NVDA and AAPL Form 10-Q indicates "
+            "earnings context."
+        )
+        tickers = extract_ticker_candidates(text)
+
+        self.assertIn("NVDA", tickers)
+        self.assertIn("AAPL", tickers)
+        self.assertNotIn("SEC", tickers)
+        self.assertNotIn("EDGAR", tickers)
+        self.assertNotIn("HTTPS", tickers)
+
+    def test_web_results_provider_boundary_filters_market_false_positives(
+        self,
+    ) -> None:
+        class FilteredWebResultsEngine(DeepResearchEngine):
+            def _get_text(self, url: str, **kwargs: Any) -> str:
+                del kwargs
+                if "duckduckgo.com/html" in url:
+                    return """
+                    <html><body>
+                    <a class="result__a" href="https://apps.apple.com/us/app/upside-cash-back-gas-food/id1099997190">
+                    Upside - Cash Back App on the App Store
+                    </a>
+                    <div class="result__snippet">Public company upside deals for drivers and diners.</div>
+                    <a class="result__a" href="https://storymaps.arcgis.com/stories/company-upside">
+                    Public companies upside StoryMap
+                    </a>
+                    <div class="result__snippet">Interactive story map about public companies and upside themes.</div>
+                    <a class="result__a" href="https://www.reuters.com/markets/us/analysts-see-upside-in-chip-stocks-2026-01-01/">
+                    Analysts see upside in chip stocks after earnings
+                    </a>
+                    <div class="result__snippet">Analysts raised price targets after earnings and revenue guidance revisions.</div>
+                    </body></html>
+                    """
+                return ""
+
+        engine = FilteredWebResultsEngine()
+        sources = engine._search_web_results(
+            "which publicly traded companies have highest probability-adjusted upside potential over next 12 24 months",
+            limit=5,
+        )
+
+        urls = {source.url for source in sources}
+        self.assertIn(
+            "https://www.reuters.com/markets/us/analysts-see-upside-in-chip-stocks-2026-01-01/",
+            urls,
+        )
+        self.assertNotIn(
+            "https://apps.apple.com/us/app/upside-cash-back-gas-food/id1099997190",
+            urls,
+        )
+        self.assertNotIn(
+            "https://storymaps.arcgis.com/stories/company-upside",
+            urls,
+        )
+
+    def test_google_news_unresolved_wrappers_are_rejected(self) -> None:
+        class GoogleNewsWrapperEngine(DeepResearchEngine):
+            def _get_text(self, url: str, **kwargs: Any) -> str:
+                del kwargs
+                if "news.google.com/rss/search" in url:
+                    return """
+                    <rss><channel>
+                      <item>
+                                                <title>NVDA stock analysts raise semiconductor targets after earnings guidance</title>
+                        <link>https://news.google.com/rss/articles/CBMiTESTWRAPPER?oc=5</link>
+                        <pubDate>Fri, 10 May 2026 12:00:00 GMT</pubDate>
+                        <source>Reuters</source>
+                      </item>
+                    </channel></rss>
+                    """
+                return ""
+
+            def _resolve_google_news_article_url(self, url: str) -> str:
+                return url
+
+        engine = GoogleNewsWrapperEngine()
+        sources = engine._search_google_news_rss("nvda earnings guidance", limit=5)
+
+        self.assertEqual(sources, [])
+
+    def test_google_news_resolved_links_use_canonical_article_urls(self) -> None:
+        class GoogleNewsResolvedEngine(DeepResearchEngine):
+            def _get_text(self, url: str, **kwargs: Any) -> str:
+                del kwargs
+                if "news.google.com/rss/search" in url:
+                    return """
+                    <rss><channel>
+                      <item>
+                                                <title>NVDA stock analysts raise semiconductor targets after earnings guidance</title>
+                        <link>https://news.google.com/rss/articles/CBMiTESTWRAPPER?oc=5</link>
+                        <pubDate>Fri, 10 May 2026 12:00:00 GMT</pubDate>
+                        <source>Reuters</source>
+                      </item>
+                    </channel></rss>
+                    """
+                return ""
+
+            def _resolve_google_news_article_url(self, url: str) -> str:
+                del url
+                return "https://www.reuters.com/markets/us/nvidia-analyst-targets-2026-05-10/"
+
+        engine = GoogleNewsResolvedEngine()
+        sources = engine._search_google_news_rss("nvda earnings guidance", limit=5)
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(
+            sources[0].url,
+            "https://www.reuters.com/markets/us/nvidia-analyst-targets-2026-05-10/",
+        )
 
     def test_current_web_low_novelty_stops_before_full_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -900,20 +900,37 @@ class WorkerAgent(ObjectiveAnalysisMixin):
 
         seed_urls: list[str] = []
         seen_seed_urls: set[str] = set()
+        discovery_builder = getattr(
+            self.research_engine,
+            "_live_discovery_seed_urls",
+            None,
+        )
+        if callable(discovery_builder):
+            try:
+                for candidate in discovery_builder(
+                    objective,
+                    core_query,
+                    search_queries,
+                    limit=8,
+                ):
+                    normalized_url = self._planning_seed_url(
+                        candidate,
+                        reference_query,
+                    )
+                    if not normalized_url or normalized_url in seen_seed_urls:
+                        continue
+                    seen_seed_urls.add(normalized_url)
+                    seed_urls.append(normalized_url)
+            except Exception:
+                pass
         for candidate in ai_strategy.get("authoritative_domains") or []:
-            normalized_url = self._planning_seed_url(candidate)
-            if not normalized_url or normalized_url in seen_seed_urls:
-                continue
-            seen_seed_urls.add(normalized_url)
-            seed_urls.append(normalized_url)
-        for candidate in self._browser_authoritative_seed_urls(objective, core_query):
-            normalized_url = self._planning_seed_url(candidate)
+            normalized_url = self._planning_seed_url(candidate, reference_query)
             if not normalized_url or normalized_url in seen_seed_urls:
                 continue
             seen_seed_urls.add(normalized_url)
             seed_urls.append(normalized_url)
         for candidate in self._software_agent_diagnostic_seed_urls(objective):
-            normalized_url = self._planning_seed_url(candidate)
+            normalized_url = self._planning_seed_url(candidate, reference_query)
             if not normalized_url or normalized_url in seen_seed_urls:
                 continue
             seen_seed_urls.add(normalized_url)
@@ -953,7 +970,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         }
 
     @staticmethod
-    def _planning_seed_url(candidate: Any) -> str | None:
+    def _planning_seed_url(candidate: Any, reference_query: str = "") -> str | None:
         text = str(candidate or "").strip().rstrip("/")
         if not text:
             return None
@@ -963,24 +980,17 @@ class WorkerAgent(ObjectiveAnalysisMixin):
             return None
         if DeepResearchEngine._is_search_result_url(text):
             return None
+        if reference_query:
+            host = urllib.parse.urlparse(text).netloc.lower().lstrip("www.")
+            blocked_hosts = DeepResearchEngine._blocked_irrelevant_site_hosts(
+                reference_query
+            )
+            if any(
+                host == blocked or host.endswith(f".{blocked}")
+                for blocked in blocked_hosts
+            ):
+                return None
         return text
-
-    @staticmethod
-    def _browser_authoritative_seed_urls(
-        objective: str,
-        core_query: str,
-    ) -> list[str]:
-        combined = f"{objective} {core_query}".strip()
-        if not DeepResearchEngine._looks_like_market_query(combined):
-            return []
-        seeds = [
-            "https://sec.gov",
-            "https://reuters.com/markets",
-            "https://fred.stlouisfed.org",
-        ]
-        if DeepResearchEngine._looks_like_current_evidence_query(combined):
-            seeds.append("https://www.bls.gov")
-        return seeds[:4]
 
     @staticmethod
     def _multi_hour_min_runtime_seconds() -> int:
@@ -1316,6 +1326,8 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         urls: list[str],
         browser_plan: dict[str, Any] | None = None,
     ) -> int:
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+        cap = max(1, int(caps.get("pc_navigation_limit", 24)))
         safe_urls = [
             str(url).strip()
             for url in urls
@@ -1323,7 +1335,7 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         ]
         candidate_count = len(safe_urls)
         if candidate_count == 0:
-            return 5
+            return min(5, cap)
         query_count = 0
         if isinstance(browser_plan, dict):
             query_count = len(
@@ -1335,27 +1347,29 @@ class WorkerAgent(ObjectiveAnalysisMixin):
             )
         if WorkerAgent._pc_browser_expansive_mode(objective, browser_plan):
             adaptive_target = max(
-                12,
-                min(candidate_count, 24),
-                min(query_count * 2, 24),
+                min(8, cap),
+                min(candidate_count, cap),
+                min(query_count * 2, cap),
             )
-            return max(12, min(adaptive_target, 24))
+            return min(adaptive_target, cap)
         if candidate_count >= 8 or query_count >= 5:
-            return min(candidate_count, 8)
-        return min(candidate_count, 5)
+            return min(candidate_count, 8, cap)
+        return min(candidate_count, 5, cap)
 
     @staticmethod
     def _pc_browser_cycle_count(
         objective: str,
         browser_plan: dict[str, Any] | None = None,
     ) -> int:
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+        cap = max(1, int(caps.get("pc_cycle_count", 8)))
         query_count = 0
         if isinstance(browser_plan, dict):
             query_count = len(browser_plan.get("search_queries") or [])
         if WorkerAgent._pc_browser_expansive_mode(objective, browser_plan):
-            return max(3, min(8, 2 + max(1, query_count // 4)))
+            return min(cap, max(2, 2 + max(1, query_count // 4)))
         if query_count >= 6:
-            return min(4, 1 + (query_count // 4))
+            return min(cap, 1 + (query_count // 4))
         return 1
 
     @staticmethod
@@ -1364,14 +1378,16 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         backend: Any,
         frontier_urls: list[str],
     ) -> int:
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+        cap = max(1, int(caps.get("pc_parallel_workers", 4)))
         if not frontier_urls:
             return 1
         if not isinstance(backend, VirtualDesktopSandboxBackend):
             return 1
         if WorkerAgent._pc_browser_expansive_mode(objective):
-            return max(1, min(4, len(frontier_urls) // 8 or 1))
+            return max(1, min(cap, len(frontier_urls) // 8 or 1))
         if len(frontier_urls) >= 8:
-            return min(3, max(2, len(frontier_urls) // 5))
+            return min(cap, 3, max(2, len(frontier_urls) // 5))
         return 1
 
     @staticmethod
@@ -1379,9 +1395,11 @@ class WorkerAgent(ObjectiveAnalysisMixin):
         objective: str,
         navigation_limit: int,
     ) -> int:
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+        cap = max(1, int(caps.get("pc_batch_limit", 12)))
         if WorkerAgent._pc_browser_expansive_mode(objective):
-            return max(4, min(int(navigation_limit or 1), 12))
-        return max(2, min(int(navigation_limit or 1), 8))
+            return min(cap, max(4, min(int(navigation_limit or 1), cap)))
+        return min(cap, max(2, min(int(navigation_limit or 1), 8)))
 
     @staticmethod
     def _pc_browser_expansive_mode(

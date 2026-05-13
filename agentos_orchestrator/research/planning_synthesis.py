@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -374,13 +375,6 @@ class ResearchPlanningSynthesisMixin:
             for m in missing[:6]:
                 lines.append(f"- {m}")
             lines.append("")
-
-        # AI upgrade notice
-        lines.append("---")
-        lines.append(
-            "*Note: AI synthesis (Gemini) was not available. Set `GEMINI_API_KEY` "
-            "in your `.env` file to enable institutional-quality analyst narrative.*"
-        )
 
         return "\n".join(lines)
 
@@ -913,17 +907,31 @@ class ResearchPlanningSynthesisMixin:
 
         merged_domains: list[str] = []
         seen_domains: set[str] = set()
+        blocked_domains = self._blocked_irrelevant_site_hosts(query_reference)
         for domain in diagnostic_authorities + list(
             ai_strategy.get("authoritative_domains") or []
         ):
             text = str(domain or "").strip()
             if not text:
                 continue
-            normalized = text.lower().rstrip("/")
+            normalized_url = (
+                text
+                if re.match(r"^[a-z]+://", text, flags=re.IGNORECASE)
+                else f"https://{text.lstrip('/')}"
+            )
+            if not self._is_safe_public_url(normalized_url):
+                continue
+            host = urllib.parse.urlparse(normalized_url).netloc.lower().lstrip("www.")
+            if any(
+                host == blocked or host.endswith(f".{blocked}")
+                for blocked in blocked_domains
+            ):
+                continue
+            normalized = normalized_url.rstrip("/").lower()
             if normalized in seen_domains:
                 continue
             seen_domains.add(normalized)
-            merged_domains.append(text)
+            merged_domains.append(normalized_url.rstrip("/"))
 
         return {
             "core_question": objective[:300],
@@ -1075,8 +1083,8 @@ class ResearchPlanningSynthesisMixin:
             deduped.append(text)
         return deduped[:18]
 
-    @staticmethod
-    def _question_to_keywords(question: str, query: str) -> str:
+    @classmethod
+    def _question_to_keywords(cls, question: str, query: str) -> str:
         """Convert a full subquestion sentence into a short keyword phrase
         suitable for API search (≤60 chars)."""
         # Drop stop words and common filler.
@@ -1096,6 +1104,8 @@ class ResearchPlanningSynthesisMixin:
             "an",
             "in",
             "of",
+            "recently",
+            "announced",
             "to",
             "and",
             "or",
@@ -1113,10 +1123,73 @@ class ResearchPlanningSynthesisMixin:
             "system",
             "systems",
         }
+        meta_research_terms = {
+            "baseline",
+            "scope",
+            "define",
+            "defines",
+            "definition",
+            "definitions",
+            "mechanism",
+            "mechanisms",
+            "limitation",
+            "limitations",
+            "failure",
+            "mode",
+            "modes",
+            "causal",
+            "factor",
+            "factors",
+            "driver",
+            "drivers",
+            "evidence",
+            "problem",
+            "statement",
+            "thesis",
+            "theses",
+            "topic",
+            "exact",
+            "explicit",
+            "remain",
+            "recur",
+            "across",
+            "uncertainty",
+            "uncertainties",
+        }
+        query_anchors: list[str] = []
+        for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower()):
+            if token in stop_words or token in cls._generic_query_terms():
+                continue
+            if token not in query_anchors:
+                query_anchors.append(token)
+
         words = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", question.lower())
-        keywords = [w for w in words if w not in stop_words]
-        phrase = " ".join(keywords[:6])
-        return phrase[:60].strip() if len(phrase) >= 6 else ""
+        question_tokens = [w for w in words if w not in stop_words]
+        novel_tokens: list[str] = []
+        for token in question_tokens:
+            if token in cls._generic_query_terms() or token in query_anchors:
+                continue
+            if token not in novel_tokens:
+                novel_tokens.append(token)
+        if not novel_tokens:
+            return ""
+        signal_tokens = [
+            token for token in novel_tokens if token not in meta_research_terms
+        ]
+        if not signal_tokens:
+            return ""
+
+        phrase_tokens: list[str] = []
+        for token in query_anchors[:4]:
+            if token not in phrase_tokens:
+                phrase_tokens.append(token)
+        for token in signal_tokens:
+            if token not in phrase_tokens:
+                phrase_tokens.append(token)
+            if len(phrase_tokens) >= 6:
+                break
+        phrase = " ".join(phrase_tokens[:6])
+        return phrase[:80].strip() if len(phrase_tokens) >= 3 else ""
 
     @staticmethod
     def _clean_objective(objective: str) -> str:
@@ -1912,6 +1985,7 @@ class ResearchPlanningSynthesisMixin:
             r"\banalyst-grade\b",
             r"\bscientist-grade\b",
             r"\branked candidates\b",
+            r"\bevidence for and against each thesis[^.;]*",
             r"\bthe evidence for and against each thesis[^.;]*",
             r"\buncertainty bounds\b",
             r"\bcatalyst quality\b",

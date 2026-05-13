@@ -142,6 +142,7 @@ class ResearchCrawlWorker:
                 content,
                 source.title,
                 query,
+                source.url,
             )
             self.engine._record_crawl_observation(
                 source,

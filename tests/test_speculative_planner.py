@@ -1,4 +1,5 @@
 """Tests for the SpeculativePlanner (Phase 5)."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -19,6 +20,7 @@ from agentos_orchestrator.os_control.base import UiAction
 # Helpers                                                                       #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def _action(action_type: str, selector: str = "el") -> UiAction:
     return UiAction(action_type=action_type, selector=selector)
 
@@ -34,6 +36,7 @@ def _make_observation(frame_id: str = "frame-1") -> MagicMock:
 # ─────────────────────────────────────────────────────────────────────────── #
 # build_plan                                                                    #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestSpeculativePlannerBuildPlan:
     def test_build_plan_returns_speculative_plan(self):
@@ -73,6 +76,7 @@ class TestSpeculativePlannerBuildPlan:
 # ─────────────────────────────────────────────────────────────────────────── #
 # next_commit                                                                   #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestSpeculativePlannerNextCommit:
     def test_exhausted_plan_returns_no_commit(self):
@@ -145,7 +149,7 @@ class TestSpeculativePlannerNextCommit:
         spec = SpeculativeAction(
             action=irrev_action,
             speculative_reward=0.8,
-            risk_score=0.50,   # below abort threshold
+            risk_score=0.50,  # below abort threshold
             requires_approval=True,
             is_irreversible=True,
         )
@@ -163,6 +167,7 @@ class TestSpeculativePlannerNextCommit:
 # ─────────────────────────────────────────────────────────────────────────── #
 # SpeculativePlan helpers                                                       #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestSpeculativePlanHelpers:
     def test_mark_committed_advances_counter(self):
@@ -196,6 +201,7 @@ class TestSpeculativePlanHelpers:
 # refresh_plan                                                                  #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def test_refresh_plan_invalidates_old_plan():
     planner = SpeculativePlanner(mcts_iterations=5)
     obs1 = _make_observation("obs-1")
@@ -211,6 +217,7 @@ def test_refresh_plan_invalidates_old_plan():
 # Module-level singleton                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def test_get_speculative_planner_returns_same_instance():
     p1 = get_speculative_planner()
     p2 = get_speculative_planner()
@@ -220,6 +227,7 @@ def test_get_speculative_planner_returns_same_instance():
 # ─────────────────────────────────────────────────────────────────────────── #
 # Irreversible action types constant                                            #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def test_irreversible_action_types_is_frozenset():
     assert isinstance(IRREVERSIBLE_ACTION_TYPES, frozenset)

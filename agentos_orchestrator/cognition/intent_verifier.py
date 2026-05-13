@@ -93,7 +93,7 @@ _WRITE_ACTION_TYPES = frozenset(
     {"type", "set_value", "fill", "paste", "click_submit", "submit"},
 )
 # Actions that navigate to external destinations
-_NAVIGATE_TYPES = frozenset({"open_url", "navigate", "goto", "launch"}),
+_NAVIGATE_TYPES = (frozenset({"open_url", "navigate", "goto", "launch"}),)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -209,6 +209,7 @@ class DiagnosticianDecision:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Constraint compiler                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class IntentConstraintCompiler:
     """Compile a user objective string into a list of IntentConstraints.
@@ -397,6 +398,7 @@ class IntentConstraintCompiler:
 # Specialised constraint implementations                                       #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @dataclass(slots=True)
 class _VisualPromptInjectionGuard(IntentConstraint):
     """Detect injected instructions embedded in action values or selectors."""
@@ -471,6 +473,7 @@ class _ApprovalRequiredConstraint(IntentConstraint):
 # ─────────────────────────────────────────────────────────────────────────── #
 # Logic verifier                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class IntentVerifier:
     """Check proposed actions against compiled intent constraints.
@@ -555,11 +558,13 @@ class IntentVerifier:
 # Convenience helpers                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def json_safe_metadata(metadata: dict | None) -> str:
     if not metadata:
         return ""
     try:
         import json
+
         return json.dumps(metadata, default=str)[:512]
     except Exception:  # noqa: BLE001
         return str(metadata)[:512]
@@ -612,8 +617,7 @@ def _build_repair_hints(
             " Sanitize on-screen text before trusting it as an argument."
         )
     return (
-        "Review the action against the user's objective and request approval"
-        " if unsure."
+        "Review the action against the user's objective and request approval if unsure."
     )
 
 

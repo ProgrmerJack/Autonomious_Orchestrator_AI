@@ -1,4 +1,5 @@
 """Tests for programmer_recipes.py (Phase 3)."""
+
 from __future__ import annotations
 
 import textwrap
@@ -16,6 +17,7 @@ from agentos_orchestrator.cognition.programmer_recipes import (
 # ─────────────────────────────────────────────────────────────────────────── #
 # Registry                                                                      #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestRecipeRegistry:
     def test_all_expected_recipes_registered(self):
@@ -45,23 +47,27 @@ class TestRecipeRegistry:
 # recipe_for_objective                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestRecipeForObjective:
-    @pytest.mark.parametrize("objective, expected_id", [
-        ("Analyse the stock price of AAPL over 6 months", "stock_analysis"),
-        ("Generate a ticker report with OHLCV data", "stock_analysis"),
-        ("Create a PowerPoint presentation for the Q3 review", "presentation"),
-        ("Build a PPTX deck with 5 slides", "presentation"),
-        ("Export the results to PDF", "pdf_report"),
-        ("Render a PDF report from the markdown notes", "pdf_report"),
-        ("Create a Word document summarising the findings", "docx_report"),
-        ("Produce a DOCX report", "docx_report"),
-        ("Transform the CSV file to filter by date", "csv_transform"),
-        ("Aggregate and reshape the data.csv", "csv_transform"),
-        ("Plot a bar chart of monthly sales", "chart"),
-        ("Visualize the time series as a line graph", "chart"),
-        ("Aggregate the research snippets into a brief", "research_brief"),
-        ("Write a research summary from the sources", "research_brief"),
-    ])
+    @pytest.mark.parametrize(
+        "objective, expected_id",
+        [
+            ("Analyse the stock price of AAPL over 6 months", "stock_analysis"),
+            ("Generate a ticker report with OHLCV data", "stock_analysis"),
+            ("Create a PowerPoint presentation for the Q3 review", "presentation"),
+            ("Build a PPTX deck with 5 slides", "presentation"),
+            ("Export the results to PDF", "pdf_report"),
+            ("Render a PDF report from the markdown notes", "pdf_report"),
+            ("Create a Word document summarising the findings", "docx_report"),
+            ("Produce a DOCX report", "docx_report"),
+            ("Transform the CSV file to filter by date", "csv_transform"),
+            ("Aggregate and reshape the data.csv", "csv_transform"),
+            ("Plot a bar chart of monthly sales", "chart"),
+            ("Visualize the time series as a line graph", "chart"),
+            ("Aggregate the research snippets into a brief", "research_brief"),
+            ("Write a research summary from the sources", "research_brief"),
+        ],
+    )
     def test_objective_maps_to_recipe(self, objective, expected_id):
         result = recipe_for_objective(objective)
         assert result == expected_id, (
@@ -69,13 +75,16 @@ class TestRecipeForObjective:
         )
 
     def test_unrelated_objective_returns_none(self):
-        result = recipe_for_objective("Open the file explorer and navigate to Documents")
+        result = recipe_for_objective(
+            "Open the file explorer and navigate to Documents"
+        )
         assert result is None
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Code generation — structural checks                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestStockAnalysisCodeGen:
     def test_generates_nonempty_code(self):
@@ -101,10 +110,13 @@ class TestStockAnalysisCodeGen:
 
 class TestPresentationCodeGen:
     def test_generates_nonempty_code(self):
-        code = build_recipe_code("presentation", {
-            "title": "Q3 Results",
-            "slides": [{"heading": "Summary", "bullets": ["Good quarter"]}],
-        })
+        code = build_recipe_code(
+            "presentation",
+            {
+                "title": "Q3 Results",
+                "slides": [{"heading": "Summary", "bullets": ["Good quarter"]}],
+            },
+        )
         assert len(code.strip()) > 50
 
     def test_code_contains_title(self):
@@ -136,11 +148,14 @@ class TestPdfReportCodeGen:
 
 class TestCsvTransformCodeGen:
     def test_generates_nonempty_code(self):
-        code = build_recipe_code("csv_transform", {
-            "input_path": "data.csv",
-            "output_file": "filtered.csv",
-            "operations": [{"kind": "head", "n": 50}],
-        })
+        code = build_recipe_code(
+            "csv_transform",
+            {
+                "input_path": "data.csv",
+                "output_file": "filtered.csv",
+                "operations": [{"kind": "head", "n": 50}],
+            },
+        )
         assert len(code.strip()) > 50
 
     def test_code_is_valid_python(self):
@@ -150,12 +165,15 @@ class TestCsvTransformCodeGen:
 
 class TestChartCodeGen:
     def test_generates_nonempty_code(self):
-        code = build_recipe_code("chart", {
-            "chart_type": "bar",
-            "x_data": ["Jan", "Feb", "Mar"],
-            "y_data": [10, 20, 15],
-            "title": "Monthly Sales",
-        })
+        code = build_recipe_code(
+            "chart",
+            {
+                "chart_type": "bar",
+                "x_data": ["Jan", "Feb", "Mar"],
+                "y_data": [10, 20, 15],
+                "title": "Monthly Sales",
+            },
+        )
         assert len(code.strip()) > 50
 
     def test_code_is_valid_python(self):
@@ -169,10 +187,13 @@ class TestChartCodeGen:
 
 class TestResearchBriefCodeGen:
     def test_generates_nonempty_code(self):
-        code = build_recipe_code("research_brief", {
-            "topic": "AI Safety",
-            "snippets": [{"source": "arXiv", "text": "Recent work shows..."}],
-        })
+        code = build_recipe_code(
+            "research_brief",
+            {
+                "topic": "AI Safety",
+                "snippets": [{"source": "arXiv", "text": "Recent work shows..."}],
+            },
+        )
         assert len(code.strip()) > 50
 
     def test_code_is_valid_python(self):
@@ -183,6 +204,7 @@ class TestResearchBriefCodeGen:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Error handling                                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def test_build_recipe_code_raises_for_unknown_recipe():
     with pytest.raises(KeyError):

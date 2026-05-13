@@ -40,31 +40,34 @@ log = logging.getLogger(__name__)
 # Configuration constants                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-MAX_SPECULATIVE_STEPS: int = 24   # hard cap on plan length
-MCTS_ITERATIONS: int = 80         # simulations per search
-MIN_PREFIX_SCORE: float = 0.35    # minimum cumulative reward to commit
+MAX_SPECULATIVE_STEPS: int = 24  # hard cap on plan length
+MCTS_ITERATIONS: int = 80  # simulations per search
+MIN_PREFIX_SCORE: float = 0.35  # minimum cumulative reward to commit
 STALE_OBSERVATION_HASH_MISMATCH = "stale_hash"
-IRREVERSIBLE_ACTION_TYPES: frozenset[str] = frozenset({
-    "file_delete",
-    "shell_exec",
-    "send_message",
-    "trade_order",
-    "payment",
-    "bulk_delete",
-})
+IRREVERSIBLE_ACTION_TYPES: frozenset[str] = frozenset(
+    {
+        "file_delete",
+        "shell_exec",
+        "send_message",
+        "trade_order",
+        "payment",
+        "bulk_delete",
+    }
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Data structures                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @dataclass(slots=True)
 class SpeculativeAction:
     """A single action inside a speculative plan, annotated with risk."""
 
     action: UiAction
-    speculative_reward: float       # estimated reward for this step
-    risk_score: float               # 0–1; from RiskGuardian or heuristic
+    speculative_reward: float  # estimated reward for this step
+    risk_score: float  # 0–1; from RiskGuardian or heuristic
     requires_approval: bool
     is_irreversible: bool
 
@@ -75,9 +78,9 @@ class SpeculativePlan:
 
     plan_id: str
     objective: str
-    observation_hash: str           # hash of ObservationFrame at plan-build time
+    observation_hash: str  # hash of ObservationFrame at plan-build time
     actions: list[SpeculativeAction] = field(default_factory=list)
-    committed_count: int = 0        # how many have been committed so far
+    committed_count: int = 0  # how many have been committed so far
     is_stale: bool = False
     build_timestamp: float = field(default_factory=time.time)
 
@@ -85,7 +88,7 @@ class SpeculativePlan:
 
     @property
     def remaining(self) -> list[SpeculativeAction]:
-        return self.actions[self.committed_count:]
+        return self.actions[self.committed_count :]
 
     @property
     def next_action(self) -> SpeculativeAction | None:
@@ -124,6 +127,7 @@ class CommitDecision:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Risk scoring — thin shim so the planner is self-contained                    #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def _quick_risk_score(action: UiAction) -> tuple[float, bool]:
     """Lightweight heuristic risk score when RiskGuardian is unavailable.
@@ -186,6 +190,7 @@ except ImportError:
 # Observation hashing                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def _hash_observation(observation: Any) -> str:
     """Produce a short hash of the observation for staleness detection."""
     if observation is None:
@@ -208,6 +213,7 @@ def _hash_observation(observation: Any) -> str:
 # MCTS search → speculative plan                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class _MCTSSearch:
     """Thin driver around MCTSWorldModel for SpeculativePlanner."""
 
@@ -229,7 +235,10 @@ class _MCTSSearch:
 
         for _ in range(self._iterations):
             node = self._select(root)
-            if not self._wm.is_terminal(node.state, objective) and not node.is_fully_expanded():
+            if (
+                not self._wm.is_terminal(node.state, objective)
+                and not node.is_fully_expanded()
+            ):
                 node = self._expand(node, objective)
             reward = self._simulate(node.state, objective, max_depth)
             self._backpropagate(node, reward)
@@ -290,6 +299,7 @@ class _MCTSSearch:
 # ─────────────────────────────────────────────────────────────────────────── #
 # SpeculativePlanner                                                            #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class SpeculativePlanner:
     """Generates, validates, and incrementally commits speculative action plans.
@@ -460,7 +470,9 @@ class SpeculativePlanner:
         effective_approval = spec.requires_approval or live_approval
 
         if effective_risk >= self._abort_threshold:
-            plan.invalidate(f"action {spec.action.action_type} live_risk={effective_risk:.2f}")
+            plan.invalidate(
+                f"action {spec.action.action_type} live_risk={effective_risk:.2f}"
+            )
             return CommitDecision(
                 should_commit=False,
                 action=spec.action,

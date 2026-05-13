@@ -1,4 +1,5 @@
 """Tests for the IntentVerifier and IntentConstraintCompiler (Phase 4)."""
+
 from __future__ import annotations
 
 import pytest
@@ -15,6 +16,7 @@ from agentos_orchestrator.os_control.base import UiAction
 # ─────────────────────────────────────────────────────────────────────────── #
 # Fixtures                                                                      #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 @pytest.fixture
 def compiler() -> IntentConstraintCompiler:
@@ -43,6 +45,7 @@ def _action(
 # ─────────────────────────────────────────────────────────────────────────── #
 # Compiler tests                                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestIntentConstraintCompiler:
     def test_benign_objective_returns_at_least_injection_guard(self, compiler):
@@ -77,14 +80,20 @@ class TestIntentConstraintCompiler:
         assert any("trade" in cat.lower() for cat in categories)
 
     def test_messaging_objective_adds_messaging_constraint(self, compiler):
-        constraints = compiler.compile("Send an email to all team members with the report")
+        constraints = compiler.compile(
+            "Send an email to all team members with the report"
+        )
         categories = [c.category for c in constraints]
-        assert any("message" in cat.lower() or "messaging" in cat.lower() for cat in categories)
+        assert any(
+            "message" in cat.lower() or "messaging" in cat.lower() for cat in categories
+        )
 
     def test_no_duplicate_categories(self, compiler):
         constraints = compiler.compile("Delete old receipts and send email")
         categories = [c.category for c in constraints]
-        assert len(categories) == len(set(categories)), "Constraint categories must be unique"
+        assert len(categories) == len(set(categories)), (
+            "Constraint categories must be unique"
+        )
 
     def test_compile_returns_list(self, compiler):
         result = compiler.compile("Some objective")
@@ -94,6 +103,7 @@ class TestIntentConstraintCompiler:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Verifier tests                                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestIntentVerifier:
     def test_benign_action_passes(self, verifier, compiler):
@@ -109,7 +119,10 @@ class TestIntentVerifier:
         action = _action("click", "confirm-payment-button")
         decision = verifier.verify(action, "Pay the invoice", constraints)
         # approval constraint requires confirmation
-        assert decision.diagnostician in ("confirm", "abort") or decision.violated_constraints
+        assert (
+            decision.diagnostician in ("confirm", "abort")
+            or decision.violated_constraints
+        )
 
     def test_delete_guard_blocks_delete_when_not_in_objective(self, verifier, compiler):
         # Objective does NOT mention delete → delete_guard PatternConstraint IS added
@@ -119,7 +132,9 @@ class TestIntentVerifier:
         decision = verifier.verify(action, "Archive the old project files", constraints)
         assert decision.diagnostician in ("abort", "confirm", "reflect", "repair")
 
-    def test_credential_guard_blocks_password_action_without_credential_objective(self, verifier, compiler):
+    def test_credential_guard_blocks_password_action_without_credential_objective(
+        self, verifier, compiler
+    ):
         # Objective does NOT mention credential → credential_guard IS added
         # Action value contains "password" → triggers abort
         constraints = compiler.compile("Fill in the registration form")
@@ -127,15 +142,19 @@ class TestIntentVerifier:
         decision = verifier.verify(action, "Fill in the registration form", constraints)
         assert decision.diagnostician in ("abort", "confirm", "reflect")
 
-    def test_trade_guard_blocks_trade_value_when_not_in_objective(self, verifier, compiler):
+    def test_trade_guard_blocks_trade_value_when_not_in_objective(
+        self, verifier, compiler
+    ):
         # Non-trade objective → PatternConstraint blocks trade-related action values
         # Action value "buy stock AAPL" matches _TRADE_RE → blocked
         constraints = compiler.compile("Click a button")
         action = _action("click", "btn", value="buy stock now")
         decision = verifier.verify(action, "Click a button", constraints)
         # Either blocked by trade guard or credential/payment guard
-        assert decision.diagnostician in ("confirm", "abort") or \
-               len(decision.violated_constraints) > 0
+        assert (
+            decision.diagnostician in ("confirm", "abort")
+            or len(decision.violated_constraints) > 0
+        )
 
     def test_injection_guard_detects_injected_text(self, verifier, compiler):
         constraints = compiler.compile("Fill in the web form")
@@ -150,7 +169,9 @@ class TestIntentVerifier:
     def test_screenshot_action_always_passes(self, verifier, compiler):
         constraints = compiler.compile("Take a screenshot of the desktop")
         action = _action("screenshot", "desktop")
-        decision = verifier.verify(action, "Take a screenshot of the desktop", constraints)
+        decision = verifier.verify(
+            action, "Take a screenshot of the desktop", constraints
+        )
         assert decision.diagnostician == "execute"
 
     def test_verify_plan_returns_per_action_decisions(self, verifier, compiler):
@@ -176,6 +197,7 @@ class TestIntentVerifier:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Edge cases                                                                    #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestIntentVerifierEdgeCases:
     def test_empty_objective(self, verifier, compiler):

@@ -12,11 +12,63 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from typing import Any
 
-from .models import ResearchSource, extract_ticker_candidates as _extract_ticker_candidates
+from .models import (
+    ResearchSource,
+    extract_ticker_candidates as _extract_ticker_candidates,
+)
 from .provider_policy import provider_order as _provider_order_policy
 
 
 class ProviderSearchMixin:
+    @staticmethod
+    def _decode_google_news_wrapper_url(url: str) -> str:
+        parsed = urllib.parse.urlparse(url or "")
+        if "news.google.com" not in parsed.netloc.lower():
+            return url
+        query = urllib.parse.parse_qs(parsed.query)
+        for key in ("url", "u", "q"):
+            candidate = str((query.get(key) or [""])[0] or "").strip()
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+        return url
+
+    def _resolve_google_news_article_url(self, url: str) -> str:
+        candidate = self._decode_google_news_wrapper_url(url)
+        parsed = urllib.parse.urlparse(candidate or "")
+        if "news.google.com" not in parsed.netloc.lower():
+            return candidate
+
+        try:
+            import httpx  # type: ignore[import-not-found]
+
+            with httpx.Client(
+                follow_redirects=True,
+                timeout=6.0,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            ) as client:
+                response = client.get(candidate)
+                resolved = str(response.url)
+                if resolved.startswith(("http://", "https://")):
+                    return resolved
+        except Exception:
+            return candidate
+        return candidate
+
+    def _provider_source_allowed(
+        self,
+        source: ResearchSource,
+        query: str,
+    ) -> bool:
+        self._assign_source_semantics(source, query)
+        return self._matches_intent_spec(source, query)
+
     def _search_semantic_scholar(
         self,
         query: str,
@@ -342,6 +394,7 @@ class ProviderSearchMixin:
         # when it is absent so SEC EDGAR calls never crash with ImportError.
         try:
             import h2  # noqa: F401  # type: ignore[import-not-found]
+
             _http2 = True
         except ImportError:
             _http2 = False
@@ -684,16 +737,17 @@ class ProviderSearchMixin:
             if not abstract:
                 # API unavailable for this symbol — skip rather than fake it
                 continue
-            sources.append(
-                ResearchSource(
-                    provider="financial-portals",
-                    title=f"{name} ({symbol}) — Live Fundamentals",
-                    url=f"https://finance.yahoo.com/quote/{symbol}",
-                    year=datetime.now(UTC).year,
-                    abstract=abstract,
-                    score=65.0,
-                )
+            source = ResearchSource(
+                provider="financial-portals",
+                title=f"{name} ({symbol}) — Live Fundamentals",
+                url=f"https://finance.yahoo.com/quote/{symbol}",
+                year=datetime.now(UTC).year,
+                abstract=abstract,
+                score=65.0,
             )
+            if not self._provider_source_allowed(source, query):
+                continue
+            sources.append(source)
 
         query_entity_terms = {
             token.lower() for token in re.findall(r"\b[A-Z][A-Za-z]{3,}\b", query)
@@ -701,6 +755,7 @@ class ProviderSearchMixin:
         query_entity_terms.update(
             token.lower() for token in _extract_ticker_candidates(query)
         )
+        explicit_query_entity = self._extract_company_binding(query)
 
         # Real news articles from Yahoo Finance (actual URLs, actual titles)
         for item in (yf_payload.get("news") or [])[: min(target_limit, 12)]:
@@ -722,28 +777,51 @@ class ProviderSearchMixin:
             aligned_news = self._objective_alignment_score(title_text, query) >= 0.35
             if query_entity_terms and not (mentions_entity or aligned_news):
                 continue
+            if (
+                not query_entity_terms
+                and self._looks_like_market_query(query)
+                and not aligned_news
+                and not self._has_market_signal(title_text)
+            ):
+                continue
             year = datetime.now(UTC).year
             if pub_time:
                 try:
                     year = datetime.fromtimestamp(int(pub_time), UTC).year
                 except (ValueError, OSError):
                     pass
-            sources.append(
-                ResearchSource(
-                    provider="financial-portals",
-                    title=title,
-                    url=url,
-                    year=year,
-                    abstract=f"{publisher}: {title}",
-                    score=25.0,
-                )
+            source = ResearchSource(
+                provider="financial-portals",
+                title=title,
+                url=url,
+                year=year,
+                abstract=f"{publisher}: {title}",
+                score=25.0,
             )
+            if not self._provider_source_allowed(source, query):
+                continue
+            sources.append(source)
 
         # ── 2. Explicit ticker extraction + company-name search ──────────────
         # Two strategies to resolve companies from the query:
         # (a) Short all-caps tickers via _extract_ticker_candidates
         # (b) Capitalized company-name tokens (e.g. NVIDIA, Apple, Microsoft)
         #     searched individually on YF v1 since the full query returns no quotes.
+        if self._looks_like_market_query(query) and not explicit_query_entity:
+            self._record_provider_diagnostic(
+                "financial-portals",
+                "info",
+                "skipped issuer-specific fallback resolution for broad market query",
+            )
+            sources.sort(
+                key=lambda source: (
+                    source.score,
+                    "Live Fundamentals" in source.title,
+                ),
+                reverse=True,
+            )
+            return sources[: target_limit * 3]
+
         tickers = _extract_ticker_candidates(query)
         candidate_names: list[str] = []
         _common_words = {
@@ -775,6 +853,14 @@ class ProviderSearchMixin:
             "ABOUT",
             "WILL",
             "HAVE",
+            "US",
+            "USA",
+            "PUBLIC",
+            "PUBLICLY",
+            "COMPANY",
+            "COMPANIES",
+            "UPSIDE",
+            "POTENTIAL",
         }
         for token in query.split():
             t = token.strip(".,!?;:")
@@ -1045,6 +1131,7 @@ class ProviderSearchMixin:
         seen_urls: set[str] = set()
 
         # Bing requires realistic browser headers to avoid bot-detection responses.
+        # Do NOT set Accept-Encoding — let httpx negotiate based on installed libs.
         bing_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1053,7 +1140,6 @@ class ProviderSearchMixin:
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://www.bing.com/",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
@@ -1082,60 +1168,94 @@ class ProviderSearchMixin:
                 break
 
             added_this_page = 0
-            # Bing 2024+ results: multiple possible result structures.
-            # Pattern 1: <h2><a href="...">title</a></h2> inside .b_algo
-            # Pattern 2: data-href attributes in newer layouts
-            patterns = [
-                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"&]+)"[^>]*>(.*?)</a>',
-                r'<a[^>]+class="[^"]*tilk[^"]*"[^>]+href="(https?://[^"&]+)"[^>]*>(.*?)</a>',
-                r'cite[^>]*>(https?://[^<]+)</cite>',
-            ]
-            # Use the richest pattern that gives results
-            for pattern in patterns:
-                matches = list(re.finditer(pattern, raw, flags=re.IGNORECASE | re.DOTALL))
-                if matches:
-                    for match in matches:
-                        if len(match.groups()) == 2:
-                            url = match.group(1).strip()
-                            title = self._html_to_text(match.group(2)).strip()
-                        else:
-                            url = "https://" + match.group(1).strip().lstrip("https://")
-                            title = self._label_from_url(url)
-                        if not url or not title:
-                            continue
-                        if not self._is_safe_public_url(url):
-                            continue
-                        if "bing.com" in url or "microsoft.com" in url:
-                            continue
-                        if url in seen_urls:
-                            continue
-                        seen_urls.add(url)
-                        # Extract snippet from surrounding HTML
-                        match_end = match.end()
-                        tail = raw[match_end: match_end + 3000]
+
+            # Bing 2024+ HTML: result titles are in <h2><a href="bing.com/ck/a?...">
+            # where the real destination URL is base64-encoded in the `u=a1<B64>`
+            # parameter.  The context check (b_algo within 2000 chars) ensures we
+            # only pick up organic result blocks, not Bing widgets or nav links.
+            url_title_pairs: list[tuple[str, str]] = []
+            for match in re.finditer(
+                r'<h2[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>(.*?)</a>',
+                raw,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                raw_href = match.group(1)
+                title_html = match.group(2)
+                # Confirm this h2 is inside a b_algo result block
+                ctx_start = max(0, match.start() - 2000)
+                if "b_algo" not in raw[ctx_start : match.start()]:
+                    continue
+                title = self._html_to_text(title_html).strip()
+                if not title:
+                    continue
+                # Decode Bing's /ck/a redirect URL to get the real destination
+                url = ""
+                if "bing.com/ck/a" in raw_href or raw_href.startswith(
+                    "https://www.bing"
+                ):
+                    # Real URL is base64-encoded in &u=a1<B64>&  (HTML-escaped as &amp;u=a1…)
+                    u_match = re.search(
+                        r"[?&;](?:amp;)?u=a1([A-Za-z0-9+/\-_%]+)", raw_href
+                    )
+                    if u_match:
+                        try:
+                            import base64 as _b64
+
+                            b64 = urllib.parse.unquote(u_match.group(1))
+                            b64 += "=" * (4 - len(b64) % 4) if len(b64) % 4 else ""
+                            real = _b64.b64decode(b64).decode("utf-8", errors="ignore")
+                            if real.startswith("http"):
+                                url = real
+                        except Exception:
+                            pass
+                else:
+                    if raw_href.startswith("http"):
+                        url = raw_href
+                if url:
+                    url_title_pairs.append((url, title))
+
+            for url, title in url_title_pairs:
+                if not self._is_safe_public_url(url):
+                    continue
+                if "bing.com" in url or "microsoft.com" in url:
+                    continue
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                # Try to find a snippet paragraph near the URL reference in raw HTML.
+                # Search for the encoded domain name in the raw page to locate context.
+                host_needle = urllib.parse.urlparse(url).netloc.lstrip("www.")
+                snippet = ""
+                if host_needle:
+                    ctx_idx = raw.find(host_needle)
+                    if ctx_idx >= 0:
+                        tail = raw[ctx_idx : ctx_idx + 2000]
                         snippet_m = re.search(
                             r'<p[^>]*(?:class="[^"]*(?:b_algoSlug|b_paractl|snippet)[^"]*")?[^>]*>(.*?)</p>',
                             tail,
                             flags=re.IGNORECASE | re.DOTALL,
                         )
-                        snippet = self._html_to_text(snippet_m.group(1)).strip() if snippet_m else ""
-                        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
-                        score = max(target_limit - len(sources), 1)
-                        sources.append(
-                            ResearchSource(
-                                provider="bing-search",
-                                title=title[:160],
-                                url=url,
-                                authors=[host] if host else [],
-                                abstract=(snippet or f"Bing result: {title}")[:800],
-                                score=float(score),
-                            )
+                        snippet = (
+                            self._html_to_text(snippet_m.group(1)).strip()
+                            if snippet_m
+                            else ""
                         )
-                        added_this_page += 1
-                        if len(sources) >= target_limit:
-                            break
-                    if sources:  # found results with this pattern
-                        break
+                host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+                score = max(target_limit - len(sources), 1)
+                source = ResearchSource(
+                    provider="bing-search",
+                    title=title[:160],
+                    url=url,
+                    authors=[host] if host else [],
+                    abstract=(snippet or f"Bing result: {title}")[:800],
+                    score=float(score),
+                )
+                if not self._provider_source_allowed(source, query):
+                    continue
+                sources.append(source)
+                added_this_page += 1
+                if len(sources) >= target_limit:
+                    break
             if len(sources) >= target_limit or added_this_page == 0:
                 break
 
@@ -1208,11 +1328,8 @@ class ProviderSearchMixin:
             title = (
                 (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
             )
-            url = (link_m.group(1) or link_m.group(2) or "").strip() if link_m else ""
-            # Google News wraps links in its redirect; try to decode
-            if "news.google.com" in url:
-                # The real URL is after a redirect; use as-is (enrichment will follow)
-                pass
+            raw_url = (link_m.group(1) or link_m.group(2) or "").strip() if link_m else ""
+            url = self._resolve_google_news_article_url(raw_url)
             publisher = (
                 self._html_to_text(source_m.group(1)).strip()
                 if source_m
@@ -1226,20 +1343,24 @@ class ProviderSearchMixin:
                     year = int(yr_m.group(1))
             if not title or not url:
                 continue
+            if "news.google.com" in urllib.parse.urlparse(url).netloc.lower():
+                # Do not accept unresolved Google wrapper URLs as primary evidence.
+                continue
             if url in seen:
                 continue
             seen.add(url)
-            sources.append(
-                ResearchSource(
-                    provider="google-news-rss",
-                    title=title[:160],
-                    url=url,
-                    year=year,
-                    authors=[publisher] if publisher else [],
-                    abstract=f"{publisher}: {title}",
-                    score=30.0,
-                )
+            source = ResearchSource(
+                provider="google-news-rss",
+                title=title[:160],
+                url=url,
+                year=year,
+                authors=[publisher] if publisher else [],
+                abstract=f"{publisher}: {title}",
+                score=30.0,
             )
+            if not self._provider_source_allowed(source, query):
+                continue
+            sources.append(source)
             if len(sources) >= target_limit:
                 break
 
@@ -1434,6 +1555,14 @@ class ProviderSearchMixin:
             "ANALYSIS",
             "MARKET",
             "SHARES",
+            "US",
+            "USA",
+            "PUBLIC",
+            "PUBLICLY",
+            "COMPANY",
+            "COMPANIES",
+            "UPSIDE",
+            "POTENTIAL",
         }
         for token in query.split():
             t = token.strip(".,!?;:")
@@ -1535,6 +1664,12 @@ class ProviderSearchMixin:
             "TRADING",
             "BUYING",
             "SELLING",
+            "US",
+            "USA",
+            "PUBLIC",
+            "PUBLICLY",
+            "COMPANY",
+            "COMPANIES",
         }
         for token in query.split():
             t = token.strip(".,!?;:")
@@ -1657,6 +1792,7 @@ class ProviderSearchMixin:
 
         tickers: list[str] = []
         _stop = {"AND", "THE", "FOR", "SHORT", "INTEREST", "SQUEEZE", "FLOAT"}
+        _stop.update({"US", "USA", "PUBLIC", "PUBLICLY", "COMPANY", "COMPANIES"})
         for token in query.split():
             t = token.strip(".,!?;:")
             if re.match(r"^[A-Z]{1,6}$", t) and t not in _stop:
@@ -1759,6 +1895,12 @@ class ProviderSearchMixin:
             "GUIDANCE",
             "BEAT",
             "MISS",
+            "US",
+            "USA",
+            "PUBLIC",
+            "PUBLICLY",
+            "COMPANY",
+            "COMPANIES",
         }
         for token in query.split():
             t = token.strip(".,!?;:")
@@ -2252,9 +2394,13 @@ class ProviderSearchMixin:
             url_title_pairs: list[tuple[str, str, int]] = []
             added_this_page = 0
             for ddg_pat in ddg_patterns:
-                for match in re.finditer(ddg_pat, raw_html, flags=re.IGNORECASE | re.DOTALL):
+                for match in re.finditer(
+                    ddg_pat, raw_html, flags=re.IGNORECASE | re.DOTALL
+                ):
                     raw_url = self._normalize_web_result_url(match.group(1))
-                    title = self._html_to_text(match.group(2)) or self._label_from_url(raw_url)
+                    title = self._html_to_text(match.group(2)) or self._label_from_url(
+                        raw_url
+                    )
                     if raw_url and title:
                         url_title_pairs.append((raw_url, title, match.end()))
                 if url_title_pairs:
@@ -2265,7 +2411,7 @@ class ProviderSearchMixin:
                     continue
                 if raw_url in seen_urls:
                     continue
-                tail = raw_html[match_end: match_end + 1500]
+                tail = raw_html[match_end : match_end + 1500]
                 snippet_match = re.search(
                     r'class="[^"]*(?:result__snippet|result-snippet|snippet)[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
                     tail,
@@ -2301,20 +2447,21 @@ class ProviderSearchMixin:
                 global_rank += 1
                 host = urllib.parse.urlparse(raw_url).netloc.lower().lstrip("www.")
                 score = max(target_limit - global_rank + 1, 0)
-                sources.append(
-                    ResearchSource(
-                        provider="web-search",
-                        title=title[:160],
-                        url=raw_url,
-                        authors=[host] if host else [],
-                        abstract=(
-                            snippet or "Generic web result. Snippet unavailable."
-                        )[:1200],
-                        citation_count=score,
-                        score=float(score),
-                        quality_flags=quality_flags,
-                    )
+                source = ResearchSource(
+                    provider="web-search",
+                    title=title[:160],
+                    url=raw_url,
+                    authors=[host] if host else [],
+                    abstract=(snippet or "Generic web result. Snippet unavailable.")[
+                        :1200
+                    ],
+                    citation_count=score,
+                    score=float(score),
+                    quality_flags=quality_flags,
                 )
+                if not self._provider_source_allowed(source, query):
+                    continue
+                sources.append(source)
                 if len(sources) >= target_limit:
                     break
             if len(sources) >= target_limit or added_this_page == 0:
@@ -2349,9 +2496,7 @@ class ProviderSearchMixin:
             )
             and provider_searchers.get(provider) is not None
         ]
-        parallel_workers = self._provider_parallel_worker_count(
-            len(routed_providers)
-        )
+        parallel_workers = self._provider_parallel_worker_count(len(routed_providers))
         if getattr(
             self._provider_parallelism_context,
             "disable_nested_provider_parallelism",
@@ -2404,6 +2549,7 @@ class ProviderSearchMixin:
             else:
                 try:
                     import h2  # noqa: F401  # type: ignore[import-not-found]
+
                     _http2_dispatch = True
                 except ImportError:
                     _http2_dispatch = False

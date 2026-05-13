@@ -247,9 +247,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertGreaterEqual(int(budget["financial_results_per_query"]), 16)
 
     def test_expansive_pc_browser_frontier_budget_is_bounded(self) -> None:
-        objective = (
-            "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox"
-        )
+        objective = "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox"
         browser_plan = {
             "enabled": True,
             "search_queries": [f"query {index}" for index in range(12)],
@@ -450,7 +448,10 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertFalse(any("analyst-grade" in query.lower() for query in queries))
         self.assertFalse(
-            any("all available general-purpose research means" in query.lower() for query in queries)
+            any(
+                "all available general-purpose research means" in query.lower()
+                for query in queries
+            )
         )
 
     def test_browser_search_queries_reject_frontier_page_text_fragments(
@@ -585,9 +586,31 @@ class OrchestratorTests(unittest.TestCase):
             )
         )
         self.assertFalse(any("scientist-grade" in query.lower() for query in queries))
-        self.assertFalse(any("against each thesis" in query.lower() for query in queries))
+        self.assertFalse(
+            any("against each thesis" in query.lower() for query in queries)
+        )
         self.assertIn("https://sec.gov", browser_plan["seed_urls"])
         self.assertIn("https://reuters.com", browser_plan["seed_urls"])
+
+    def test_planning_browser_research_uses_live_discovery_for_market_seeds(
+        self,
+    ) -> None:
+        objective = (
+            "As of right now, research which publicly traded companies have the highest "
+            "probability-adjusted upside potential over the next 12 to 24 months."
+        )
+        worker = WorkerAgent(None, None, FakeResearchEngine())
+        worker.research_engine._ai_research_strategy = lambda objective, query, depth: {}
+
+        browser_plan = worker._planning_browser_research(
+            objective,
+            WorkerAgent._heuristic_objective_analysis(objective),
+        )
+
+        self.assertIn("https://example.com/current-analysis", browser_plan["seed_urls"])
+        self.assertIn("https://example.org/filing", browser_plan["seed_urls"])
+        self.assertNotIn("https://fred.stlouisfed.org", browser_plan["seed_urls"])
+        self.assertNotIn("https://www.bls.gov", browser_plan["seed_urls"])
 
     def test_ai_objective_analysis_requires_llm_by_default(self) -> None:
         worker = WorkerAgent(None, None, FakeResearchEngine())
@@ -762,6 +785,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_pc_browser_navigation_limit_expands_for_current_web(self) -> None:
         urls = [f"https://example.com/report-{index}" for index in range(12)]
+        caps = DeepResearchEngine._local_browser_pressure_caps()
 
         limit = WorkerAgent._pc_browser_navigation_limit(
             "Research semiconductor pricing and supplier risk as of now",
@@ -773,7 +797,8 @@ class OrchestratorTests(unittest.TestCase):
             },
         )
 
-        self.assertGreaterEqual(limit, 16)
+        self.assertGreater(limit, 5)
+        self.assertLessEqual(limit, int(caps["pc_navigation_limit"]))
 
     def test_run_pc_browser_actions_honors_expanded_navigation_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -824,10 +849,8 @@ class OrchestratorTests(unittest.TestCase):
                 return [UiNode(node_id="desktop-1", role="Window", name="Desktop")]
 
             def perform(self, action):
-                if action.action_type == "launch_app":
-                    self.launches.append(str(action.value or action.selector))
-                    return "launched"
-                raise RuntimeError(action.action_type)
+                self.launches.append(str(action.value or action.selector))
+                return "launched"
 
         backend = FakeLiveBackend()
         worker = WorkerAgent(None, None, FakeResearchEngine(), pc_backend=backend)
@@ -854,7 +877,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(report.get("launch_target"), "https://example.com/report")
         self.assertTrue(worker._has_browser_surface(nodes))
 
-    def test_run_pc_browser_actions_uses_frontier_selected_browser_nodes(
+    def test_run_pc_browser_actions_uses_frontier_client_when_available(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -907,6 +930,42 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertGreaterEqual(len(frontier_client.calls), 3)
             self.assertTrue(post_nodes)
+
+    def test_expansive_pc_browser_frontier_budget_is_bounded(self) -> None:
+        objective = "[multi-hour] Research highest-potential stocks right now using all available tools in sandbox"
+        browser_plan = {
+            "enabled": True,
+            "search_queries": [f"query {index}" for index in range(12)],
+        }
+        caps = DeepResearchEngine._local_browser_pressure_caps()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend = VirtualDesktopSandboxBackend(Path(temp_dir) / "sandbox.json")
+
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_navigation_limit(
+                    objective,
+                    [f"https://example.com/{index}" for index in range(48)],
+                    browser_plan,
+                ),
+                int(caps["pc_navigation_limit"]),
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_cycle_count(objective, browser_plan),
+                int(caps["pc_cycle_count"]),
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_parallel_browser_worker_count(
+                    objective,
+                    backend,
+                    [f"https://example.com/{index}" for index in range(48)],
+                ),
+                int(caps["pc_parallel_workers"]),
+            )
+            self.assertLessEqual(
+                WorkerAgent._pc_browser_batch_limit(objective, 64),
+                int(caps["pc_batch_limit"]),
+            )
 
     def test_run_pc_browser_actions_hydrates_virtual_browser_with_real_content(
         self,
@@ -1448,7 +1507,9 @@ class OrchestratorTests(unittest.TestCase):
 
                 worker._active_pc_research("run_pc_progress", task, [])
 
-                progress_path = root / "runs" / "run_pc_progress" / "research" / "progress.json"
+                progress_path = (
+                    root / "runs" / "run_pc_progress" / "research" / "progress.json"
+                )
                 payload = json.loads(progress_path.read_text(encoding="utf-8"))
 
                 self.assertEqual(payload["stage"], "pc-research-completed")

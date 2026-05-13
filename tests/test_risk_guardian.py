@@ -1,4 +1,5 @@
 """Tests for the RiskGuardian, PolicyMatrix, and RiskCalibration (Phase 4)."""
+
 from __future__ import annotations
 
 import pytest
@@ -18,18 +19,22 @@ from agentos_orchestrator.os_control.base import UiAction
 # Fixtures                                                                      #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @pytest.fixture
 def guardian() -> RiskGuardian:
     return RiskGuardian()
 
 
-def _action(action_type: str, selector: str = "element", value: str | None = None) -> UiAction:
+def _action(
+    action_type: str, selector: str = "element", value: str | None = None
+) -> UiAction:
     return UiAction(action_type=action_type, selector=selector, value=value)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # classify_target                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestClassifyTarget:
     def test_payment_button_classified_as_payment(self):
@@ -63,6 +68,7 @@ class TestClassifyTarget:
 # ─────────────────────────────────────────────────────────────────────────── #
 # classify_reversibility                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestClassifyReversibility:
     def test_scroll_is_reversible(self):
@@ -108,6 +114,7 @@ class TestClassifyReversibility:
 # RiskGuardian.assess (all params after action are keyword-only)               #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestRiskGuardianAssess:
     def test_scroll_has_low_risk(self, guardian):
         action = _action("scroll", "page")
@@ -141,7 +148,13 @@ class TestRiskGuardianAssess:
     def test_assessment_has_risk_level_string(self, guardian):
         action = _action("click", "btn")
         assessment = guardian.assess(action, objective="Click a button")
-        assert assessment.risk_level in ("negligible", "low", "medium", "high", "critical")
+        assert assessment.risk_level in (
+            "negligible",
+            "low",
+            "medium",
+            "high",
+            "critical",
+        )
 
     def test_context_adjustments_is_dict(self, guardian):
         action = _action("submit", "payment-checkout-form")
@@ -162,6 +175,7 @@ class TestRiskGuardianAssess:
 # ─────────────────────────────────────────────────────────────────────────── #
 # RiskGuardian.is_safe (keyword-only after action)                             #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestRiskGuardianIsSafe:
     def test_scroll_is_safe(self, guardian):
@@ -187,6 +201,7 @@ class TestRiskGuardianIsSafe:
 # ─────────────────────────────────────────────────────────────────────────── #
 # RiskCalibration                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestRiskCalibration:
     def test_record_outcome_increases_delta_on_false_negative(self):
@@ -227,6 +242,7 @@ class TestRiskCalibration:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Module-level assess_action_risk (keyword-only args)                          #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def test_assess_action_risk_module_level():
     action = _action("click", "home-btn")

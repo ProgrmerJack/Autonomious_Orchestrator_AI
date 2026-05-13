@@ -1,4 +1,5 @@
 """Tests for benchmark_promotion.py (Phase 7)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,6 +28,7 @@ from agentos_orchestrator.cognition.benchmark_promotion import (
 # Task catalogue                                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestTaskCatalogue:
     def test_capability_tasks_non_empty(self):
         assert len(CAPABILITY_TASKS) > 0
@@ -54,7 +56,9 @@ class TestTaskCatalogue:
             )
 
     def test_all_safety_categories_covered(self):
-        categories_in_tasks = {t.safety_category for t in SAFETY_TASKS if t.safety_category}
+        categories_in_tasks = {
+            t.safety_category for t in SAFETY_TASKS if t.safety_category
+        }
         # All safety categories should have at least one task
         for cat in SafetyCategory:
             if cat == SafetyCategory.CAPABILITY_NONE:
@@ -65,6 +69,7 @@ class TestTaskCatalogue:
 # ─────────────────────────────────────────────────────────────────────────── #
 # PromotionTier ordering                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestPromotionTierOrdering:
     def test_ordered_has_four_tiers(self):
@@ -93,6 +98,7 @@ class TestPromotionTierOrdering:
 # PromotionGate                                                                 #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestPromotionGate:
     def _passing_state(self, n: int = 15) -> PromotionState:
         """Build a state that has enough passing results to satisfy the gate."""
@@ -109,11 +115,13 @@ class TestPromotionGate:
         return state
 
     def test_gate_passes_when_requirements_met(self):
-        gate = PromotionGate(PromotionGateConfig(
-            min_capability_pass_rate=0.80,
-            min_safety_pass_rate=1.00,
-            min_tasks_evaluated=5,
-        ))
+        gate = PromotionGate(
+            PromotionGateConfig(
+                min_capability_pass_rate=0.80,
+                min_safety_pass_rate=1.00,
+                min_tasks_evaluated=5,
+            )
+        )
         state = self._passing_state(10)
         can, reason = gate.evaluate(state)
         assert can is True
@@ -127,10 +135,12 @@ class TestPromotionGate:
         assert "insuffi" in reason.lower() or "required" in reason.lower()
 
     def test_gate_fails_low_cap_pass_rate(self):
-        gate = PromotionGate(PromotionGateConfig(
-            min_capability_pass_rate=0.90,
-            min_tasks_evaluated=5,
-        ))
+        gate = PromotionGate(
+            PromotionGateConfig(
+                min_capability_pass_rate=0.90,
+                min_tasks_evaluated=5,
+            )
+        )
         state = PromotionState(policy_id="failing-policy")
         for i in range(10):
             outcome = TaskOutcome.PASS if i < 5 else TaskOutcome.FAIL
@@ -146,17 +156,22 @@ class TestPromotionGate:
         assert can is False
 
     def test_gate_fails_too_many_consecutive_failures(self):
-        gate = PromotionGate(PromotionGateConfig(
-            min_tasks_evaluated=5,
-            max_consecutive_failures=2,
-        ))
+        gate = PromotionGate(
+            PromotionGateConfig(
+                min_tasks_evaluated=5,
+                max_consecutive_failures=2,
+            )
+        )
         state = PromotionState(policy_id="bad-policy")
         state.consecutive_failures = 10
         # Add enough results to pass count threshold
         for i in range(5):
             result = TaskResult(
-                task_id=f"t-{i}", outcome=TaskOutcome.FAIL, score=0.0,
-                elapsed_seconds=1.0, tier=PromotionTier.SANDBOX
+                task_id=f"t-{i}",
+                outcome=TaskOutcome.FAIL,
+                score=0.0,
+                elapsed_seconds=1.0,
+                tier=PromotionTier.SANDBOX,
             )
             state.results_by_tier.setdefault("sandbox", []).append(result)
         can, _ = gate.evaluate(state)
@@ -168,7 +183,7 @@ class TestPromotionGate:
             policy_id="demote-me",
             current_tier=PromotionTier.ISOLATED_DESKTOP,
         )
-        state.consecutive_failures = 7   # > 3 * 2 = 6
+        state.consecutive_failures = 7  # > 3 * 2 = 6
         should, reason = gate.should_demote(state)
         assert should is True
         assert "demot" in reason.lower()
@@ -187,6 +202,7 @@ class TestPromotionGate:
 # ─────────────────────────────────────────────────────────────────────────── #
 # BenchmarkRunner                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestBenchmarkRunner:
     def test_dry_run_returns_report(self, tmp_path):
@@ -209,6 +225,7 @@ class TestBenchmarkRunner:
 
     def test_report_json_is_valid(self, tmp_path):
         import json
+
         runner = BenchmarkRunner(policy_id="test", output_dir=tmp_path)
         report = runner.run(tasks=CAPABILITY_TASKS[:2])
         parsed = json.loads(report.to_json())
@@ -282,7 +299,9 @@ class TestBenchmarkRunner:
         runner = BenchmarkRunner(
             policy_id="cap-only",
             output_dir=tmp_path,
-            gate_config=PromotionGateConfig(max_consecutive_failures=len(CAPABILITY_TASKS) + 1),
+            gate_config=PromotionGateConfig(
+                max_consecutive_failures=len(CAPABILITY_TASKS) + 1
+            ),
         )
         report = runner.run_capability_only()
         assert report.total_count == len(CAPABILITY_TASKS)
@@ -291,6 +310,7 @@ class TestBenchmarkRunner:
 # ─────────────────────────────────────────────────────────────────────────── #
 # build_runner factory                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def test_build_runner_returns_runner(tmp_path):
     runner = build_runner("my-policy", output_dir=tmp_path)

@@ -50,10 +50,11 @@ log = logging.getLogger(__name__)
 # Enumerations                                                                  #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class IsolationTier(str, Enum):
-    HOST    = "host"
+    HOST = "host"
     VIRTUAL = "virtual"
-    CUA     = "cua"
+    CUA = "cua"
 
 
 class IsolationUnavailable(RuntimeError):
@@ -63,6 +64,7 @@ class IsolationUnavailable(RuntimeError):
 # ─────────────────────────────────────────────────────────────────────────── #
 # Artifact sync                                                                 #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 @dataclass(slots=True)
 class SyncedArtifact:
@@ -92,11 +94,24 @@ class ArtifactSyncer:
     ) -> None:
         self._sandbox_dir = sandbox_dir
         self._artifacts_dir = artifacts_dir
-        self._extension_allow = extension_allow or frozenset({
-            ".md", ".txt", ".pdf", ".pptx", ".docx", ".csv",
-            ".json", ".png", ".jpg", ".jpeg", ".svg", ".html",
-            ".xlsx", ".py",
-        })
+        self._extension_allow = extension_allow or frozenset(
+            {
+                ".md",
+                ".txt",
+                ".pdf",
+                ".pptx",
+                ".docx",
+                ".csv",
+                ".json",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".svg",
+                ".html",
+                ".xlsx",
+                ".py",
+            }
+        )
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     def sync(self, run_id: str | None = None) -> list[SyncedArtifact]:
@@ -153,10 +168,12 @@ class ArtifactSyncer:
 # Backend resolution helpers                                                    #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 def _build_virtual_backend(sandbox_state_path: Path) -> OsControlBackend:
     from agentos_orchestrator.os_control.virtual_desktop_sandbox_backend import (
         VirtualDesktopSandboxBackend,
     )
+
     return VirtualDesktopSandboxBackend(sandbox_state_path)  # type: ignore[return-value]
 
 
@@ -166,6 +183,7 @@ def _build_cua_backend() -> OsControlBackend:
         from agentos_orchestrator.sandbox.providers import (  # type: ignore[import]
             CuaSandboxProvider,
         )
+
         provider = CuaSandboxProvider()
         # CuaSandboxProvider is a SandboxProvider not an OsControlBackend;
         # we expose it through a thin shim.
@@ -204,6 +222,7 @@ def _build_host_backend() -> OsControlBackend:
     """Return the real UIA backend for full host control."""
     try:
         from agentos_orchestrator.os_control.uia_backend import UiaBackend  # type: ignore[import]
+
         backend = UiaBackend()
         if not backend.available():
             raise IsolationUnavailable("UIA backend reports not available")
@@ -216,9 +235,11 @@ def _build_host_backend() -> OsControlBackend:
 # IsolatedDesktopAdapter                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @dataclass
 class IsolationConfig:
     """Runtime configuration for the adapter."""
+
     tier: IsolationTier = IsolationTier.VIRTUAL
     sandbox_state_path: Path = field(
         default_factory=lambda: Path("artifacts/sandbox/desktop_state.json")
@@ -226,13 +247,11 @@ class IsolationConfig:
     sandbox_working_dir: Path = field(
         default_factory=lambda: Path("artifacts/sandbox/workdir")
     )
-    artifacts_dir: Path = field(
-        default_factory=lambda: Path("artifacts/workflows")
-    )
+    artifacts_dir: Path = field(default_factory=lambda: Path("artifacts/workflows"))
     # If True, fall back to the next tier when the requested tier is unavailable
     allow_tier_fallback: bool = True
-    focus_protection: bool = True          # refuse host actions if focus in use
-    artifact_sync_on_complete: bool = True # auto-sync after each task completion
+    focus_protection: bool = True  # refuse host actions if focus in use
+    artifact_sync_on_complete: bool = True  # auto-sync after each task completion
 
 
 class IsolatedDesktopAdapter:
@@ -320,9 +339,7 @@ class IsolatedDesktopAdapter:
         if self._is_isolated == isolated:
             return
         self._is_isolated = isolated
-        new_tier = (
-            self._config.tier if isolated else IsolationTier.HOST
-        )
+        new_tier = self._config.tier if isolated else IsolationTier.HOST
         log.info(
             "IsolatedDesktopAdapter: switching to %s mode (tier=%s)",
             "isolated" if isolated else "host",
@@ -387,23 +404,27 @@ class IsolatedDesktopAdapter:
         try:
             result = self._backend.perform(action)  # type: ignore[union-attr]
             elapsed = time.monotonic() - start
-            self._action_log.append({
-                "action_type": action.action_type,
-                "selector": action.selector,
-                "result": result,
-                "elapsed_ms": round(elapsed * 1000, 1),
-                "tier": self._current_tier.value if self._current_tier else "?",
-                "isolated": self._is_isolated,
-            })
+            self._action_log.append(
+                {
+                    "action_type": action.action_type,
+                    "selector": action.selector,
+                    "result": result,
+                    "elapsed_ms": round(elapsed * 1000, 1),
+                    "tier": self._current_tier.value if self._current_tier else "?",
+                    "isolated": self._is_isolated,
+                }
+            )
             return result
         except Exception as exc:
-            self._action_log.append({
-                "action_type": action.action_type,
-                "selector": action.selector,
-                "result": f"error:{exc}",
-                "tier": self._current_tier.value if self._current_tier else "?",
-                "isolated": self._is_isolated,
-            })
+            self._action_log.append(
+                {
+                    "action_type": action.action_type,
+                    "selector": action.selector,
+                    "result": f"error:{exc}",
+                    "tier": self._current_tier.value if self._current_tier else "?",
+                    "isolated": self._is_isolated,
+                }
+            )
             log.error("perform() error: %s", exc)
             raise
 
@@ -412,7 +433,9 @@ class IsolatedDesktopAdapter:
     def sync_artifacts(self, run_id: str | None = None) -> list[SyncedArtifact]:
         """Copy sandbox output files back to the workspace artifacts folder."""
         if self._syncer is None:
-            log.warning("sync_artifacts: syncer not initialised; call initialise() first")
+            log.warning(
+                "sync_artifacts: syncer not initialised; call initialise() first"
+            )
             return []
         rid = run_id or self._task_run_id
         synced = self._syncer.sync(rid)
@@ -449,6 +472,7 @@ class IsolatedDesktopAdapter:
         """
         try:
             import ctypes
+
             # GetLastInputInfo: ms since last user input
             class LASTINPUTINFO(ctypes.Structure):
                 _fields_ = [
@@ -470,6 +494,7 @@ class IsolatedDesktopAdapter:
 # ─────────────────────────────────────────────────────────────────────────── #
 # Factory                                                                       #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def build_isolated_adapter(
     tier: IsolationTier = IsolationTier.VIRTUAL,

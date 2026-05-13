@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 from contextlib import closing
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -1099,13 +1100,15 @@ class ResearchCrawlStateMixin:
             match_score = self._persistent_match_score(claim_text, query, objective)
             if match_score < 0.28:
                 continue
+            if not self._text_matches_intent_spec(claim_text, query):
+                continue
             if int(row["contradiction_count"] or 0) > 0:
                 candidate = self._query_core_terms(
                     f"{objective} {claim_text} independent verification"
                 )
             else:
                 candidate = self._query_core_terms(f"{query} {claim_text}")
-            if candidate:
+            if candidate and self._query_variant_matches_intent(candidate, query):
                 candidates.append(candidate)
 
         for row in contradiction_rows:
@@ -1119,18 +1122,22 @@ class ResearchCrawlStateMixin:
             )
             if match_score < 0.24:
                 continue
+            if not self._text_matches_intent_spec(contradiction_text, query):
+                continue
             candidate = self._query_core_terms(
                 f"{objective} {contradiction_text} counterevidence"
             )
-            if candidate:
+            if candidate and self._query_variant_matches_intent(candidate, query):
                 candidates.append(candidate)
 
         for row in domain_rows[: max(4, limit // 2)]:
             domain = str(row["domain"] or "").strip()
             if not domain:
                 continue
+            if self._persistent_match_score(domain, query, objective) < 0.3:
+                continue
             candidate = self._query_core_terms(f"site:{domain} {query}")
-            if candidate:
+            if candidate and self._query_variant_matches_intent(candidate, query):
                 candidates.append(candidate)
 
         for row in observation_rows:
@@ -1141,7 +1148,7 @@ class ResearchCrawlStateMixin:
             candidates.extend(self._load_json_text_list(row["query_hints_json"]))
             if source_query:
                 candidate = self._query_core_terms(f"{query} {source_query}")
-                if candidate:
+                if candidate and self._query_variant_matches_intent(candidate, query):
                     candidates.append(candidate)
 
         return self._sanitize_query_variants(candidates, query)[:limit]
@@ -1204,6 +1211,8 @@ class ResearchCrawlStateMixin:
             claim_text = str(row["claim_text"] or "").strip()
             if self._persistent_match_score(claim_text, query, objective) < 0.28:
                 continue
+            if not self._text_matches_intent_spec(claim_text, query):
+                continue
             urls.extend(self._load_json_text_list(row["source_urls_json"]))
             if len(urls) >= limit * 3:
                 break
@@ -1213,6 +1222,8 @@ class ResearchCrawlStateMixin:
                 excerpt = str(row["excerpt"] or "").strip()
                 label = f"{row['url']} {excerpt[:280]}".strip()
                 if self._persistent_match_score(label, query, objective) < 0.22:
+                    continue
+                if not self._text_matches_intent_spec(label, query):
                     continue
                 urls.append(str(row["url"] or "").strip())
                 urls.extend(self._load_json_text_list(row["outbound_urls_json"]))
@@ -1225,8 +1236,20 @@ class ResearchCrawlStateMixin:
                 label = f"{row['url']} {source_query}".strip()
                 if self._persistent_match_score(label, query, objective) < 0.22:
                     continue
+                if not self._text_matches_intent_spec(label, query):
+                    continue
                 urls.append(str(row["url"] or "").strip())
                 if len(urls) >= limit * 3:
                     break
 
-        return self._persistent_unique_urls(urls)[:limit]
+        blocked_hosts = self._blocked_irrelevant_site_hosts(query or objective)
+        filtered_urls: list[str] = []
+        for url in self._persistent_unique_urls(urls):
+            host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+            if any(
+                host == blocked or host.endswith(f".{blocked}")
+                for blocked in blocked_hosts
+            ):
+                continue
+            filtered_urls.append(url)
+        return filtered_urls[:limit]

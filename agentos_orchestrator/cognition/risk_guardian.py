@@ -47,13 +47,14 @@ REROUTE_THRESHOLD: float = 0.35
 # Action-to-target policy matrix rows                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 @dataclass(frozen=True, slots=True)
 class PolicyMatrixRow:
-    action_type: str          # matches UiAction.action_type (lower-cased prefix match)
-    target_class: str         # "payment", "credential", "file", "system", "ui", "data", "*"
-    reversibility: str        # "reversible" | "hard_to_reverse" | "irreversible"
-    data_sensitivity: str     # "public" | "internal" | "confidential" | "secret"
-    base_risk: float          # [0.0, 1.0]
+    action_type: str  # matches UiAction.action_type (lower-cased prefix match)
+    target_class: str  # "payment", "credential", "file", "system", "ui", "data", "*"
+    reversibility: str  # "reversible" | "hard_to_reverse" | "irreversible"
+    data_sensitivity: str  # "public" | "internal" | "confidential" | "secret"
+    base_risk: float  # [0.0, 1.0]
     approval_required: bool
     diagnostician_floor: str  # minimum diagnostician level if risk threshold not met
     notes: str = ""
@@ -63,98 +64,314 @@ class PolicyMatrixRow:
 # the first matching row wins. A wildcard ("*") matches any value.
 _POLICY_MATRIX: tuple[PolicyMatrixRow, ...] = (
     # ── Payment operations ──────────────────────────────────────────────── #
-    PolicyMatrixRow("click", "payment", "irreversible", "confidential", 0.90, True,
-                    "confirm", "Payment submit — always requires approval."),
-    PolicyMatrixRow("type",  "payment", "irreversible", "confidential", 0.85, True,
-                    "confirm", "Typing a payment value — approval required."),
-    PolicyMatrixRow("*",     "payment", "irreversible", "confidential", 0.88, True,
-                    "confirm", "Any payment-class action."),
-
+    PolicyMatrixRow(
+        "click",
+        "payment",
+        "irreversible",
+        "confidential",
+        0.90,
+        True,
+        "confirm",
+        "Payment submit — always requires approval.",
+    ),
+    PolicyMatrixRow(
+        "type",
+        "payment",
+        "irreversible",
+        "confidential",
+        0.85,
+        True,
+        "confirm",
+        "Typing a payment value — approval required.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "payment",
+        "irreversible",
+        "confidential",
+        0.88,
+        True,
+        "confirm",
+        "Any payment-class action.",
+    ),
     # ── Credential entry ─────────────────────────────────────────────────── #
-    PolicyMatrixRow("type",  "credential", "hard_to_reverse", "secret", 0.82, True,
-                    "confirm", "Typing a credential — approval required."),
-    PolicyMatrixRow("paste", "credential", "hard_to_reverse", "secret", 0.82, True,
-                    "confirm", "Pasting a credential — approval required."),
-    PolicyMatrixRow("*",     "credential", "*",             "secret", 0.80, True,
-                    "confirm", "Any credential-class action."),
-
+    PolicyMatrixRow(
+        "type",
+        "credential",
+        "hard_to_reverse",
+        "secret",
+        0.82,
+        True,
+        "confirm",
+        "Typing a credential — approval required.",
+    ),
+    PolicyMatrixRow(
+        "paste",
+        "credential",
+        "hard_to_reverse",
+        "secret",
+        0.82,
+        True,
+        "confirm",
+        "Pasting a credential — approval required.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "credential",
+        "*",
+        "secret",
+        0.80,
+        True,
+        "confirm",
+        "Any credential-class action.",
+    ),
     # ── External messaging ───────────────────────────────────────────────── #
-    PolicyMatrixRow("click", "message_send", "irreversible", "internal", 0.88, True,
-                    "confirm", "Sending an external message — approval required."),
-    PolicyMatrixRow("submit","message_send", "irreversible", "internal", 0.88, True,
-                    "confirm", "Submitting an external message."),
-    PolicyMatrixRow("*",     "message_send", "irreversible", "*",       0.85, True,
-                    "confirm", "Any external message dispatch."),
-
+    PolicyMatrixRow(
+        "click",
+        "message_send",
+        "irreversible",
+        "internal",
+        0.88,
+        True,
+        "confirm",
+        "Sending an external message — approval required.",
+    ),
+    PolicyMatrixRow(
+        "submit",
+        "message_send",
+        "irreversible",
+        "internal",
+        0.88,
+        True,
+        "confirm",
+        "Submitting an external message.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "message_send",
+        "irreversible",
+        "*",
+        0.85,
+        True,
+        "confirm",
+        "Any external message dispatch.",
+    ),
     # ── File / data deletion ─────────────────────────────────────────────── #
-    PolicyMatrixRow("delete","file",         "irreversible", "*",       0.95, True,
-                    "abort",   "File deletion — almost always irreversible."),
-    PolicyMatrixRow("remove","file",         "irreversible", "*",       0.93, True,
-                    "abort",   "File removal."),
-    PolicyMatrixRow("*",     "file_delete",  "irreversible", "*",       0.94, True,
-                    "abort",   "Any file-delete-class action."),
-
+    PolicyMatrixRow(
+        "delete",
+        "file",
+        "irreversible",
+        "*",
+        0.95,
+        True,
+        "abort",
+        "File deletion — almost always irreversible.",
+    ),
+    PolicyMatrixRow(
+        "remove", "file", "irreversible", "*", 0.93, True, "abort", "File removal."
+    ),
+    PolicyMatrixRow(
+        "*",
+        "file_delete",
+        "irreversible",
+        "*",
+        0.94,
+        True,
+        "abort",
+        "Any file-delete-class action.",
+    ),
     # ── Trade / order placement ──────────────────────────────────────────── #
-    PolicyMatrixRow("click", "trade",        "irreversible", "confidential", 0.96, True,
-                    "abort",   "Trading order submit — extremely high risk."),
-    PolicyMatrixRow("submit","trade",        "irreversible", "confidential", 0.96, True,
-                    "abort",   "Trade submission."),
-    PolicyMatrixRow("*",     "trade",        "*",             "*",       0.90, True,
-                    "confirm", "Any trade-class action."),
-
+    PolicyMatrixRow(
+        "click",
+        "trade",
+        "irreversible",
+        "confidential",
+        0.96,
+        True,
+        "abort",
+        "Trading order submit — extremely high risk.",
+    ),
+    PolicyMatrixRow(
+        "submit",
+        "trade",
+        "irreversible",
+        "confidential",
+        0.96,
+        True,
+        "abort",
+        "Trade submission.",
+    ),
+    PolicyMatrixRow(
+        "*", "trade", "*", "*", 0.90, True, "confirm", "Any trade-class action."
+    ),
     # ── Permission grants ────────────────────────────────────────────────── #
-    PolicyMatrixRow("click", "permission",   "hard_to_reverse", "internal", 0.78, True,
-                    "confirm", "Permission grant click."),
-    PolicyMatrixRow("*",     "permission",   "*",             "*",       0.75, True,
-                    "confirm", "Any permission-class action."),
-
+    PolicyMatrixRow(
+        "click",
+        "permission",
+        "hard_to_reverse",
+        "internal",
+        0.78,
+        True,
+        "confirm",
+        "Permission grant click.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "permission",
+        "*",
+        "*",
+        0.75,
+        True,
+        "confirm",
+        "Any permission-class action.",
+    ),
     # ── Package installation ─────────────────────────────────────────────── #
-    PolicyMatrixRow("*",     "package_install", "hard_to_reverse", "*",  0.72, True,
-                    "confirm", "Package install — can introduce supply chain risk."),
-
+    PolicyMatrixRow(
+        "*",
+        "package_install",
+        "hard_to_reverse",
+        "*",
+        0.72,
+        True,
+        "confirm",
+        "Package install — can introduce supply chain risk.",
+    ),
     # ── System configuration ─────────────────────────────────────────────── #
-    PolicyMatrixRow("*",     "system_config",  "hard_to_reverse", "*",  0.85, True,
-                    "confirm", "System config change."),
-
+    PolicyMatrixRow(
+        "*",
+        "system_config",
+        "hard_to_reverse",
+        "*",
+        0.85,
+        True,
+        "confirm",
+        "System config change.",
+    ),
     # ── Safe UI navigation (low risk) ────────────────────────────────────── #
-    PolicyMatrixRow("scroll","ui",           "reversible",    "public", 0.02, False,
-                    "execute", "Scroll — trivially reversible."),
-    PolicyMatrixRow("hover", "ui",           "reversible",    "public", 0.01, False,
-                    "execute", "Hover — no state change."),
-    PolicyMatrixRow("focus", "ui",           "reversible",    "public", 0.03, False,
-                    "execute", "Focus change."),
-    PolicyMatrixRow("click", "ui",           "reversible",    "public", 0.12, False,
-                    "execute", "Reversible UI click."),
-    PolicyMatrixRow("hotkey","ui",           "reversible",    "public", 0.08, False,
-                    "execute", "Reversible hotkey."),
-
+    PolicyMatrixRow(
+        "scroll",
+        "ui",
+        "reversible",
+        "public",
+        0.02,
+        False,
+        "execute",
+        "Scroll — trivially reversible.",
+    ),
+    PolicyMatrixRow(
+        "hover",
+        "ui",
+        "reversible",
+        "public",
+        0.01,
+        False,
+        "execute",
+        "Hover — no state change.",
+    ),
+    PolicyMatrixRow(
+        "focus", "ui", "reversible", "public", 0.03, False, "execute", "Focus change."
+    ),
+    PolicyMatrixRow(
+        "click",
+        "ui",
+        "reversible",
+        "public",
+        0.12,
+        False,
+        "execute",
+        "Reversible UI click.",
+    ),
+    PolicyMatrixRow(
+        "hotkey",
+        "ui",
+        "reversible",
+        "public",
+        0.08,
+        False,
+        "execute",
+        "Reversible hotkey.",
+    ),
     # ── Hard-to-reverse UI writes ─────────────────────────────────────────── #
-    PolicyMatrixRow("type",  "ui",           "hard_to_reverse", "internal", 0.28, False,
-                    "reflect", "Typing into a field — moderately risky."),
-    PolicyMatrixRow("*",     "ui",           "hard_to_reverse", "internal", 0.30, False,
-                    "reflect", "Hard-to-reverse UI action."),
-
+    PolicyMatrixRow(
+        "type",
+        "ui",
+        "hard_to_reverse",
+        "internal",
+        0.28,
+        False,
+        "reflect",
+        "Typing into a field — moderately risky.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "ui",
+        "hard_to_reverse",
+        "internal",
+        0.30,
+        False,
+        "reflect",
+        "Hard-to-reverse UI action.",
+    ),
     # ── Code execution ───────────────────────────────────────────────────── #
-    PolicyMatrixRow("*",     "code_sandbox", "hard_to_reverse", "*",   0.40, False,
-                    "reflect", "Sandboxed code — audit before use."),
-    PolicyMatrixRow("*",     "code_host",    "hard_to_reverse", "*",   0.70, True,
-                    "confirm", "Host code execution — approval recommended."),
-
+    PolicyMatrixRow(
+        "*",
+        "code_sandbox",
+        "hard_to_reverse",
+        "*",
+        0.40,
+        False,
+        "reflect",
+        "Sandboxed code — audit before use.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "code_host",
+        "hard_to_reverse",
+        "*",
+        0.70,
+        True,
+        "confirm",
+        "Host code execution — approval recommended.",
+    ),
     # ── Fallback ─────────────────────────────────────────────────────────── #
-    PolicyMatrixRow("*",     "*",            "reversible",    "*",       0.10, False,
-                    "execute", "Default reversible action."),
-    PolicyMatrixRow("*",     "*",            "hard_to_reverse", "*",    0.35, False,
-                    "reflect", "Default hard-to-reverse action."),
-    PolicyMatrixRow("*",     "*",            "irreversible",  "*",       0.65, True,
-                    "confirm", "Default irreversible action."),
-    PolicyMatrixRow("*",     "*",            "*",             "*",       0.20, False,
-                    "execute", "Catch-all default."),
+    PolicyMatrixRow(
+        "*",
+        "*",
+        "reversible",
+        "*",
+        0.10,
+        False,
+        "execute",
+        "Default reversible action.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "*",
+        "hard_to_reverse",
+        "*",
+        0.35,
+        False,
+        "reflect",
+        "Default hard-to-reverse action.",
+    ),
+    PolicyMatrixRow(
+        "*",
+        "*",
+        "irreversible",
+        "*",
+        0.65,
+        True,
+        "confirm",
+        "Default irreversible action.",
+    ),
+    PolicyMatrixRow("*", "*", "*", "*", 0.20, False, "execute", "Catch-all default."),
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Data structures                                                              #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 @dataclass(slots=True)
 class RiskAssessment:
@@ -168,7 +385,7 @@ class RiskAssessment:
     adjusted_risk: float
     approval_required: bool
     diagnostician_recommendation: str  # execute | reflect | reroute | confirm | abort
-    matched_policy_row: str            # notes field of the matched row
+    matched_policy_row: str  # notes field of the matched row
     context_adjustments: dict[str, float] = field(default_factory=dict)
     calibration_delta: float = 0.0
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -198,8 +415,7 @@ class RiskAssessment:
             "diagnostician_recommendation": self.diagnostician_recommendation,
             "matched_policy_row": self.matched_policy_row,
             "context_adjustments": {
-                key: round(float(v), 3)
-                for key, v in self.context_adjustments.items()
+                key: round(float(v), 3) for key, v in self.context_adjustments.items()
             },
             "calibration_delta": round(self.calibration_delta, 4),
             "evidence": dict(self.evidence),
@@ -260,8 +476,10 @@ def classify_target(action: UiAction) -> tuple[str, str]:
     data_sensitivity → "public" | "internal" | "confidential" | "secret"
     """
     combined = " ".join(
-        filter(None, [action.action_type, str(action.selector or ""),
-                      str(action.value or "")])
+        filter(
+            None,
+            [action.action_type, str(action.selector or ""), str(action.value or "")],
+        )
     ).lower()
 
     if _PAYMENT_TERMS.search(combined):
@@ -283,7 +501,9 @@ def classify_target(action: UiAction) -> tuple[str, str]:
 
     # Code execution
     if action.action_type.lower() == "tool" or "sandbox" in combined:
-        host = action.metadata.get("host_execution", False) if action.metadata else False
+        host = (
+            action.metadata.get("host_execution", False) if action.metadata else False
+        )
         return ("code_host" if host else "code_sandbox"), "internal"
 
     return "ui", "public"
@@ -309,8 +529,14 @@ def classify_reversibility(action: UiAction) -> str:
 # Policy matrix lookup                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _row_matches(row: PolicyMatrixRow, action_type: str, target: str,
-                 reversibility: str, sensitivity: str) -> bool:
+
+def _row_matches(
+    row: PolicyMatrixRow,
+    action_type: str,
+    target: str,
+    reversibility: str,
+    sensitivity: str,
+) -> bool:
     def _m(pattern: str, value: str) -> bool:
         return pattern == "*" or value.startswith(pattern)
 
@@ -329,7 +555,9 @@ def _lookup_policy(
     data_sensitivity: str,
 ) -> PolicyMatrixRow:
     for row in _POLICY_MATRIX:
-        if _row_matches(row, action_type, target_class, reversibility, data_sensitivity):
+        if _row_matches(
+            row, action_type, target_class, reversibility, data_sensitivity
+        ):
             return row
     # Should never happen — the catch-all row guarantees a match.
     return _POLICY_MATRIX[-1]
@@ -338,6 +566,7 @@ def _lookup_policy(
 # ─────────────────────────────────────────────────────────────────────────── #
 # Context adjustments                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def _context_adjustments(
     action: UiAction,
@@ -378,6 +607,7 @@ def _context_adjustments(
 # ─────────────────────────────────────────────────────────────────────────── #
 # Calibration hook                                                              #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class RiskCalibration:
     """Historical calibration layer for risk thresholds.
@@ -420,6 +650,7 @@ _GLOBAL_CALIBRATION = RiskCalibration()
 # Risk Guardian                                                                 #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class RiskGuardian:
     """Score proposed actions using the policy matrix and context adjustments.
 
@@ -454,7 +685,8 @@ class RiskGuardian:
         # Derive diagnostician recommendation from adjusted score.
         diagnostician = _score_to_diagnostician(
             adjusted_risk,
-            row.approval_required or (proposal.required_approval if proposal else False),
+            row.approval_required
+            or (proposal.required_approval if proposal else False),
             row.diagnostician_floor,
         )
 
@@ -466,8 +698,7 @@ class RiskGuardian:
             base_risk=row.base_risk,
             adjusted_risk=adjusted_risk,
             approval_required=(
-                row.approval_required
-                or adjusted_risk >= APPROVAL_THRESHOLD
+                row.approval_required or adjusted_risk >= APPROVAL_THRESHOLD
             ),
             diagnostician_recommendation=diagnostician,
             matched_policy_row=row.notes,

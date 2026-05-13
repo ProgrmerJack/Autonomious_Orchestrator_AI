@@ -314,7 +314,8 @@ class ResearchRetrievalMixin:
             # so they compete properly against provider results.
             if pass_index == 0:
                 seed_candidates = [
-                    s for s in all_sources
+                    s
+                    for s in all_sources
                     if s.url and (not s.abstract or len(s.abstract) < 80)
                 ][:24]
                 if seed_candidates:
@@ -382,7 +383,17 @@ class ResearchRetrievalMixin:
                     ranked = self._rank_sources(
                         self._dedupe_sources(all_sources), query
                     )
-                    selected = ranked[: settings.max_sources]
+                    reranked = self._rerank_for_domain_diversity(
+                        ranked,
+                        selected_domain_counts,
+                        low_novelty_streak,
+                        pass_index,
+                    )
+                    selected = self._select_balanced_top(
+                        reranked,
+                        settings.max_sources,
+                        query,
+                    )
 
             current_titles = {
                 self._normalize_title(source.title)
@@ -604,6 +615,7 @@ class ResearchRetrievalMixin:
             if (
                 low_marginal_yield_pass
                 and depth_met
+                and not source_starved
                 and low_marginal_yield_streak >= max_low_marginal_yield_streak
             ):
                 stop_reason = "marginal_yield_exhausted"
@@ -793,6 +805,7 @@ class ResearchRetrievalMixin:
                     return axes
 
         return axes or ["primary evidence", "independent verification"]
+
     @classmethod
     def _classify_query(cls, query: str) -> set[str]:
         """Return the set of provider keys that are appropriate for *query*.
@@ -904,6 +917,7 @@ class ResearchRetrievalMixin:
             selected.add("github-repositories")
 
         return selected
+
     @classmethod
     def _expand_provider_mix_for_diversity(
         cls,
@@ -942,6 +956,7 @@ class ResearchRetrievalMixin:
         if cls._looks_like_software_agent_query(query):
             expanded.add("github-repositories")
         return expanded if expanded != allowed_providers else None
+
     def _enrich_top_sources(
         self,
         sources: list[ResearchSource],
@@ -999,7 +1014,12 @@ class ResearchRetrievalMixin:
                 else:
                     source.abstract = f"{source.abstract} {extra}".strip()[:3000]
                 extra_queries.extend(
-                    self._content_to_new_queries(content, source.title, query)
+                    self._content_to_new_queries(
+                        content,
+                        source.title,
+                        query,
+                        source.url,
+                    )
                 )
                 # URL CHAINING: extract outbound links from the fetched page.
                 # For browser-rendered pages, content is plain text so we pass
@@ -1059,6 +1079,7 @@ class ResearchRetrievalMixin:
                 result.append(q[:80])
         # Return up to 40 new query strings — double the previous 24 cap.
         return result[:40]
+
     def _extract_outbound_source_candidates(
         self,
         raw_html: str,
@@ -1210,6 +1231,7 @@ class ResearchRetrievalMixin:
             if len(candidates) >= 100:
                 break
         return candidates
+
     @staticmethod
     def _text_signal_score(text: str) -> float:
         words = re.findall(r"\b[a-zA-Z]{3,}\b", text)
@@ -1233,6 +1255,7 @@ class ResearchRetrievalMixin:
         density = min(1.0, len(words) / 260.0)
         noise_ratio = noise_hits / max(len(lower_words), 1)
         return max(0.0, min(1.0, density * (1.0 - min(noise_ratio * 6.0, 1.0))))
+
     @staticmethod
     def _overlay_marker_count(raw_html: str) -> int:
         lower = raw_html.lower()
@@ -1251,6 +1274,7 @@ class ResearchRetrievalMixin:
             "overlay",
         )
         return sum(1 for marker in markers if marker in lower)
+
     @classmethod
     def _interrupt_resolve_overlays(cls, raw_html: str) -> tuple[str, str]:
         html_candidate = raw_html
@@ -1260,6 +1284,7 @@ class ResearchRetrievalMixin:
             if signal >= 0.2:
                 return html_candidate, "resolved"
         return raw_html, "unreachable-paywalled"
+
     @staticmethod
     def _strip_known_overlays(raw_html: str) -> str:
         patterns = [
@@ -1272,6 +1297,7 @@ class ResearchRetrievalMixin:
         for pattern in patterns:
             cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
         return cleaned
+
     def _fetch_page_text(self, url: str, max_bytes: int = 40_000) -> str:
         """Fetch *url* and return stripped plain text.
 
@@ -1287,6 +1313,7 @@ class ResearchRetrievalMixin:
         if not raw:
             return ""
         return self._html_to_text(raw)
+
     def _finalize_selected_sources(
         self,
         selected: list[ResearchSource],
@@ -1305,6 +1332,7 @@ class ResearchRetrievalMixin:
         self._enrich_top_sources(needs_enrichment[: min(12, max_sources)], query)
         ranked = self._rank_sources(self._dedupe_sources(all_sources), query)
         return self._select_balanced_top(ranked, max_sources, query)
+
     def _get_text(
         self,
         url: str,
@@ -1334,10 +1362,13 @@ class ResearchRetrievalMixin:
             ),
         ]
         ua = _ua_pool[hash(url) % len(_ua_pool)]
+        # Do NOT set Accept-Encoding manually — httpx auto-negotiates based on
+        # which decompression libraries (brotli, zstd) are actually installed.
+        # Setting it manually advertises 'br' even when brotli isn't present,
+        # causing servers to send brotli-compressed responses httpx cannot decode.
         headers = {
             "Accept": accept,
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -1368,6 +1399,7 @@ class ResearchRetrievalMixin:
         # gracefully so every web fetch never crashes with ImportError.
         try:
             import h2  # noqa: F401  # type: ignore[import-not-found]
+
             _http2 = True
         except ImportError:
             _http2 = False
@@ -1384,7 +1416,9 @@ class ResearchRetrievalMixin:
                     headers=headers,
                     timeout=effective_timeout,
                 ) as response:
-                    content_type = str(response.headers.get("Content-Type") or "").lower()
+                    content_type = str(
+                        response.headers.get("Content-Type") or ""
+                    ).lower()
                     if content_type and not any(
                         marker in content_type
                         for marker in ("text/", "html", "xml", "json")
@@ -1398,6 +1432,7 @@ class ResearchRetrievalMixin:
                     return bytes(raw[:max_bytes]).decode("utf-8", errors="replace")
         except Exception:
             return ""
+
     _JS_REQUIRED_HOSTS: frozenset[str] = frozenset(
         {
             "bloomberg.com",
@@ -1418,10 +1453,12 @@ class ResearchRetrievalMixin:
             "statista.com",
         }
     )
+
     def _needs_browser(self, url: str) -> bool:
         """Return True if this URL belongs to a JS-rendered finance/news site."""
         host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
         return any(h in host for h in self._JS_REQUIRED_HOSTS)
+
     def _headless_browser_pool_size(self, url_count: int) -> int:
         if url_count <= 0:
             return 0
@@ -1435,11 +1472,16 @@ class ResearchRetrievalMixin:
             except ValueError:
                 pass
         depth = self.research_depth_for_objective(self._active_objective)
+        cap = max(
+            1,
+            int(self._local_browser_pressure_caps().get("headless_browser_workers", 6)),
+        )
         if depth == "multi-hour":
-            return max(2, min(6, url_count))
+            return min(cap, max(2, min(6, url_count)))
         if self._looks_like_current_evidence_query(self._active_objective):
-            return max(2, min(4, url_count))
-        return max(1, min(3, url_count))
+            return min(cap, max(2, min(4, url_count)))
+        return min(cap, max(1, min(3, url_count)))
+
     def _enrichment_parallel_worker_count(self, source_count: int) -> int:
         if source_count <= 0:
             return 0
@@ -1455,6 +1497,7 @@ class ResearchRetrievalMixin:
         if self._looks_like_current_evidence_query(self._active_objective):
             return max(1, min(12, source_count))
         return max(1, min(8, source_count))
+
     def _new_headless_browser_bundle(self) -> dict[str, Any] | None:
         try:
             from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
@@ -1494,6 +1537,7 @@ class ResearchRetrievalMixin:
             }
         except Exception:
             return None
+
     @staticmethod
     def _close_headless_browser_bundle(bundle: dict[str, Any]) -> None:
         context = bundle.get("context")
@@ -1509,6 +1553,7 @@ class ResearchRetrievalMixin:
             finally:
                 if playwright is not None:
                     playwright.stop()
+
     def _render_browser_page_with_context(
         self,
         context: Any,
@@ -1551,6 +1596,7 @@ class ResearchRetrievalMixin:
                 page.close()
             except Exception:
                 pass
+
     def _headless_browser_pool_fetch(
         self,
         urls: list[str],
@@ -1570,6 +1616,7 @@ class ResearchRetrievalMixin:
             bundle_cleanup=self._close_headless_browser_bundle,
         )
         return pool.render_many(safe_urls, max_chars, timeout_ms)
+
     def _get_text_browser(
         self,
         url: str,
@@ -1599,6 +1646,7 @@ class ResearchRetrievalMixin:
             return ""
         finally:
             self._close_headless_browser_bundle(bundle)
+
     def _get_text_with_browser_fallback(
         self,
         url: str,
@@ -1621,6 +1669,7 @@ class ResearchRetrievalMixin:
             max_bytes=max_bytes,
             timeout_seconds=timeout_seconds,
         )
+
     def _should_retry_with_browser(
         self,
         url: str,
@@ -1654,6 +1703,7 @@ class ResearchRetrievalMixin:
             if anchors and not any(anchor in text.lower() for anchor in anchors):
                 return len(re.findall(r"\b[a-z]{4,}\b", text.lower())) < 90
         return False
+
     def _get_text_stitched(
         self,
         url: str,
@@ -1697,6 +1747,7 @@ class ResearchRetrievalMixin:
             return ""
         stitched = self._stitch_text_chunks(chunks, overlap_chars=140)
         return stitched[:24_000]
+
     def _extract_signal_text_chunk(self, raw_html: str, query: str) -> str:
         signal_pattern = re.compile(
             (
@@ -1727,6 +1778,7 @@ class ResearchRetrievalMixin:
             if anchors and not any(anchor in candidate.lower() for anchor in anchors):
                 return ""
         return candidate
+
     @staticmethod
     def _stitch_text_chunks(chunks: list[str], overlap_chars: int = 120) -> str:
         if not chunks:
@@ -1743,6 +1795,7 @@ class ResearchRetrievalMixin:
                     break
             stitched += chunk[overlap:]
         return stitched
+
     @staticmethod
     def _looks_like_market_query(query: str) -> bool:
         lower = query.lower()
@@ -1768,6 +1821,7 @@ class ResearchRetrievalMixin:
             "ticker",
         }
         return any(token in lower for token in market_tokens)
+
     @staticmethod
     def _looks_like_public_security_query(query: str) -> bool:
         lower = query.lower()
@@ -1789,6 +1843,7 @@ class ResearchRetrievalMixin:
             "downside",
         }
         return any(token in lower for token in security_tokens)
+
     @staticmethod
     def _looks_like_quant_finance_query(query: str) -> bool:
         lower = query.lower()
@@ -1810,6 +1865,7 @@ class ResearchRetrievalMixin:
             "market microstructure",
         }
         return any(token in lower for token in quant_tokens)
+
     @staticmethod
     def _has_market_identifiers(text: str) -> bool:
         if _extract_ticker_candidates(text):
@@ -1820,6 +1876,7 @@ class ResearchRetrievalMixin:
                 text or "",
             )
         )
+
     @classmethod
     def _has_actionable_market_signal(cls, text: str) -> bool:
         lower = (text or "").lower()
@@ -1853,6 +1910,7 @@ class ResearchRetrievalMixin:
             "dividend",
         )
         return any(marker in lower for marker in actionable_markers)
+
     @staticmethod
     def _strip_dom_noise_tokens(text: str) -> str:
         cleaned = text
@@ -1873,6 +1931,7 @@ class ResearchRetrievalMixin:
             flags=re.IGNORECASE,
         )
         return re.sub(r"\s+", " ", cleaned).strip()
+
     @staticmethod
     def _has_dom_noise_pattern(text: str) -> bool:
         lower = text.lower()
@@ -1896,6 +1955,7 @@ class ResearchRetrievalMixin:
                 "check your spam folder",
             )
         )
+
     def _passes_semantic_binary_gate(self, text: str, query: str) -> bool:
         sample = self._strip_dom_noise_tokens((text or "")[:4000])
         if not sample.strip():
@@ -1939,9 +1999,12 @@ class ResearchRetrievalMixin:
         allowed = overlap >= 1 and not self._has_dom_noise_pattern(sample)
         self._semantic_gate_cache[cache_key] = allowed
         return allowed
+
     @classmethod
     def _passes_deterministic_semantic_gate(cls, text: str, query: str) -> bool:
         sample = cls._strip_dom_noise_tokens(text)
+        if not cls._text_matches_intent_spec(sample, query):
+            return False
         anchors = cls._objective_anchor_terms(query)
         words = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", sample.lower()))
         overlap = len(anchors & words) if anchors else 0
@@ -1965,28 +2028,37 @@ class ResearchRetrievalMixin:
             has_offdomain = any(token in sample.lower() for token in offdomain_vocab)
             if has_offdomain and not has_market:
                 return False
-            if not has_market and overlap < 2:
+            # Allow any source that has general market vocabulary (stock, upside,
+            # market, etc.) — screener/best-stocks queries will have results that
+            # discuss stocks without mentioning specific earnings or EPS.
+            if not has_market and overlap < 1:
                 return False
+            # Only hard-block public security results that have absolutely no
+            # market signal AND no anchor overlap — too strict previously caused
+            # all web results to score 0.0 for screener queries.
             if (
                 cls._looks_like_public_security_query(query)
                 and not actionable_market
-                and overlap < 2
+                and not has_market
+                and overlap < 1
             ):
                 return False
             return (
-                overlap >= 1 or actionable_market
+                overlap >= 1 or has_market or actionable_market
             ) and not cls._has_dom_noise_pattern(sample)
         if not anchors:
             return False
         return overlap >= min(2, len(anchors)) and not cls._has_dom_noise_pattern(
             sample
         )
+
     @classmethod
     def _content_to_new_queries(
         cls,
         content: str,
         source_title: str,
         query: str = "",
+        source_url: str = "",
     ) -> list[str]:
         """Extract 2-4 focused keyword phrases from fetched page content."""
         # Detect JS-blocked / error pages — these produce garbage queries.
@@ -2007,8 +2079,16 @@ class ResearchRetrievalMixin:
         )
         content = cls._strip_dom_noise_tokens(content)
         source_title = cls._strip_dom_noise_tokens(source_title)
+        source_host = cls._source_host(source_url)
+        if source_host == "sec.gov" and source_url and not cls._is_sec_filing_url(source_url):
+            return []
         _content_lower = content.lower()[:2000]
         if any(sig in _content_lower for sig in _js_block_signals):
+            return []
+        if query and not cls._text_matches_intent_spec(
+            f"{source_title} {content[:3000]}",
+            query,
+        ):
             return []
         # Pick the most frequent non-stop content words.
         words = re.findall(r"\b[a-zA-Z][a-zA-Z-]{3,}\b", content.lower())
@@ -2140,6 +2220,54 @@ class ResearchRetrievalMixin:
         ]
         if query and not matching_anchors:
             return []
+        prefilled_queries: list[str] = []
+        if query and cls._looks_like_public_security_query(query):
+            original_entity_binding = cls._extract_company_binding(query)
+            if not original_entity_binding:
+                # Broad public-company discovery should stay driven by the
+                # explicit objective and curated market axes, not by whatever
+                # listicle or market page happened to be fetched first.
+                return []
+            entity_binding = cls._extract_company_binding(
+                f"{source_title} {content[:2500]}"
+            )
+            if entity_binding and original_entity_binding:
+                focused_terms = [
+                    marker
+                    for marker in (
+                        "earnings",
+                        "guidance",
+                        "valuation",
+                        "price target",
+                        "free cash flow",
+                        "analyst rating",
+                    )
+                    if marker in source_text
+                ]
+                if focused_terms:
+                    prefilled_queries.append(f"{entity_binding} {focused_terms[0]}")
+                else:
+                    prefilled_queries.append(entity_binding)
+            elif entity_binding and not original_entity_binding:
+                # Broad basket discovery should not collapse into a single
+                # company thesis just because one retained source mentions a
+                # ticker. Keep the query expansion basket-level in that case.
+                pass
+            elif not any(
+                marker in source_text
+                for marker in (
+                    "public company",
+                    "public companies",
+                    "publicly traded",
+                    "stocks",
+                    "shares",
+                    "analyst",
+                    "earnings",
+                    "price target",
+                    "valuation",
+                )
+            ):
+                return []
         # Combine title keywords with top content terms.
         title_words = [
             w
@@ -2147,7 +2275,7 @@ class ResearchRetrievalMixin:
             if w not in stop
         ][:3]
         anchor_prefix = " ".join(matching_anchors[:2]).strip()
-        queries: list[str] = []
+        queries: list[str] = list(prefilled_queries)
         if top_terms[:3]:
             candidate = " ".join(top_terms[:3])
             if anchor_prefix and not any(
@@ -2179,6 +2307,7 @@ class ResearchRetrievalMixin:
             seen.add(normalized)
             deduped.append(candidate[:80])
         return deduped[:4]
+
     def _citation_chase(
         self,
         sources: list[ResearchSource],
@@ -2219,6 +2348,7 @@ class ResearchRetrievalMixin:
                 self._enrich_top_sources(next_frontier[:8], query)
             frontier = next_frontier
         return all_chased
+
     def _fetch_openalex_cited_works(
         self,
         work_id: str,
@@ -2281,6 +2411,7 @@ class ResearchRetrievalMixin:
                 )
             )
         return sources
+
     @staticmethod
     def _json_request_headers() -> dict[str, str]:
         return {
@@ -2296,6 +2427,7 @@ class ResearchRetrievalMixin:
 
         try:
             import h2  # noqa: F401  # type: ignore[import-not-found]
+
             _http2 = True
         except ImportError:
             _http2 = False
@@ -2341,6 +2473,7 @@ class ResearchRetrievalMixin:
 
         try:
             import h2  # noqa: F401  # type: ignore[import-not-found]
+
             _http2_async = True
         except ImportError:
             _http2_async = False

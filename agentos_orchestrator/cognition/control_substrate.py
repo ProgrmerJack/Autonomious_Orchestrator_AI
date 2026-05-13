@@ -46,10 +46,7 @@ class ControlChannelScores:
     manual: float = 0.0
 
     def asdict(self) -> dict[str, float]:
-        return {
-            key: round(float(value), 3)
-            for key, value in asdict(self).items()
-        }
+        return {key: round(float(value), 3) for key, value in asdict(self).items()}
 
 
 @dataclass(slots=True)
@@ -119,8 +116,7 @@ class ActionProposal:
         payload = asdict(self)
         payload["risk_score"] = round(float(self.risk_score), 3)
         payload["route_scores"] = {
-            key: round(float(value), 3)
-            for key, value in self.route_scores.items()
+            key: round(float(value), 3) for key, value in self.route_scores.items()
         }
         return payload
 
@@ -290,24 +286,16 @@ class FourLaneActionRouter:
         route_scores = {
             "api_mcp": 0.2 + 0.55 * channel_max.get("api", 0.0),
             "code_tool": 0.24 + 0.5 * channel_max.get("code", 0.0),
-            "structured_ui": (
-                0.28 + 0.55 * channel_max.get("accessibility", 0.0)
-            ),
+            "structured_ui": (0.28 + 0.55 * channel_max.get("accessibility", 0.0)),
             "native_vision": 0.18
             + 0.35 * channel_max.get("native", 0.0)
             + 0.35 * channel_max.get("vision", 0.0),
         }
-        if (
-            action_type in _API_ACTIONS
-            or metadata.get("control_channel") == "api"
-        ):
+        if action_type in _API_ACTIONS or metadata.get("control_channel") == "api":
             route_scores["api_mcp"] += 0.45
         if action_type in _CODE_ACTIONS or _code_task(lower_goal):
             route_scores["code_tool"] += 0.42
-        if (
-            _semantic_selector(selector)
-            or action_type in _STRUCTURED_UI_ACTIONS
-        ):
+        if _semantic_selector(selector) or action_type in _STRUCTURED_UI_ACTIONS:
             route_scores["structured_ui"] += 0.3
         if action_type in _NATIVE_VISION_ACTIONS or _coordinate_action(action):
             route_scores["native_vision"] += 0.5
@@ -319,10 +307,7 @@ class FourLaneActionRouter:
             route_scores["native_vision"] += 0.12
         if observation.discovered_surfaces:
             route_scores["api_mcp"] += 0.12
-        return {
-            key: max(0.0, min(1.0, value))
-            for key, value in route_scores.items()
-        }
+        return {key: max(0.0, min(1.0, value)) for key, value in route_scores.items()}
 
 
 class PreActionVerifier:
@@ -355,6 +340,7 @@ class PreActionVerifier:
                 compile_intent,
                 verify_action_intent,
             )
+
             self._compile_intent = compile_intent
             self._verify_action_intent = verify_action_intent
         except ImportError:
@@ -366,6 +352,7 @@ class PreActionVerifier:
             from agentos_orchestrator.cognition.risk_guardian import (  # type: ignore[import]
                 assess_action_risk,
             )
+
             self._assess_action_risk = assess_action_risk
         except ImportError:
             self._assess_action_risk = None
@@ -398,7 +385,9 @@ class PreActionVerifier:
                 )
                 diag = getattr(intent_decision, "diagnostician", "execute")
                 if diag in ("abort",):
-                    reason = getattr(intent_decision, "reason", "Intent constraint violated.")
+                    reason = getattr(
+                        intent_decision, "reason", "Intent constraint violated."
+                    )
                     return PreActionDecision(
                         allowed=False,
                         decision="abort",
@@ -415,7 +404,9 @@ class PreActionVerifier:
                         },
                     )
                 if diag in ("confirm",) and not approval_token:
-                    reason = getattr(intent_decision, "reason", "Action requires approval.")
+                    reason = getattr(
+                        intent_decision, "reason", "Action requires approval."
+                    )
                     return PreActionDecision(
                         allowed=False,
                         decision="confirm",
@@ -551,9 +542,7 @@ class AdaptiveControlLedger:
         app_agent: str = "workflow",
         app_signature: str = "unknown",
     ) -> str:
-        entry_id = _short_hash(
-            f"entry:{goal}:{proposal.proposal_id}:{time.time_ns()}"
-        )
+        entry_id = _short_hash(f"entry:{goal}:{proposal.proposal_id}:{time.time_ns()}")
         payload = {
             "entry_id": entry_id,
             "goal": goal,
@@ -588,9 +577,7 @@ class AdaptiveControlLedger:
             "execution_receipt": _json_safe(receipt),
             "post_action_verification_result": _json_safe(verification_result),
             "repair_decision": dict(repair_decision or {}),
-            "training_label": (
-                training_label if matched else "verification_failure"
-            ),
+            "training_label": (training_label if matched else "verification_failure"),
             "regression_eligible": not matched,
             "status": "completed" if matched else "needs_repair",
         }
@@ -620,7 +607,7 @@ class AdaptiveControlLedger:
             return []
         lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
         events: list[dict[str, Any]] = []
-        for line in lines[-max(1, limit):]:
+        for line in lines[-max(1, limit) :]:
             try:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
@@ -837,9 +824,7 @@ def _stable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "sandbox",
     }
     return {
-        key: _json_safe(value)
-        for key, value in metadata.items()
-        if key in stable_keys
+        key: _json_safe(value) for key, value in metadata.items() if key in stable_keys
     }
 
 
@@ -985,10 +970,7 @@ def _requires_approval(
 
 def _rollback_notes(action: UiAction, reversibility: str) -> str:
     if reversibility == "reversible":
-        return (
-            "Re-observe and undo through the same route if verification "
-            "fails."
-        )
+        return "Re-observe and undo through the same route if verification fails."
     if action.action_type == "move_file":
         return "Record source and destination before execution for reversal."
     return "Requires confirmation or external recovery before execution."
@@ -1046,10 +1028,7 @@ def _goal_lock_conflict(
         and not lock.external_navigation_intent
         and app_family != "browser"
     ):
-        return (
-            "Goal lock blocked browser navigation outside the declared "
-            "objective."
-        )
+        return "Goal lock blocked browser navigation outside the declared objective."
     if action.action_type == "draw_path" and not (
         "draw" in lock.allowed_domains
         or app_family == "design_canvas"
@@ -1060,16 +1039,17 @@ def _goal_lock_conflict(
         "sheet" in lock.allowed_domains or app_family == "office_form"
     ):
         return "Goal lock blocked spreadsheet edits outside a sheet objective."
-    if action.action_type in {
-        "copy_file",
-        "move_file",
-        "rename_file",
-        "delete_file",
-    } and not lock.file_op_intent:
-        return (
-            "Goal lock blocked file mutation outside the declared file "
-            "objective."
-        )
+    if (
+        action.action_type
+        in {
+            "copy_file",
+            "move_file",
+            "rename_file",
+            "delete_file",
+        }
+        and not lock.file_op_intent
+    ):
+        return "Goal lock blocked file mutation outside the declared file objective."
     return ""
 
 
@@ -1095,10 +1075,7 @@ def _semantic_selector(selector: str) -> bool:
         "class_name=",
         "node_id=",
     )
-    return any(
-        token in selector
-        for token in tokens
-    )
+    return any(token in selector for token in tokens)
 
 
 def _coordinate_action(action: UiAction) -> bool:

@@ -1,4 +1,5 @@
 """Tests for IsolatedDesktopAdapter (Phase 6)."""
+
 from __future__ import annotations
 
 import os
@@ -22,6 +23,7 @@ from agentos_orchestrator.os_control.base import UiAction
 # ─────────────────────────────────────────────────────────────────────────── #
 # ArtifactSyncer                                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 class TestArtifactSyncer:
     def test_sync_copies_allowed_extensions(self, tmp_path):
@@ -84,6 +86,7 @@ class TestArtifactSyncer:
 # IsolatedDesktopAdapter — VIRTUAL tier (no real desktop required)             #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestIsolatedDesktopAdapterVirtual:
     @pytest.fixture
     def adapter(self, tmp_path) -> IsolatedDesktopAdapter:
@@ -141,6 +144,7 @@ class TestIsolatedDesktopAdapterVirtual:
 # Focus protection                                                              #
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
 class TestFocusProtection:
     def test_focus_protection_defers_host_action_when_user_active(self, tmp_path):
         config = IsolationConfig(
@@ -187,6 +191,7 @@ class TestFocusProtection:
 # ─────────────────────────────────────────────────────────────────────────── #
 # build_isolated_adapter factory                                                #
 # ─────────────────────────────────────────────────────────────────────────── #
+
 
 def test_build_isolated_adapter_returns_adapter(tmp_path):
     adapter = build_isolated_adapter(

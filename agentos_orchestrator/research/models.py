@@ -39,6 +39,12 @@ def extract_ticker_candidates(text: str) -> list[str]:
         "NASDAQ",
         "SPY",
         "QQQ",
+        "SEC",
+        "EDGAR",
+        "HTTPS",
+        "HTTP",
+        "FORM",
+        "CIK",
     }
     raw = text or ""
     tokens: list[str] = []
@@ -66,6 +72,13 @@ def extract_ticker_candidates(text: str) -> list[str]:
                 "nyse",
             )
         ):
+            tokens.append(token)
+            continue
+
+        pair_left = max(match.start() - 12, 0)
+        pair_right = min(match.end() + 24, len(raw))
+        pair_window = raw[pair_left:pair_right]
+        if re.search(r"\b[A-Z]{1,5}\b\s*(?:,|and|/)\s*\b[A-Z]{1,5}\b", pair_window):
             tokens.append(token)
     seen: set[str] = set()
     result: list[str] = []
@@ -131,6 +144,10 @@ class ResearchSource:
     contradiction_risk: float = 0.0
     evidence_grade: str = "ungraded"
     quality_flags: list[str] = field(default_factory=list)
+    evidence_kind: str = "unknown"
+    subject_kind: str = "unknown"
+    document_kind: str = "unknown"
+    entity_binding: str = ""
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -145,6 +162,10 @@ class ResearchSource:
             "credibility_score": self.credibility_score,
             "contradiction_risk": self.contradiction_risk,
             "quality_flags": self.quality_flags,
+            "evidence_kind": self.evidence_kind,
+            "subject_kind": self.subject_kind,
+            "document_kind": self.document_kind,
+            "entity_binding": self.entity_binding,
         }
 
 
@@ -168,3 +189,14 @@ class ResearchSettings:
     max_sources: int
     per_provider: int
     max_query_variants: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchIntentSpec:
+    mode: str = "general"
+    accepted_subject_kinds: tuple[str, ...] = ()
+    accepted_evidence_kinds: tuple[str, ...] = ()
+    rejected_evidence_kinds: tuple[str, ...] = ()
+    required_context_terms: tuple[str, ...] = ()
+    require_entity_binding: bool = False
+    require_actionable_signal: bool = False
