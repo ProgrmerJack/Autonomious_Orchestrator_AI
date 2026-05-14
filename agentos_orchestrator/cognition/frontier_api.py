@@ -429,10 +429,21 @@ class HTTPFrontierClient:
             f"{self.config.model}:generateContent?key={api_key}"
         )
         image_b64 = base64.b64encode(prompt.annotated_png).decode("ascii")
-        body = {
-            "systemInstruction": {
-                "parts": [{"text": prompt.static_instruction_text()}]
-            },
+        # Gemini context caching: when enabled AND the static instruction is
+        # large (>=4096 tokens / ~16k chars), we register a CachedContent for
+        # the static instruction and reuse it via cachedContent on subsequent
+        # calls.  Caching is keyed by (model, sha256(static_instruction)).
+        cached_content_name = ""
+        static_text = prompt.static_instruction_text()
+        if (
+            self.config.enable_prompt_cache
+            and len(static_text) >= 16_000
+            and os.environ.get("AGENTOS_GEMINI_CONTEXT_CACHE", "1") != "0"
+        ):
+            cached_content_name = self._gemini_get_or_create_cache(
+                api_key, static_text
+            )
+        body: dict[str, Any] = {
             "generationConfig": {
                 "temperature": 0,
                 "maxOutputTokens": self.config.max_output_tokens,
@@ -447,6 +458,12 @@ class HTTPFrontierClient:
                 }
             ],
         }
+        if cached_content_name:
+            body["cachedContent"] = cached_content_name
+        else:
+            body["systemInstruction"] = {
+                "parts": [{"text": static_text}]
+            }
         data = self._post_json(endpoint, body, {"Content-Type": "application/json"})
         self.last_usage = _usage_payload(
             "gemini",
@@ -454,11 +471,61 @@ class HTTPFrontierClient:
             prompt,
             model=self.config.model,
         )
+        if cached_content_name:
+            self.last_usage["cached_content"] = cached_content_name
         candidates = data.get("candidates", [])
         if not candidates:
             return "{}"
         parts = candidates[0].get("content", {}).get("parts", [])
         return "\n".join(part.get("text", "") for part in parts)
+
+    # ------------------------------------------------------------------
+    # Gemini context-cache helpers
+    # ------------------------------------------------------------------
+    _gemini_cache_index: dict[str, str] = {}
+
+    def _gemini_get_or_create_cache(
+        self,
+        api_key: str,
+        static_text: str,
+    ) -> str:
+        """Create-or-reuse a Gemini CachedContent for *static_text*.
+
+        Returns the resource name (``cachedContents/...``) or "" on failure.
+        Failure is silent so the regular path still works.
+        """
+        import hashlib
+
+        digest = hashlib.sha256(
+            f"{self.config.model}|{static_text}".encode("utf-8")
+        ).hexdigest()
+        cached = HTTPFrontierClient._gemini_cache_index.get(digest)
+        if cached:
+            return cached
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            f"cachedContents?key={api_key}"
+        )
+        ttl = os.environ.get("AGENTOS_GEMINI_CONTEXT_CACHE_TTL", "3600s")
+        body = {
+            "model": f"models/{self.config.model}",
+            "contents": [
+                {"role": "user", "parts": [{"text": static_text}]}
+            ],
+            "ttl": ttl,
+        }
+        try:
+            data = self._post_json(
+                url,
+                body,
+                {"Content-Type": "application/json"},
+            )
+        except Exception:
+            return ""
+        name = str(data.get("name") or "")
+        if name:
+            HTTPFrontierClient._gemini_cache_index[digest] = name
+        return name
 
     def _require_api_key(self) -> str:
         key = self.config.api_key

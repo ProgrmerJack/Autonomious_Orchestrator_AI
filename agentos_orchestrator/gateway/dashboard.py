@@ -248,6 +248,13 @@ def create_dashboard_app(
         redoc_url=None,
         openapi_url=None,
     )
+
+    def research_workspace_root() -> Path:
+        parent = Path(orchestrator.state_path).resolve(strict=False).parent
+        if parent.name == ".agentos":
+            return parent.parent
+        return parent
+
     app.state.gateway_auth = auth
     app.add_middleware(
         cors.CORSMiddleware,
@@ -374,6 +381,15 @@ def create_dashboard_app(
             discord,
             channel_deliveries,
         )
+        try:
+            from agentos_orchestrator.gateway.run_heartbeat_ws import (
+                register_run_heartbeat_route,
+            )
+
+            register_run_heartbeat_route(app, auth)
+        except Exception:
+            # Heartbeat WS is non-critical; keep dashboard alive on import errors
+            pass
 
         @app.get("/status")
         async def status() -> dict:
@@ -577,6 +593,30 @@ def create_dashboard_app(
         async def recover_run(run_id: str) -> dict:
             return asdict(orchestrator.recover(run_id))
 
+        @app.post("/runs/{run_id}/replay-merge")
+        async def replay_merge_run(run_id: str) -> dict:
+            workspace_root = research_workspace_root()
+            research_engine = getattr(orchestrator.worker, "research_engine", None)
+            if research_engine is None or not hasattr(
+                research_engine, "replay_detached_merge"
+            ):
+                from agentos_orchestrator.research import DeepResearchEngine
+
+                research_engine = DeepResearchEngine(workspace_root=workspace_root)
+            elif hasattr(research_engine, "workspace_root"):
+                configured_root = Path(
+                    getattr(research_engine, "workspace_root") or "."
+                )
+                if configured_root == Path("."):
+                    research_engine.workspace_root = workspace_root
+            try:
+                return asdict(research_engine.replay_detached_merge(run_id))
+            except FileNotFoundError as exc:
+                raise fastapi.HTTPException(
+                    status_code=404,
+                    detail=str(exc),
+                ) from exc
+
         @app.post("/policy/inspect")
         async def inspect_policy(payload: dict) -> dict:
             action = ActionRequest(
@@ -589,7 +629,10 @@ def create_dashboard_app(
         @app.get("/runs/{run_id}/research")
         async def get_research_artifacts(run_id: str) -> dict:
             try:
-                return _research_payload(run_id, Path.cwd())
+                return _research_payload(
+                    run_id,
+                    research_workspace_root(),
+                )
             except FileNotFoundError as exc:
                 raise fastapi.HTTPException(
                     status_code=404,
@@ -603,7 +646,7 @@ def create_dashboard_app(
             Returns the most recently written progress.json if available,
             or a 404 if the research phase has not yet started.
             """
-            progress_path = Path.cwd() / "runs" / run_id / "research" / "progress.json"
+            progress_path = research_workspace_root() / "runs" / run_id / "research" / "progress.json"
             if not progress_path.exists():
                 raise fastapi.HTTPException(
                     status_code=404,

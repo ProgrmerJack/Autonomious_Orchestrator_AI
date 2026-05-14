@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from agentos_orchestrator.os_control.workflow.adapters import (
+    ApiIntentWorkflowAdapter,
     BrowserWorkflowAdapter,
     EditorWorkflowAdapter,
     ExplorerFileOpsWorkflowAdapter,
@@ -10,14 +11,19 @@ from agentos_orchestrator.os_control.workflow.adapters import (
     FileManagerWorkflowAdapter,
     GenericAppWorkflowAdapter,
     OfficeWorkflowAdapter,
+    ResearchWorkflowAdapter,
     SpreadsheetCellEditIntentAdapter,
     SpreadsheetWorkflowAdapter,
     WorkflowContext,
+    workflow_prefers_research_tool,
 )
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
     DesktopWorkflowStep,
     WorkflowArtifact,
+)
+from agentos_orchestrator.os_control.workflow.programmer import (
+    build_programmer_tool_step,
 )
 
 
@@ -108,7 +114,9 @@ class DesktopWorkflowPlanner:
     )
 
     def __init__(self) -> None:
+        self.api_intent_adapter = ApiIntentWorkflowAdapter()
         self.browser_adapter = BrowserWorkflowAdapter()
+        self.research_adapter = ResearchWorkflowAdapter()
         self.file_manager_adapter = FileManagerWorkflowAdapter()
         self.explorer_file_ops_adapter = ExplorerFileOpsWorkflowAdapter()
         self.file_ops_intent_adapter = FileOpsIntentAdapter()
@@ -133,13 +141,12 @@ class DesktopWorkflowPlanner:
             requires_clarification,
         )
         steps = self._build_steps(segments)
-        summary = self._summary(mode, app_target, artifacts, steps, sub_tasks)
         risks, notes = self._plan_guidance()
-        return DesktopWorkflowPlan(
+        plan = DesktopWorkflowPlan(
             objective=cleaned,
             mode=mode,
             app_target=app_target,
-            summary=summary,
+            summary="",
             steps=steps,
             artifacts=artifacts,
             risks=risks,
@@ -148,6 +155,29 @@ class DesktopWorkflowPlanner:
             requires_clarification=requires_clarification,
             clarification_questions=clarification_questions,
         )
+        programmer_step = build_programmer_tool_step(plan)
+        if programmer_step is not None:
+            insert_at = 0
+            while (
+                insert_at < len(plan.steps)
+                and plan.steps[insert_at].action_type == "tool"
+                and plan.steps[insert_at].selector
+                == "tool_executor:workflow_research"
+            ):
+                insert_at += 1
+            plan.steps = [
+                *plan.steps[:insert_at],
+                programmer_step,
+                *plan.steps[insert_at:],
+            ]
+        plan.summary = self._summary(
+            mode,
+            app_target,
+            artifacts,
+            plan.steps,
+            sub_tasks,
+        )
+        return plan
 
     def _build_steps(
         self,
@@ -187,18 +217,43 @@ class DesktopWorkflowPlanner:
         segment_steps: list[DesktopWorkflowStep] = []
         lower = objective.lower()
         artifact_path = None
-        if artifacts:
-            artifact_path = artifacts[0].path.replace("/", "\\")
+        research_artifact_path = None
+        for artifact in artifacts:
+            normalized_path = artifact.path.replace("/", "\\")
+            if artifact.kind == "research-brief":
+                if research_artifact_path is None:
+                    research_artifact_path = normalized_path
+                continue
+            if artifact_path is None:
+                artifact_path = normalized_path
+        if artifact_path is None:
+            artifact_path = research_artifact_path
+        research_preferred = bool(
+            research_artifact_path
+            and research_artifact_path.lower().endswith("research_brief.md")
+            and workflow_prefers_research_tool(lower, mode)
+        )
+        effective_app_target = app_target
+        if research_preferred and app_target in {"msedge.exe", "chrome.exe"}:
+            effective_app_target = None
         context = WorkflowContext(
             objective=objective,
             lower=lower,
             mode=mode,
-            app_target=app_target,
+            app_target=effective_app_target,
             artifact_path=artifact_path,
+            research_artifact_path=research_artifact_path,
         )
-        segment_steps.extend(self.browser_adapter.steps_for(context))
-        if app_target:
-            self._append_launch_step(segment_steps, app_target)
+        research_steps = self.research_adapter.steps_for(context)
+        if research_steps:
+            segment_steps.extend(research_steps)
+        api_steps = self.api_intent_adapter.steps_for(context)
+        if api_steps:
+            segment_steps.extend(api_steps)
+        elif not research_steps:
+            segment_steps.extend(self.browser_adapter.steps_for(context))
+        if effective_app_target and not api_steps:
+            self._append_launch_step(segment_steps, effective_app_target)
         segment_steps.extend(self.file_manager_adapter.steps_for(context))
         segment_steps.extend(self.explorer_file_ops_adapter.steps_for(context))
         segment_steps.extend(self.file_ops_intent_adapter.steps_for(context))
@@ -316,10 +371,22 @@ class DesktopWorkflowPlanner:
     ) -> list[WorkflowArtifact]:
         slug = self._slug(objective)
         base = f"artifacts/workflows/{slug}"
+        artifacts: list[WorkflowArtifact] = []
+        if workflow_prefers_research_tool(lower, mode):
+            artifacts.append(
+                WorkflowArtifact(
+                    path=f"{base}/research_brief.md",
+                    kind="research-brief",
+                    description=(
+                        "Provider-backed research brief gathered before any "
+                        "browser-first UI handoff."
+                    ),
+                )
+            )
         artifact = self._artifact_for_mode(base, lower, mode)
-        if artifact is None:
-            return []
-        return [artifact]
+        if artifact is not None:
+            artifacts.append(artifact)
+        return artifacts
 
     def _artifact_for_mode(
         self,
@@ -389,9 +456,38 @@ class DesktopWorkflowPlanner:
         inferred = DesktopWorkflowPlanner._inferred_app_target(lower)
         if inferred is not None:
             return inferred
+        if DesktopWorkflowPlanner._is_api_task(lower):
+            return None
+        if mode == "app-task" and workflow_prefers_research_tool(lower, mode):
+            return None
         if mode == "app-task" and DesktopWorkflowPlanner._is_knowledge_task(lower):
             return "msedge.exe"
         return DesktopWorkflowPlanner.DEFAULT_MODE_TARGETS.get(mode)
+
+    @staticmethod
+    def _is_api_task(lower: str) -> bool:
+        if re.search(
+            r"https?://\S*(?:/api|graphql|openapi|swagger|\.json)\S*",
+            lower,
+        ):
+            return True
+        if re.search(
+            r"(?:localhost|127\.0\.0\.1)(?::\d{1,5})?(?:/\S*)?",
+            lower,
+        ):
+            return True
+        return any(
+            cue in lower
+            for cue in (
+                " api",
+                "api ",
+                "endpoint",
+                "graphql",
+                "openapi",
+                "swagger",
+                "webhook",
+            )
+        )
 
     @staticmethod
     def _is_knowledge_task(lower: str) -> bool:
@@ -510,14 +606,37 @@ class DesktopWorkflowPlanner:
         normalized = objective
         normalized = re.sub(r"\bthen\b", " and ", normalized, flags=re.I)
         normalized = re.sub(r"\bnext\b", " and ", normalized, flags=re.I)
-        parts = [
+        raw_parts = [
             item.strip(" .")
             for item in re.split(r"\s+and\s+|\s*;\s*|\s*,\s*", normalized)
             if item.strip(" .")
         ]
+        parts: list[str] = []
+        for item in raw_parts:
+            if parts and DesktopWorkflowPlanner._should_merge_continuation(parts[-1], item):
+                parts[-1] = f"{parts[-1]} and {item}"
+                continue
+            parts.append(item)
         if len(parts) <= 1:
             return [objective.strip()] if objective.strip() else []
         return parts[:8]
+
+    @staticmethod
+    def _should_merge_continuation(previous: str, current: str) -> bool:
+        previous_lower = previous.lower().strip()
+        current_lower = current.lower().strip()
+        if not previous_lower or not current_lower:
+            return False
+        if not DesktopWorkflowPlanner._is_knowledge_task(previous_lower):
+            return False
+        continuation_patterns = (
+            r"^(?:analy(?:z|s)e|compare|investigate|summari(?:z|s)e)\s+(?:it|them|that|those|this)\b",
+            r"^(?:analy(?:z|s)e|compare|investigate|summari(?:z|s)e)\b$",
+        )
+        return any(
+            re.search(pattern, current_lower) is not None
+            for pattern in continuation_patterns
+        )
 
     @staticmethod
     def _needs_clarification(cleaned: str, lower: str) -> bool:

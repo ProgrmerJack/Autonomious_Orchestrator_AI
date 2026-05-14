@@ -155,6 +155,9 @@ export type RunProgress = {
     discovered_domains?: number;
     novelty_rate?: number;
     domain_count?: number;
+    detached_frontier?: JsonMap;
+    frontier_shards?: JsonMap[];
+    detached_merge?: JsonMap;
     passes?: JsonMap[];
 };
 

@@ -13,12 +13,66 @@ mod platform {
             Ok(enigo) => {
                 let display = enigo.main_display().unwrap_or((0, 0));
                 let cursor = enigo.location().unwrap_or((0, 0));
+                let mut nodes = vec![
+                    json!({
+                        "node_id": "native-desktop",
+                        "role": "Desktop",
+                        "name": "Windows Desktop",
+                        "focused": true,
+                        "enabled": true,
+                        "bounds": [0, 0, display.0, display.1],
+                        "metadata": {
+                            "native": true,
+                            "backend": "rust-native-windows",
+                            "control_channel": "native-input"
+                        }
+                    }),
+                    json!({
+                        "node_id": "native-cursor",
+                        "role": "Pointer",
+                        "name": "Mouse Cursor",
+                        "focused": false,
+                        "enabled": true,
+                        "bounds": [cursor.0, cursor.1, 1, 1],
+                        "metadata": {
+                            "native": true,
+                            "x": cursor.0,
+                            "y": cursor.1
+                        }
+                    }),
+                ];
+                let mut uia_status = "disabled";
+                #[cfg(feature = "uia-windows")]
+                {
+                    match collect_uia_nodes(256) {
+                        Ok(extra) => {
+                            uia_status = "ok";
+                            nodes.extend(extra);
+                        }
+                        Err(error) => {
+                            uia_status = "error";
+                            nodes.push(json!({
+                                "node_id": "native-uia-error",
+                                "role": "Error",
+                                "name": "UIA enumeration failed",
+                                "focused": false,
+                                "enabled": false,
+                                "bounds": [0, 0, 0, 0],
+                                "metadata": {
+                                    "native": true,
+                                    "error": error
+                                }
+                            }));
+                        }
+                    }
+                }
                 json!({
                     "type": "native.snapshot",
                     "status": "ok",
                     "backend": "rust-native-windows",
                     "native": true,
                     "platform": "windows",
+                    "uia": uia_status,
                     "screen": {
                         "x": 0,
                         "y": 0,
@@ -26,37 +80,94 @@ mod platform {
                         "height": display.1,
                     },
                     "cursor": {"x": cursor.0, "y": cursor.1},
-                    "nodes": [
-                        {
-                            "node_id": "native-desktop",
-                            "role": "Desktop",
-                            "name": "Windows Desktop",
-                            "focused": true,
-                            "enabled": true,
-                            "bounds": [0, 0, display.0, display.1],
-                            "metadata": {
-                                "native": true,
-                                "backend": "rust-native-windows",
-                                "control_channel": "native-input"
-                            }
-                        },
-                        {
-                            "node_id": "native-cursor",
-                            "role": "Pointer",
-                            "name": "Mouse Cursor",
-                            "focused": false,
-                            "enabled": true,
-                            "bounds": [cursor.0, cursor.1, 1, 1],
-                            "metadata": {
-                                "native": true,
-                                "x": cursor.0,
-                                "y": cursor.1
-                            }
-                        }
-                    ]
+                    "nodes": nodes
                 })
             }
             Err(error) => unavailable(format!("native input unavailable: {error}")),
+        }
+    }
+
+    #[cfg(feature = "uia-windows")]
+    fn collect_uia_nodes(limit: usize) -> Result<Vec<Value>, String> {
+        use uiautomation::types::TreeScope;
+        use uiautomation::UIAutomation;
+
+        let automation = UIAutomation::new().map_err(|e| e.to_string())?;
+        let root = automation.get_root_element().map_err(|e| e.to_string())?;
+        let condition = automation
+            .create_true_condition()
+            .map_err(|e| e.to_string())?;
+        let walker = automation
+            .create_tree_walker_with_condition(&condition)
+            .map_err(|e| e.to_string())?;
+        let mut nodes = Vec::new();
+        // Enumerate top-level windows
+        let windows = root
+            .find_all(TreeScope::Children, &condition)
+            .map_err(|e| e.to_string())?;
+        for window in windows {
+            if nodes.len() >= limit {
+                break;
+            }
+            walk(&walker, &window, 0, &mut nodes, limit);
+        }
+        Ok(nodes)
+    }
+
+    #[cfg(feature = "uia-windows")]
+    fn walk(
+        walker: &uiautomation::UITreeWalker,
+        element: &uiautomation::UIElement,
+        depth: usize,
+        nodes: &mut Vec<Value>,
+        limit: usize,
+    ) {
+        if nodes.len() >= limit || depth > 5 {
+            return;
+        }
+        let name = element.get_name().unwrap_or_default();
+        let role = element
+            .get_control_type()
+            .map(|c| format!("{:?}", c))
+            .unwrap_or_default();
+        let automation_id = element.get_automation_id().unwrap_or_default();
+        let rect = element.get_bounding_rectangle().ok();
+        let bounds = rect
+            .map(|r| json!([r.get_left(), r.get_top(), r.get_width(), r.get_height()]))
+            .unwrap_or(json!([0, 0, 0, 0]));
+        let enabled = element.is_enabled().unwrap_or(false);
+        let focused = element.has_keyboard_focus().unwrap_or(false);
+        let node_id = if automation_id.is_empty() {
+            format!("uia-{}-{}", depth, nodes.len())
+        } else {
+            format!("uia-{}", automation_id)
+        };
+        nodes.push(json!({
+            "node_id": node_id,
+            "role": role,
+            "name": name,
+            "focused": focused,
+            "enabled": enabled,
+            "bounds": bounds,
+            "metadata": {
+                "native": true,
+                "backend": "rust-native-windows-uia",
+                "automation_id": automation_id,
+                "depth": depth
+            }
+        }));
+        if let Ok(first_child) = walker.get_first_child(element) {
+            let mut current = first_child;
+            loop {
+                if nodes.len() >= limit {
+                    break;
+                }
+                walk(walker, &current, depth + 1, nodes, limit);
+                match walker.get_next_sibling(&current) {
+                    Ok(sibling) => current = sibling,
+                    Err(_) => break,
+                }
+            }
         }
     }
 

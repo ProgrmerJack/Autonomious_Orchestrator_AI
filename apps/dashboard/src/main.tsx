@@ -105,6 +105,7 @@ function App() {
     const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
     const [runCheckpoint, setRunCheckpoint] = useState<JsonMap | null>(null);
     const [runProgress, setRunProgress] = useState<Record<string, RunProgress>>({});
+    const [replayingRunId, setReplayingRunId] = useState<string | null>(null);
     const [policyActionType, setPolicyActionType] = useState('os.snapshot');
     const [policyTarget, setPolicyTarget] = useState('windows-uia://snapshot');
     const [policyDecision, setPolicyDecision] = useState<JsonMap | null>(null);
@@ -124,6 +125,22 @@ function App() {
     const backendAvailable = system?.pc_backends.find(
         (backend) => backend.name === pcBackend
     )?.available;
+    const selectedRunProgress = selectedRunId ? runProgress[selectedRunId] || null : null;
+    const selectedDetachedMerge = selectedRunProgress?.detached_merge || null;
+    const selectedMergeShardCount =
+        selectedDetachedMerge && typeof selectedDetachedMerge.shard_count === 'number'
+            ? selectedDetachedMerge.shard_count
+            : null;
+    const selectedMergePacketCount =
+        selectedDetachedMerge
+        && typeof selectedDetachedMerge.merge_ready_packet_count === 'number'
+            ? selectedDetachedMerge.merge_ready_packet_count
+            : null;
+    const selectedReplayManifestPath =
+        selectedDetachedMerge
+        && typeof selectedDetachedMerge.replay_manifest_path === 'string'
+            ? selectedDetachedMerge.replay_manifest_path
+            : '';
 
     async function establishSession(token: string) {
         const trimmed = token.trim();
@@ -560,6 +577,25 @@ function App() {
         await refreshAll();
     }
 
+    async function replayMergeRun(runId: string) {
+        if (!runId) {
+            return;
+        }
+        setReplayingRunId(runId);
+        setError('');
+        try {
+            await fetchJson<JsonMap>(`/runs/${runId}/replay-merge`, {
+                method: 'POST'
+            });
+            await openRun(runId);
+            await refreshAll();
+        } catch (caught) {
+            setError(caught instanceof Error ? caught.message : String(caught));
+        } finally {
+            setReplayingRunId(null);
+        }
+    }
+
     async function inspectPolicy(event: FormEvent) {
         event.preventDefault();
         const payload = await fetchJson<JsonMap>('/policy/inspect', {
@@ -884,6 +920,17 @@ function App() {
                                     <button type="button" className="secondary" onClick={() => inspectRun(run.run_id)} title="Inspect checkpoint">
                                         <Eye size={16} />
                                     </button>
+                                    {(run.status !== 'completed' || progress?.detached_merge) && (
+                                        <button
+                                            type="button"
+                                            className="secondary"
+                                            onClick={() => void replayMergeRun(run.run_id)}
+                                            title="Replay detached merge from persisted shard packets"
+                                            disabled={replayingRunId === run.run_id}
+                                        >
+                                            <Database size={16} />
+                                        </button>
+                                    )}
                                     {run.status !== 'completed' && (
                                         <button type="button" className="secondary" onClick={() => recoverRun(run.run_id)} title="Recover run">
                                             <RefreshCw size={16} />
@@ -897,17 +944,49 @@ function App() {
                     <div className="panel research-detail">
                         <h2><FileText size={18} /> Research Artifacts</h2>
                         {!selectedRun && !runCheckpoint && <p className="muted">Select a run</p>}
-                        {selectedRunId && runProgress[selectedRunId] && (
+                        {selectedRunId && selectedRunProgress && (
                             <div className="debug-box">
                                 <h3>Live Progress</h3>
-                                <p>{runProgress[selectedRunId].stage || 'progress'}</p>
-                                <p className="muted">{runProgressSummary(runProgress[selectedRunId])}</p>
-                                {runProgressQuery(runProgress[selectedRunId]) && (
-                                    <p className="muted">{runProgressQuery(runProgress[selectedRunId])}</p>
+                                <p>{selectedRunProgress.stage || 'progress'}</p>
+                                <p className="muted">{runProgressSummary(selectedRunProgress)}</p>
+                                {runProgressQuery(selectedRunProgress) && (
+                                    <p className="muted">{runProgressQuery(selectedRunProgress)}</p>
                                 )}
-                                {runProgress[selectedRunId].last_updated && (
-                                    <span>{runProgress[selectedRunId].last_updated}</span>
+                                {selectedRunProgress.last_updated && (
+                                    <span>{selectedRunProgress.last_updated}</span>
                                 )}
+                            </div>
+                        )}
+                        {selectedRunId && (
+                            <div className="debug-box">
+                                <h3>Detached Merge Replay</h3>
+                                <p>
+                                    Rebuild final synthesis from persisted shard packets
+                                    without rerunning retrieval.
+                                </p>
+                                {(selectedMergePacketCount !== null
+                                    || selectedMergeShardCount !== null) && (
+                                    <p className="muted">
+                                        {selectedMergePacketCount ?? 0} merge-ready packets
+                                        across {selectedMergeShardCount ?? 0} shards
+                                    </p>
+                                )}
+                                {selectedReplayManifestPath && (
+                                    <span>{selectedReplayManifestPath}</span>
+                                )}
+                                <div className="actions">
+                                    <button
+                                        type="button"
+                                        onClick={() => void replayMergeRun(selectedRunId)}
+                                        title="Replay detached merge"
+                                        disabled={replayingRunId === selectedRunId}
+                                    >
+                                        <Database size={16} />
+                                        {replayingRunId === selectedRunId
+                                            ? 'Replaying Merge...'
+                                            : 'Replay Merge'}
+                                    </button>
+                                </div>
                             </div>
                         )}
                         {selectedRun && (

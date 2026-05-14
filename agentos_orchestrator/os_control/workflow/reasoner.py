@@ -15,6 +15,9 @@ from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
     DesktopWorkflowStep,
 )
+from agentos_orchestrator.os_control.workflow.programmer import (
+    build_programmer_tool_step,
+)
 
 
 @dataclass(slots=True)
@@ -44,10 +47,93 @@ class DesktopWorkflowReasoner:
         nodes: list[UiNode],
         receipts: list[dict[str, Any]],
     ) -> ActionDecision:
+        direct_decision = self._direct_lane_decision(
+            objective,
+            plan,
+            nodes,
+            receipts,
+        )
+        if direct_decision is not None:
+            return direct_decision
         model_decision = self._model_decision(objective, plan, nodes, receipts)
         if model_decision is not None:
             return model_decision
         return self._heuristic_decision(objective, plan, nodes, receipts)
+
+    def _direct_lane_decision(
+        self,
+        objective: str,
+        plan: DesktopWorkflowPlan,
+        nodes: list[UiNode],
+        receipts: list[dict[str, Any]],
+    ) -> ActionDecision | None:
+        research_step = self._research_tool_step(plan, receipts)
+        tool_step = self._programmer_tool_step(plan, receipts)
+        if self._has_api_receipt(receipts):
+            return ActionDecision(
+                None,
+                done=True,
+                rationale=(
+                    "A direct API action already produced structured output, "
+                    "so no further UI handoff is needed."
+                ),
+            )
+        if self._has_research_receipt(receipts) and tool_step is None:
+            return ActionDecision(
+                None,
+                done=True,
+                rationale=(
+                    "The workflow research brief already produced provider-backed "
+                    "evidence, so no further UI handoff is needed."
+                ),
+            )
+        if not nodes:
+            if research_step is not None:
+                return ActionDecision(
+                    research_step,
+                    rationale=(
+                        "The plan already has a provider-backed research step, "
+                        "so emit it before requiring any UI."
+                    ),
+                )
+            if tool_step is not None:
+                return ActionDecision(
+                    tool_step,
+                    rationale=(
+                        "The plan already has artifact outputs, so emit the "
+                        "programmer lane tool step before requiring any UI."
+                    ),
+                )
+            return None
+
+        api_step = self._api_surface_step(objective, nodes, receipts)
+        if api_step is not None:
+            return ActionDecision(
+                api_step,
+                rationale=(
+                    "A live endpoint is exposed on the current surface, so "
+                    "prefer a direct API action before brittle UI interaction."
+                ),
+            )
+
+        if research_step is not None:
+            return ActionDecision(
+                research_step,
+                rationale=(
+                    "The plan already has a provider-backed research step, so "
+                    "emit it before typing into the UI."
+                ),
+            )
+
+        if tool_step is not None:
+            return ActionDecision(
+                tool_step,
+                rationale=(
+                    "The plan already has artifact outputs, so emit the "
+                    "programmer lane tool step before typing into the UI."
+                ),
+            )
+        return None
 
     def _heuristic_decision(
         self,
@@ -184,6 +270,9 @@ class DesktopWorkflowReasoner:
         selector = str(parsed.get("selector") or "").strip()
         if not action_type or not selector:
             return None
+        metadata = parsed.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
         return ActionDecision(
             DesktopWorkflowStep(
                 action_type=action_type,
@@ -192,6 +281,7 @@ class DesktopWorkflowReasoner:
                 description=str(
                     parsed.get("description") or "Model-proposed adaptive action."
                 ),
+                metadata=metadata,
             ),
             rationale=str(parsed.get("rationale") or "Model-selected next action."),
             engine="gemini",
@@ -229,10 +319,199 @@ class DesktopWorkflowReasoner:
             f"{json.dumps(recent_receipts, indent=2)}\n\n"
             "Visible nodes:\n"
             f"{chr(10).join(node_lines)}\n\n"
-            "Allowed action types: focus, click, invoke, type, set_text, hotkey.\n"
-            "Return JSON with keys: done, action_type, selector, value, description, rationale.\n"
+            "Allowed action types: focus, click, invoke, type, set_text, hotkey, api_call, tool.\n"
+            "If action_type is api_call, selector must be the endpoint URL.\n"
+            "If action_type is tool, selector must be tool_executor:workflow_programmer or tool_executor:workflow_research and metadata.tool_request must be present.\n"
+            "Return JSON with keys: done, action_type, selector, value, description, rationale, metadata.\n"
             'If no more useful progress can be made, return {"done": true, "rationale": "..."}.'
         )
+
+    @classmethod
+    def _research_tool_step(
+        cls,
+        plan: DesktopWorkflowPlan,
+        receipts: list[dict[str, Any]],
+    ) -> DesktopWorkflowStep | None:
+        if cls._has_tool_selector(receipts, "tool_executor:workflow_research"):
+            return None
+        for step in plan.steps:
+            if (
+                step.action_type == "tool"
+                and step.selector == "tool_executor:workflow_research"
+            ):
+                return step
+        return None
+
+    @classmethod
+    def _programmer_tool_step(
+        cls,
+        plan: DesktopWorkflowPlan,
+        receipts: list[dict[str, Any]],
+    ) -> DesktopWorkflowStep | None:
+        if cls._has_tool_selector(receipts, "tool_executor:workflow_programmer") or cls._has_semantic_surface_write(receipts):
+            return None
+        for step in plan.steps:
+            if (
+                step.action_type == "tool"
+                and step.selector == "tool_executor:workflow_programmer"
+            ):
+                return step
+        if any(
+            step.action_type == "tool" and step.selector == "tool_executor:workflow_research"
+            for step in plan.steps
+        ):
+            return None
+        return build_programmer_tool_step(plan)
+
+    @classmethod
+    def _api_surface_step(
+        cls,
+        objective: str,
+        nodes: list[UiNode],
+        receipts: list[dict[str, Any]],
+    ) -> DesktopWorkflowStep | None:
+        if cls._has_api_action(receipts):
+            return None
+        objective_prefers_api = cls._objective_prefers_api(objective)
+        candidates: list[tuple[int, UiNode, str]] = []
+        for node in nodes:
+            endpoint = cls._node_endpoint(node)
+            if not endpoint:
+                continue
+            name_lower = node.name.lower()
+            metadata = dict(node.metadata or {})
+            if not objective_prefers_api and not (
+                "api" in name_lower or metadata.get("api")
+            ):
+                continue
+            score = 100 if node.focused else 0
+            score += 40 if metadata.get("workflow") else 0
+            score += 25 if metadata.get("endpoint") or metadata.get("api_endpoint") else 0
+            score += 20 if node.role in {"Pane", "Document", "Table"} else 0
+            score += 10 if "dashboard" in name_lower or "api" in name_lower else 0
+            candidates.append((score, node, endpoint))
+        if not candidates:
+            return None
+        _, node, endpoint = max(candidates, key=lambda item: item[0])
+        metadata = dict(node.metadata or {})
+        step_metadata: dict[str, Any] = {
+            "control_channel": "api",
+            "method": cls._api_method(objective, metadata),
+            "expected_observation": (
+                "The direct API action returns a structured response."
+            ),
+        }
+        workflow = metadata.get("workflow")
+        if isinstance(workflow, list) and workflow:
+            step_metadata["workflow"] = workflow
+        auth_env_keys = metadata.get("auth_env_keys") or []
+        if isinstance(auth_env_keys, (list, tuple)):
+            step_metadata["auth_env_keys"] = [str(item) for item in auth_env_keys]
+        headers = metadata.get("headers")
+        if isinstance(headers, dict) and headers:
+            step_metadata["headers"] = dict(headers)
+        return DesktopWorkflowStep(
+            action_type="api_call",
+            selector=endpoint,
+            description="Invoke the surfaced API directly before manipulating the UI.",
+            metadata=step_metadata,
+        )
+
+    @staticmethod
+    def _has_api_action(receipts: list[dict[str, Any]]) -> bool:
+        return any(
+            item.get("action_type") in {"api_call", "mcp_call", "http_request"}
+            for item in receipts
+        )
+
+    @staticmethod
+    def _has_tool_selector(receipts: list[dict[str, Any]], selector: str) -> bool:
+        return any(
+            item.get("action_type") == "tool" and item.get("selector") == selector
+            for item in receipts
+        )
+
+    @staticmethod
+    def _has_api_receipt(receipts: list[dict[str, Any]]) -> bool:
+        for item in receipts:
+            if item.get("action_type") in {"api_call", "mcp_call", "http_request"}:
+                return True
+            selector = str(item.get("selector") or "")
+            receipt = item.get("receipt")
+            if "tool_executor:workflow_api" in selector or "control_surface_probe" in selector:
+                return True
+            if isinstance(receipt, dict) and str(receipt.get("kind") or "") in {
+                "api_workflow",
+                "http_probe",
+            }:
+                return True
+        return False
+
+    @staticmethod
+    def _has_research_receipt(receipts: list[dict[str, Any]]) -> bool:
+        for item in receipts:
+            if (
+                item.get("action_type") == "tool"
+                and item.get("selector") == "tool_executor:workflow_research"
+            ):
+                return True
+            receipt = item.get("receipt")
+            if isinstance(receipt, dict) and str(receipt.get("kind") or "") == "workflow_research_brief":
+                return True
+        return False
+
+    @staticmethod
+    def _objective_prefers_api(objective: str) -> bool:
+        lower = objective.lower()
+        return any(
+            cue in lower
+            for cue in (
+                " api",
+                "api ",
+                "endpoint",
+                "graphql",
+                "openapi",
+                "swagger",
+                "webhook",
+                "refresh api",
+                "health",
+                "probe",
+                "localhost",
+                "127.0.0.1",
+            )
+        )
+
+    @staticmethod
+    def _node_endpoint(node: UiNode) -> str:
+        metadata = dict(node.metadata or {})
+        for key in ("endpoint", "api_endpoint", "url"):
+            value = str(metadata.get(key) or "").strip()
+            if value.startswith(("http://", "https://")):
+                return value
+        workflow = metadata.get("workflow")
+        if isinstance(workflow, list) and workflow:
+            first = workflow[0]
+            if isinstance(first, dict):
+                endpoint = str(first.get("url") or "").strip()
+                if endpoint.startswith(("http://", "https://")):
+                    return endpoint
+        return ""
+
+    @staticmethod
+    def _api_method(objective: str, metadata: dict[str, Any]) -> str:
+        declared = str(metadata.get("method") or "").strip().upper()
+        if declared:
+            return declared
+        lower = objective.lower()
+        if any(token in lower for token in (" delete ", " remove ")):
+            return "DELETE"
+        if any(token in lower for token in (" patch ", " update ")):
+            return "PATCH"
+        if " put " in lower:
+            return "PUT"
+        if any(token in lower for token in (" post ", " create ", " submit ", " send ")):
+            return "POST"
+        return "GET"
 
     @staticmethod
     def _is_browser_plan(plan: DesktopWorkflowPlan) -> bool:

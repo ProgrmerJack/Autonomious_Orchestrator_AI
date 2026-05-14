@@ -1,6 +1,7 @@
 """Programmatic UI control adapters."""
 
 from .base import OsControlBackend, UiAction, UiNode
+from .linux_atspi_backend import LinuxAtSpiBackend
 from .live_fire import (
     DEFAULT_NOTEPAD_FILE_NAME,
     DEFAULT_NOTEPAD_PAYLOAD,
@@ -8,6 +9,7 @@ from .live_fire import (
     NotepadLiveFireResult,
     NotepadLiveFireTrial,
 )
+from .macos_ax_backend import MacOsAxBackend
 from .paint_live_fire import (
     DEFAULT_PAINT_FILE_NAME,
     PaintLiveFireConfig,
@@ -46,6 +48,8 @@ __all__ = [
     "ExplorerFileOpsWorkflowAdapter",
     "GenericAppWorkflowAdapter",
     "HybridControlBackend",
+    "LinuxAtSpiBackend",
+    "MacOsAxBackend",
     "NotepadLiveFireConfig",
     "NotepadLiveFireResult",
     "NotepadLiveFireTrial",

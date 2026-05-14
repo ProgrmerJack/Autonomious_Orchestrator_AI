@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,9 +12,16 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .models import (
+    ResearchBrief,
     ResearchSettings,
     ResearchSource,
     sanitize_evidence_claim_text as _sanitize_evidence_claim_text,
+)
+
+
+_PROVIDER_DIAGNOSTIC_RAM_CAP = max(
+    32,
+    int(os.environ.get("AGENTOS_PROVIDER_DIAGNOSTIC_RAM_CAP", "512") or 512),
 )
 
 
@@ -32,14 +40,34 @@ class ResearchArtifactsMixin:
         status: str,
         detail: str = "",
     ) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        compact_detail = detail[:500]
+        if self.provider_diagnostics:
+            last = self.provider_diagnostics[-1]
+            if (
+                last.get("provider") == provider
+                and last.get("status") == status
+                and last.get("detail") == compact_detail
+            ):
+                last["repeat_count"] = int(last.get("repeat_count") or 1) + 1
+                last["created_at"] = created_at
+                self._flush_live_provider_diagnostics()
+                return
         self.provider_diagnostics.append(
             {
                 "provider": provider,
                 "status": status,
-                "detail": detail[:500],
-                "created_at": datetime.now(UTC).isoformat(),
+                "detail": compact_detail,
+                "created_at": created_at,
             }
         )
+        overflow = getattr(self, "_provider_diagnostic_overflow", 0)
+        if len(self.provider_diagnostics) > _PROVIDER_DIAGNOSTIC_RAM_CAP:
+            overflow += len(self.provider_diagnostics) - _PROVIDER_DIAGNOSTIC_RAM_CAP
+            self.provider_diagnostics = self.provider_diagnostics[
+                -_PROVIDER_DIAGNOSTIC_RAM_CAP:
+            ]
+            self._provider_diagnostic_overflow = overflow
         self._flush_live_provider_diagnostics()
 
     def _flush_live_provider_diagnostics(self) -> None:
@@ -48,8 +76,24 @@ class ResearchArtifactsMixin:
         artifact_dir = self.workspace_root / "runs" / self._active_run_id / "research"
         try:
             artifact_dir.mkdir(parents=True, exist_ok=True)
+            payload = list(self.provider_diagnostics)
+            overflow = int(getattr(self, "_provider_diagnostic_overflow", 0) or 0)
+            if overflow > 0:
+                payload = [
+                    {
+                        "provider": "provider-diagnostics",
+                        "status": "compacted",
+                        "detail": (
+                            "Older provider diagnostics were compacted from in-memory "
+                            f"retention to prevent runaway RAM growth. Dropped entries: {overflow}."
+                        ),
+                        "overflow_count": overflow,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    },
+                    *payload,
+                ]
             (artifact_dir / "provider_diagnostics.json").write_text(
-                json.dumps(self.provider_diagnostics, indent=2),
+                json.dumps(payload, indent=2),
                 encoding="utf-8",
             )
         except OSError:
@@ -112,6 +156,837 @@ class ResearchArtifactsMixin:
             ),
         )
 
+    @staticmethod
+    def _frontier_shard_index(key: str, shard_count: int) -> int:
+        normalized = str(key or "").strip()
+        if shard_count <= 1 or not normalized:
+            return 0
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        return int(digest[:12], 16) % max(1, int(shard_count))
+
+    @staticmethod
+    def _frontier_unique_values(items: list[str], limit: int = 8) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+            if len(values) >= limit:
+                break
+        return values
+
+    @staticmethod
+    def _frontier_backlog_status(
+        queue_total: int,
+        active_claims: int,
+    ) -> str:
+        if queue_total >= 512 or active_claims >= 16:
+            return "high"
+        if queue_total >= 128 or active_claims >= 4:
+            return "medium"
+        return "low"
+
+    def _detached_frontier_metrics_snapshot(self) -> dict[str, Any]:
+        if self._crawl_broker_enabled():
+            try:
+                metrics = self.crawl_broker_metrics()
+            except RuntimeError:
+                return {}
+            return metrics if isinstance(metrics, dict) else {}
+
+        self._ensure_research_state_store()
+        status_counts: dict[str, int] = {}
+        js_status_counts: dict[str, int] = {}
+        worker_stats: dict[str, dict[str, Any]] = {}
+        with closing(self._connect_research_state()) as connection:
+            queue_summary = connection.execute(
+                """
+                SELECT status,
+                       COUNT(*) AS row_count,
+                       COALESCE(SUM(js_required), 0) AS js_required_count
+                FROM crawl_queue
+                GROUP BY status
+                """
+            ).fetchall()
+            for row in queue_summary:
+                status = str(row["status"] or "").strip() or "unknown"
+                status_counts[status] = int(row["row_count"] or 0)
+                js_status_counts[status] = int(row["js_required_count"] or 0)
+
+            totals_row = connection.execute(
+                """
+                SELECT COUNT(*) AS queue_total,
+                       COALESCE(SUM(js_required), 0) AS js_total,
+                       COUNT(DISTINCT domain) AS domain_total
+                FROM crawl_queue
+                """
+            ).fetchone()
+            observation_row = connection.execute(
+                """
+                SELECT COUNT(*) AS observation_total,
+                       COALESCE(SUM(used_browser), 0) AS browser_total
+                FROM crawl_observations
+                """
+            ).fetchone()
+            active_claim_rows = connection.execute(
+                """
+                SELECT last_claimed_by AS worker_id,
+                       COUNT(*) AS active_claims,
+                       COALESCE(SUM(js_required), 0) AS active_js_claims,
+                       MAX(last_claimed_at) AS last_claimed_at
+                FROM crawl_queue
+                WHERE status = 'claimed' AND last_claimed_by != ''
+                GROUP BY last_claimed_by
+                ORDER BY active_claims DESC,
+                         active_js_claims DESC,
+                         worker_id ASC
+                """
+            ).fetchall()
+            for row in active_claim_rows:
+                worker_id = str(row["worker_id"] or "").strip()
+                if not worker_id:
+                    continue
+                worker_stats[worker_id] = {
+                    "worker_id": worker_id,
+                    "active_claims": int(row["active_claims"] or 0),
+                    "active_js_claims": int(row["active_js_claims"] or 0),
+                    "observation_count": 0,
+                    "browser_observations": 0,
+                    "last_claimed_at": str(row["last_claimed_at"] or ""),
+                    "last_observed_at": "",
+                }
+
+            observation_rows = connection.execute(
+                """
+                SELECT worker_id,
+                       COUNT(*) AS observation_count,
+                       COALESCE(SUM(used_browser), 0) AS browser_observations,
+                       MAX(updated_at) AS last_observed_at
+                FROM crawl_observations
+                WHERE worker_id != ''
+                GROUP BY worker_id
+                ORDER BY observation_count DESC,
+                         browser_observations DESC,
+                         worker_id ASC
+                """
+            ).fetchall()
+            for row in observation_rows:
+                worker_id = str(row["worker_id"] or "").strip()
+                if not worker_id:
+                    continue
+                entry = worker_stats.setdefault(
+                    worker_id,
+                    {
+                        "worker_id": worker_id,
+                        "active_claims": 0,
+                        "active_js_claims": 0,
+                        "observation_count": 0,
+                        "browser_observations": 0,
+                        "last_claimed_at": "",
+                        "last_observed_at": "",
+                    },
+                )
+                entry["observation_count"] = int(row["observation_count"] or 0)
+                entry["browser_observations"] = int(
+                    row["browser_observations"] or 0
+                )
+                entry["last_observed_at"] = str(row["last_observed_at"] or "")
+
+        worker_items = sorted(
+            worker_stats.values(),
+            key=lambda item: (
+                int(item.get("active_js_claims") or 0),
+                int(item.get("active_claims") or 0),
+                int(item.get("browser_observations") or 0),
+                int(item.get("observation_count") or 0),
+                str(item.get("worker_id") or ""),
+            ),
+            reverse=True,
+        )
+        shard_entry = {
+            "shard_index": 0,
+            "queue_db_path": str(self._research_state_path()),
+            "queue_total": int(totals_row["queue_total"] or 0) if totals_row else 0,
+            "domain_total": int(totals_row["domain_total"] or 0)
+            if totals_row
+            else 0,
+            "status_counts": status_counts,
+            "js_required_counts": {
+                "total": int(totals_row["js_total"] or 0) if totals_row else 0,
+                **js_status_counts,
+            },
+            "active_claims": int(status_counts.get("claimed", 0)),
+            "observation_total": int(observation_row["observation_total"] or 0)
+            if observation_row
+            else 0,
+            "browser_observation_total": int(observation_row["browser_total"] or 0)
+            if observation_row
+            else 0,
+            "workers": worker_items,
+        }
+        return {
+            "backend": "sqlite",
+            "shard_count": 1,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "queue": {
+                "total": shard_entry["queue_total"],
+                "domain_total": shard_entry["domain_total"],
+                "status_counts": status_counts,
+                "js_required_counts": shard_entry["js_required_counts"],
+            },
+            "observations": {
+                "total": shard_entry["observation_total"],
+                "browser_total": shard_entry["browser_observation_total"],
+            },
+            "domain_leases": {
+                "active_count": 0,
+                "items": [],
+            },
+            "worker_utilization": {
+                "active_worker_count": len(worker_items),
+                "items": worker_items,
+            },
+            "shards": [shard_entry],
+        }
+
+    def _detached_frontier_queue_inspect(
+        self,
+        *,
+        limit: int = 24,
+        statuses: list[str] | None = None,
+        shard_index: int | None = None,
+    ) -> dict[str, Any]:
+        if self._crawl_broker_enabled():
+            try:
+                return self.crawl_broker_queue_inspect(
+                    limit=limit,
+                    statuses=statuses,
+                    shard_index=shard_index,
+                )
+            except RuntimeError:
+                return {"items": [], "total_matches": 0, "per_shard_matches": {}}
+
+        del shard_index
+        self._ensure_research_state_store()
+        normalized_statuses = [
+            str(status).strip() for status in (statuses or []) if str(status).strip()
+        ]
+        if not normalized_statuses:
+            normalized_statuses = ["queued", "claimed", "processed"]
+        status_placeholders = ", ".join("?" for _ in normalized_statuses)
+        where_sql = f"WHERE status IN ({status_placeholders})"
+        params: list[Any] = list(normalized_statuses)
+        with closing(self._connect_research_state()) as connection:
+            match_row = connection.execute(
+                f"SELECT COUNT(*) AS row_count FROM crawl_queue {where_sql}",
+                tuple(params),
+            ).fetchone()
+            rows = connection.execute(
+                f"""
+                SELECT url,
+                       domain,
+                       priority,
+                       status,
+                       source_query,
+                       source_url,
+                       run_id,
+                       js_required,
+                       attempts,
+                       last_claimed_by,
+                       last_claimed_at,
+                       last_error,
+                       created_at,
+                       updated_at
+                FROM crawl_queue
+                {where_sql}
+                ORDER BY priority DESC, js_required DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (*params, max(int(limit), 1)),
+            ).fetchall()
+        items = [
+            {
+                "shard_index": 0,
+                "url": str(row["url"] or ""),
+                "domain": str(row["domain"] or ""),
+                "priority": float(row["priority"] or 0.0),
+                "status": str(row["status"] or ""),
+                "source_query": str(row["source_query"] or ""),
+                "source_url": str(row["source_url"] or ""),
+                "run_id": str(row["run_id"] or ""),
+                "js_required": bool(int(row["js_required"] or 0)),
+                "attempts": int(row["attempts"] or 0),
+                "last_claimed_by": str(row["last_claimed_by"] or ""),
+                "last_claimed_at": str(row["last_claimed_at"] or ""),
+                "last_error": str(row["last_error"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+        total_matches = int(match_row["row_count"] or 0) if match_row else 0
+        return {
+            "limit": max(int(limit), 1),
+            "statuses": normalized_statuses,
+            "total_matches": total_matches,
+            "per_shard_matches": {0: total_matches},
+            "items": items,
+        }
+
+    @staticmethod
+    def _frontier_top_domains(queue_items: list[dict[str, Any]], limit: int = 4) -> list[str]:
+        counts: dict[str, int] = {}
+        for item in queue_items:
+            domain = str(item.get("domain") or "").strip()
+            if not domain:
+                continue
+            counts[domain] = counts.get(domain, 0) + 1
+        ranked = sorted(
+            counts.items(),
+            key=lambda item: (int(item[1]), item[0]),
+            reverse=True,
+        )
+        return [domain for domain, _ in ranked[:limit]]
+
+    def _detached_frontier_schedule(
+        self,
+        objective: str,
+        query: str,
+        query_variants: list[str],
+        plan: dict[str, Any],
+        retrieval: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        metrics = self._detached_frontier_metrics_snapshot()
+        if not metrics:
+            return {}, [], ""
+
+        shard_metrics = [
+            dict(item)
+            for item in (metrics.get("shards") or [])
+            if isinstance(item, dict)
+        ]
+        shard_count = max(
+            1,
+            int(metrics.get("shard_count") or len(shard_metrics) or 1),
+        )
+        variants = self._frontier_unique_values(list(query_variants or []), limit=64)
+        source_seeds = self._frontier_unique_values(
+            [str(item) for item in (plan.get("source_seeds") or [])],
+            limit=64,
+        )
+        shard_summaries: list[dict[str, Any]] = []
+        for index in range(shard_count):
+            shard_metric = next(
+                (
+                    item
+                    for item in shard_metrics
+                    if int(item.get("shard_index") or 0) == index
+                ),
+                {"shard_index": index},
+            )
+            inspected = self._detached_frontier_queue_inspect(
+                limit=16,
+                statuses=["queued", "claimed", "processed"],
+                shard_index=index,
+            )
+            queue_items = [
+                dict(item)
+                for item in (inspected.get("items") or [])
+                if isinstance(item, dict)
+            ]
+            assigned_queries = [
+                item
+                for item in variants
+                if self._frontier_shard_index(item, shard_count) == index
+            ]
+            assigned_seed_urls = [
+                item
+                for item in source_seeds
+                if self._frontier_shard_index(item, shard_count) == index
+            ]
+            queued_urls = self._frontier_unique_values(
+                [
+                    str(item.get("url") or "")
+                    for item in queue_items
+                    if str(item.get("status") or "") in {"queued", "claimed"}
+                ],
+                limit=6,
+            )
+            processed_urls = self._frontier_unique_values(
+                [
+                    str(item.get("url") or "")
+                    for item in queue_items
+                    if str(item.get("status") or "") == "processed"
+                ],
+                limit=6,
+            )
+            pending_queries = self._frontier_unique_values(
+                [
+                    str(item.get("source_query") or "")
+                    for item in queue_items
+                    if str(item.get("status") or "") in {"queued", "claimed"}
+                ],
+                limit=6,
+            )
+            summary = {
+                "shard_index": index,
+                "queue_total": int(shard_metric.get("queue_total") or 0),
+                "domain_total": int(shard_metric.get("domain_total") or 0),
+                "status_counts": dict(shard_metric.get("status_counts") or {}),
+                "active_claims": int(shard_metric.get("active_claims") or 0),
+                "observation_total": int(shard_metric.get("observation_total") or 0),
+                "browser_observation_total": int(
+                    shard_metric.get("browser_observation_total") or 0
+                ),
+                "workers": [
+                    dict(item)
+                    for item in list(shard_metric.get("workers") or [])[:3]
+                    if isinstance(item, dict)
+                ],
+                "assigned_query_variants": assigned_queries,
+                "assigned_seed_urls": assigned_seed_urls,
+                "sample_urls": queued_urls,
+                "processed_urls": processed_urls,
+                "pending_queries": pending_queries,
+                "top_domains": self._frontier_top_domains(queue_items),
+                "backlog_status": self._frontier_backlog_status(
+                    int(shard_metric.get("queue_total") or 0),
+                    int(shard_metric.get("active_claims") or 0),
+                ),
+            }
+            shard_summaries.append(summary)
+
+        schedule = {
+            "mode": (
+                "detached-sharded-frontier" if shard_count > 1 else "detached-frontier"
+            ),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "backend": str(metrics.get("backend") or "sqlite"),
+            "objective": objective,
+            "query": query,
+            "stop_reason": str(retrieval.get("stop_reason") or ""),
+            "shard_count": shard_count,
+            "queue_total": int((metrics.get("queue") or {}).get("total") or 0),
+            "observation_total": int(
+                (metrics.get("observations") or {}).get("total") or 0
+            ),
+            "active_worker_count": int(
+                (metrics.get("worker_utilization") or {}).get("active_worker_count")
+                or 0
+            ),
+            "query_variant_count": len(variants),
+            "source_seed_count": len(source_seeds),
+            "shards": [
+                {
+                    "shard_index": int(item.get("shard_index") or 0),
+                    "backlog_status": str(item.get("backlog_status") or "low"),
+                    "queue_total": int(item.get("queue_total") or 0),
+                    "observation_total": int(item.get("observation_total") or 0),
+                    "assigned_query_variants": list(
+                        item.get("assigned_query_variants") or []
+                    ),
+                    "assigned_seed_urls": list(item.get("assigned_seed_urls") or []),
+                    "top_domains": list(item.get("top_domains") or []),
+                }
+                for item in shard_summaries
+            ],
+        }
+        markdown_lines = [
+            "# Detached Frontier Shard Summaries",
+            "",
+            f"Mode: {schedule['mode']}",
+            f"Backend: {schedule['backend']}",
+            f"Shards: {schedule['shard_count']}",
+            f"Queue total: {schedule['queue_total']}",
+            f"Observation total: {schedule['observation_total']}",
+            f"Active workers: {schedule['active_worker_count']}",
+            f"Stop reason: {schedule['stop_reason'] or 'unknown'}",
+            "",
+        ]
+        for item in shard_summaries:
+            markdown_lines.extend(
+                [
+                    f"## Shard {int(item.get('shard_index') or 0)}",
+                    "",
+                    (
+                        "Queue: "
+                        f"total={int(item.get('queue_total') or 0)}, "
+                        f"active_claims={int(item.get('active_claims') or 0)}, "
+                        f"observations={int(item.get('observation_total') or 0)}, "
+                        f"backlog={str(item.get('backlog_status') or 'low')}"
+                    ),
+                    (
+                        "Assigned query variants: "
+                        + (
+                            "; ".join(item.get("assigned_query_variants") or [])
+                            or "none"
+                        )
+                    ),
+                    (
+                        "Pending queries: "
+                        + ("; ".join(item.get("pending_queries") or []) or "none")
+                    ),
+                    (
+                        "Sample queued URLs: "
+                        + ("; ".join(item.get("sample_urls") or []) or "none")
+                    ),
+                    (
+                        "Sample processed URLs: "
+                        + ("; ".join(item.get("processed_urls") or []) or "none")
+                    ),
+                    (
+                        "Top domains: "
+                        + (", ".join(item.get("top_domains") or []) or "none")
+                    ),
+                    "",
+                ]
+            )
+        return schedule, shard_summaries, "\n".join(markdown_lines).rstrip() + "\n"
+
+    def _checkpoint_research_artifact_dir(self, run_id: str) -> Any:
+        artifact_dir = self.workspace_root / "runs" / run_id / "research"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return artifact_dir
+
+    def _prepare_detached_merge_payloads(
+        self,
+        *,
+        run_id: str,
+        objective: str,
+        query: str,
+        settings: ResearchSettings,
+        query_variants: list[str],
+        plan: dict[str, Any],
+        pc_context_info: dict[str, Any],
+        retrieval: dict[str, Any],
+        run_id_for_durable_notes: str,
+        synthesis_mode: str,
+        sources: list[ResearchSource],
+        frontier_schedule_payload: dict[str, Any] | None = None,
+        frontier_shard_payload: list[dict[str, Any]] | None = None,
+        frontier_shard_markdown: str = "",
+        shard_synthesis_packets: list[dict[str, Any]] | None = None,
+        merge_coordinator: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        durable_notes = self._load_durable_notes(run_id_for_durable_notes)
+        if frontier_schedule_payload is None or frontier_shard_payload is None:
+            (
+                frontier_schedule_payload,
+                frontier_shard_payload,
+                frontier_shard_markdown,
+            ) = self._detached_frontier_schedule(
+                objective,
+                query,
+                list(retrieval.get("query_variants") or query_variants),
+                plan,
+                retrieval,
+            )
+        if shard_synthesis_packets is None:
+            shard_synthesis_packets = self._build_shard_synthesis_packets(
+                objective,
+                query,
+                sources,
+                settings.depth,
+                plan,
+                durable_notes,
+                synthesis_mode,
+                shard_count=int(
+                    (frontier_schedule_payload or {}).get("shard_count")
+                    or len(frontier_shard_payload or [])
+                    or 1
+                ),
+                frontier_shards=frontier_shard_payload,
+            )
+        merged_packet, computed_merge = self._merge_shard_synthesis_packets(
+            objective,
+            query,
+            settings.depth,
+            plan,
+            durable_notes,
+            synthesis_mode,
+            shard_synthesis_packets,
+        )
+        if merge_coordinator is None:
+            merge_coordinator = computed_merge
+        else:
+            merge_coordinator = {
+                **computed_merge,
+                **dict(merge_coordinator),
+                "shards": list(
+                    dict(merge_coordinator).get("shards")
+                    or computed_merge.get("shards")
+                    or []
+                ),
+            }
+        stop_reason = str(retrieval.get("stop_reason") or "")
+        if stop_reason:
+            merged_packet["retrieval_stop_reason"] = stop_reason
+        replay_manifest = {
+            "kind": "detached-merge-replay-manifest",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "run_id": run_id,
+            "objective": objective,
+            "query": query,
+            "depth": settings.depth,
+            "max_sources": settings.max_sources,
+            "per_provider": settings.per_provider,
+            "max_query_variants": settings.max_query_variants,
+            "query_variants": list(query_variants or retrieval.get("query_variants") or []),
+            "plan": dict(plan),
+            "pc_context_info": dict(pc_context_info),
+            "retrieval": {
+                "coverage": dict(retrieval.get("coverage") or {}),
+                "passes": [
+                    dict(item)
+                    for item in (retrieval.get("passes") or [])
+                    if isinstance(item, dict)
+                ],
+                "stop_reason": stop_reason,
+                "query_variants": list(retrieval.get("query_variants") or query_variants),
+            },
+            "synthesis_mode": synthesis_mode,
+            "detached_frontier": dict(frontier_schedule_payload or {}),
+            "frontier_shards": [
+                dict(item)
+                for item in (frontier_shard_payload or [])
+                if isinstance(item, dict)
+            ],
+            "detached_merge": dict(merge_coordinator or {}),
+        }
+        return {
+            "frontier_schedule_payload": frontier_schedule_payload or {},
+            "frontier_shard_payload": frontier_shard_payload or [],
+            "frontier_shard_markdown": frontier_shard_markdown,
+            "shard_synthesis_packets": shard_synthesis_packets or [],
+            "merge_coordinator": merge_coordinator or {},
+            "replay_manifest": replay_manifest,
+            "merged_packet": merged_packet,
+        }
+
+    def _write_periodic_synthesis_checkpoint(
+        self,
+        *,
+        run_id: str,
+        objective: str,
+        query: str,
+        settings: ResearchSettings,
+        query_variants: list[str],
+        plan: dict[str, Any],
+        pc_context_info: dict[str, Any],
+        retrieval: dict[str, Any],
+        synthesis_mode: str,
+        sources: list[ResearchSource],
+    ) -> dict[str, Any]:
+        if not run_id:
+            return {}
+        artifact_dir = self._checkpoint_research_artifact_dir(run_id)
+        payloads = self._prepare_detached_merge_payloads(
+            run_id=run_id,
+            objective=objective,
+            query=query,
+            settings=settings,
+            query_variants=query_variants,
+            plan=plan,
+            pc_context_info=pc_context_info,
+            retrieval=retrieval,
+            run_id_for_durable_notes=run_id,
+            synthesis_mode=synthesis_mode,
+            sources=sources,
+        )
+        frontier_schedule_path = artifact_dir / "frontier_schedule.json"
+        frontier_shards_path = artifact_dir / "frontier_shards.json"
+        frontier_shards_markdown_path = artifact_dir / "frontier_shards.md"
+        synthesis_shards_path = artifact_dir / "synthesis_shards.json"
+        synthesis_merge_path = artifact_dir / "synthesis_merge_coordinator.json"
+        replay_manifest_path = artifact_dir / "synthesis_replay_manifest.json"
+        try:
+            frontier_schedule_path.write_text(
+                json.dumps(payloads["frontier_schedule_payload"], indent=2),
+                encoding="utf-8",
+            )
+            frontier_shards_path.write_text(
+                json.dumps(payloads["frontier_shard_payload"], indent=2),
+                encoding="utf-8",
+            )
+            frontier_shards_markdown_path.write_text(
+                str(payloads["frontier_shard_markdown"] or ""),
+                encoding="utf-8",
+            )
+            synthesis_shards_path.write_text(
+                json.dumps(payloads["shard_synthesis_packets"], indent=2),
+                encoding="utf-8",
+            )
+            synthesis_merge_path.write_text(
+                json.dumps(payloads["merge_coordinator"], indent=2),
+                encoding="utf-8",
+            )
+            replay_manifest_path.write_text(
+                json.dumps(payloads["replay_manifest"], indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            return {}
+        return {
+            "detached_frontier": {
+                "mode": payloads["frontier_schedule_payload"].get("mode"),
+                "backend": payloads["frontier_schedule_payload"].get("backend"),
+                "shard_count": payloads["frontier_schedule_payload"].get("shard_count"),
+                "schedule_path": str(
+                    frontier_schedule_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+            },
+            "detached_merge": {
+                "mode": payloads["merge_coordinator"].get("mode"),
+                "shard_count": payloads["merge_coordinator"].get("shard_count"),
+                "merge_ready_packet_count": payloads["merge_coordinator"].get(
+                    "merge_ready_packet_count"
+                ),
+                "non_empty_shards": payloads["merge_coordinator"].get(
+                    "non_empty_shards"
+                ),
+                "shard_packet_path": str(
+                    synthesis_shards_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+                "coordinator_path": str(
+                    synthesis_merge_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+                "replay_manifest_path": str(
+                    replay_manifest_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+            },
+        }
+
+    def replay_detached_merge(self, run_id: str) -> ResearchBrief:
+        artifact_dir = self._checkpoint_research_artifact_dir(run_id)
+        replay_manifest_path = artifact_dir / "synthesis_replay_manifest.json"
+        synthesis_shards_path = artifact_dir / "synthesis_shards.json"
+        synthesis_merge_path = artifact_dir / "synthesis_merge_coordinator.json"
+        if not replay_manifest_path.exists():
+            raise FileNotFoundError(
+                f"Detached merge replay manifest not found for run '{run_id}'"
+            )
+        if not synthesis_shards_path.exists():
+            raise FileNotFoundError(
+                f"Shard synthesis packets not found for run '{run_id}'"
+            )
+        manifest = json.loads(replay_manifest_path.read_text(encoding="utf-8"))
+        shard_packets = json.loads(synthesis_shards_path.read_text(encoding="utf-8"))
+        persisted_merge: dict[str, Any] = {}
+        if synthesis_merge_path.exists():
+            persisted_merge = json.loads(synthesis_merge_path.read_text(encoding="utf-8"))
+        objective = str(manifest.get("objective") or run_id)
+        query = str(manifest.get("query") or objective)
+        depth = str(manifest.get("depth") or "standard")
+        settings = ResearchSettings(
+            depth=depth,
+            max_sources=max(
+                1,
+                int(manifest.get("max_sources") or len(shard_packets) or 1),
+            ),
+            per_provider=max(1, int(manifest.get("per_provider") or self.limit_per_provider)),
+            max_query_variants=max(
+                1,
+                int(manifest.get("max_query_variants") or len(manifest.get("query_variants") or []) or 1),
+            ),
+        )
+        plan = dict(manifest.get("plan") or {})
+        retrieval = dict(manifest.get("retrieval") or {})
+        query_variants = [
+            str(item)
+            for item in (manifest.get("query_variants") or retrieval.get("query_variants") or [])
+            if str(item).strip()
+        ]
+        frontier_schedule_payload = dict(manifest.get("detached_frontier") or {})
+        frontier_shard_payload = [
+            dict(item)
+            for item in (manifest.get("frontier_shards") or [])
+            if isinstance(item, dict)
+        ]
+        durable_notes = self._load_durable_notes(run_id)
+        synthesis_mode = str(
+            manifest.get("synthesis_mode")
+            or self._resolve_final_synthesis_mode(depth, durable_notes)
+        )
+        synthesis_packet, merge_coordinator = self._merge_shard_synthesis_packets(
+            objective,
+            query,
+            depth,
+            plan,
+            durable_notes,
+            synthesis_mode,
+            [dict(item) for item in shard_packets if isinstance(item, dict)],
+        )
+        if persisted_merge:
+            merge_coordinator = {
+                **merge_coordinator,
+                **persisted_merge,
+                "shards": list(
+                    persisted_merge.get("shards") or merge_coordinator.get("shards") or []
+                ),
+            }
+        synthesis_packet["merge_coordinator"] = merge_coordinator
+        stop_reason = str(retrieval.get("stop_reason") or persisted_merge.get("stop_reason") or "checkpoint-replay")
+        synthesis_packet["retrieval_stop_reason"] = stop_reason
+        summary_sources = self._synthesis_packet_sources(synthesis_packet)
+        summary = self._summarize(
+            objective,
+            summary_sources,
+            depth,
+            plan,
+            query,
+            durable_notes,
+            synthesis_mode,
+            coverage=dict(retrieval.get("coverage") or {}),
+            synthesis_packet=synthesis_packet,
+        )
+        replay_retrieval = {
+            "coverage": dict(retrieval.get("coverage") or {}),
+            "passes": [
+                dict(item)
+                for item in (retrieval.get("passes") or [])
+                if isinstance(item, dict)
+            ],
+            "stop_reason": stop_reason,
+            "query_variants": query_variants,
+            "replay_mode": "detached-merge-only",
+        }
+        artifacts = self._write_artifacts(
+            run_id,
+            objective,
+            query,
+            summary_sources,
+            summary,
+            settings,
+            query_variants,
+            plan,
+            dict(manifest.get("pc_context_info") or {}),
+            replay_retrieval,
+            run_id,
+            synthesis_mode,
+            synthesis_packet,
+            frontier_schedule_payload,
+            frontier_shard_payload,
+            "",
+            [dict(item) for item in shard_packets if isinstance(item, dict)],
+            merge_coordinator,
+        )
+        return ResearchBrief(
+            objective=objective,
+            query=query,
+            summary=summary,
+            sources=summary_sources,
+            artifacts=artifacts,
+            confidence=self._confidence(summary_sources),
+            metadata={
+                "replay_mode": "detached-merge-only",
+                "run_id": run_id,
+                "retrieval": replay_retrieval,
+            },
+        )
+
     def _write_artifacts(
         self,
         run_id: str,
@@ -127,6 +1002,11 @@ class ResearchArtifactsMixin:
         run_id_for_durable_notes: str,
         synthesis_mode: str,
         synthesis_packet: dict[str, Any],
+        frontier_schedule_payload: dict[str, Any] | None = None,
+        frontier_shard_payload: list[dict[str, Any]] | None = None,
+        frontier_shard_markdown: str = "",
+        shard_synthesis_packets: list[dict[str, Any]] | None = None,
+        merge_coordinator: dict[str, Any] | None = None,
     ) -> list[str]:
         artifact_dir = self.workspace_root / "runs" / run_id / "research"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +1014,9 @@ class ResearchArtifactsMixin:
         brief_path = artifact_dir / "brief.md"
         digest_path = artifact_dir / "digest.json"
         plan_path = artifact_dir / "research_plan.json"
+        frontier_schedule_path = artifact_dir / "frontier_schedule.json"
+        frontier_shards_path = artifact_dir / "frontier_shards.json"
+        frontier_shards_markdown_path = artifact_dir / "frontier_shards.md"
         claim_trace_path = artifact_dir / "claim_trace.json"
         findings_path = artifact_dir / "findings.json"
         diagnostics_path = artifact_dir / "provider_diagnostics.json"
@@ -143,6 +1026,9 @@ class ResearchArtifactsMixin:
         evidence_graph_path = artifact_dir / "evidence_graph.json"
         benchmark_adapters_path = artifact_dir / "benchmark_adapters.json"
         synthesis_packet_path = artifact_dir / "synthesis_packet.json"
+        synthesis_shards_path = artifact_dir / "synthesis_shards.json"
+        synthesis_merge_path = artifact_dir / "synthesis_merge_coordinator.json"
+        synthesis_replay_manifest_path = artifact_dir / "synthesis_replay_manifest.json"
         durable_notes_path = self._durable_report_path(run_id_for_durable_notes)
         findings = self._finding_ledger(query, sources, plan)
         claim_trace_payload = self._claim_trace(objective, summary, findings)
@@ -152,6 +1038,47 @@ class ResearchArtifactsMixin:
             "stop_reason": retrieval["stop_reason"],
             "query_variants": retrieval["query_variants"],
         }
+        detached_payloads = self._prepare_detached_merge_payloads(
+            run_id=run_id,
+            objective=objective,
+            query=query,
+            settings=settings,
+            query_variants=query_variants,
+            plan=plan,
+            pc_context_info=pc_context_info,
+            retrieval=retrieval,
+            run_id_for_durable_notes=run_id_for_durable_notes,
+            synthesis_mode=synthesis_mode,
+            sources=sources,
+            frontier_schedule_payload=frontier_schedule_payload,
+            frontier_shard_payload=frontier_shard_payload,
+            frontier_shard_markdown=frontier_shard_markdown,
+            shard_synthesis_packets=shard_synthesis_packets,
+            merge_coordinator=merge_coordinator,
+        )
+        frontier_schedule_payload = dict(
+            detached_payloads.get("frontier_schedule_payload") or {}
+        )
+        frontier_shard_payload = [
+            dict(item)
+            for item in (detached_payloads.get("frontier_shard_payload") or [])
+            if isinstance(item, dict)
+        ]
+        frontier_shard_markdown = str(
+            detached_payloads.get("frontier_shard_markdown") or ""
+        )
+        shard_synthesis_packets = [
+            dict(item)
+            for item in (detached_payloads.get("shard_synthesis_packets") or [])
+            if isinstance(item, dict)
+        ]
+        merge_coordinator = dict(detached_payloads.get("merge_coordinator") or {})
+        replay_manifest = dict(detached_payloads.get("replay_manifest") or {})
+        if frontier_schedule_payload:
+            retrieval_payload["detached_frontier"] = frontier_schedule_payload
+            retrieval_payload["frontier_shards"] = frontier_shard_payload
+        if merge_coordinator:
+            retrieval_payload["detached_merge"] = merge_coordinator
         benchmark_adapters = self._benchmark_adapters(sources)
         evidence_graph_payload = self._evidence_graph(
             objective,
@@ -177,6 +1104,58 @@ class ResearchArtifactsMixin:
                 "compressed digest artifacts",
             ]
         )
+        plan_payload = {
+            "depth": settings.depth,
+            "objective": objective,
+            "query": query,
+            "query_variants": query_variants,
+            "source_seeds": plan.get("source_seeds") or [],
+            "max_sources": settings.max_sources,
+            "per_provider": settings.per_provider,
+            "core_question": plan["core_question"],
+            "subquestions": plan["subquestions"],
+            "comparative_axes": plan["comparative_axes"],
+            "evidence_requirements": plan["evidence_requirements"],
+            "perspectives": plan.get("perspectives") or [],
+            "pc_context": pc_context_info,
+            "coverage": retrieval["coverage"],
+            "stop_reason": retrieval["stop_reason"],
+            "final_synthesis_mode": synthesis_mode,
+            "token_strategy": ", ".join(token_strategy_parts),
+        }
+        if frontier_schedule_payload:
+            plan_payload["detached_frontier"] = {
+                "mode": frontier_schedule_payload.get("mode"),
+                "backend": frontier_schedule_payload.get("backend"),
+                "shard_count": frontier_schedule_payload.get("shard_count"),
+                "schedule_path": str(
+                    frontier_schedule_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+                "shard_summary_path": str(
+                    frontier_shards_markdown_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+            }
+        if merge_coordinator:
+            plan_payload["detached_merge"] = {
+                "mode": merge_coordinator.get("mode"),
+                "shard_count": merge_coordinator.get("shard_count"),
+                "non_empty_shards": merge_coordinator.get("non_empty_shards"),
+                "shard_packet_path": str(
+                    synthesis_shards_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+                "coordinator_path": str(
+                    synthesis_merge_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+                "replay_manifest_path": str(
+                    synthesis_replay_manifest_path.relative_to(self.workspace_root)
+                ).replace("\\", "/"),
+            }
+        analysis_retrieval = dict(retrieval)
+        if frontier_schedule_payload:
+            analysis_retrieval["detached_frontier"] = frontier_schedule_payload
+            analysis_retrieval["frontier_shards"] = frontier_shard_payload
+        if merge_coordinator:
+            analysis_retrieval["detached_merge"] = merge_coordinator
 
         sources_path.write_text(
             json.dumps([asdict(source) for source in sources], indent=2),
@@ -224,30 +1203,22 @@ class ResearchArtifactsMixin:
             encoding="utf-8",
         )
         plan_path.write_text(
-            json.dumps(
-                {
-                    "depth": settings.depth,
-                    "objective": objective,
-                    "query": query,
-                    "query_variants": query_variants,
-                    "source_seeds": plan.get("source_seeds") or [],
-                    "max_sources": settings.max_sources,
-                    "per_provider": settings.per_provider,
-                    "core_question": plan["core_question"],
-                    "subquestions": plan["subquestions"],
-                    "comparative_axes": plan["comparative_axes"],
-                    "evidence_requirements": plan["evidence_requirements"],
-                    "perspectives": plan.get("perspectives") or [],
-                    "pc_context": pc_context_info,
-                    "coverage": retrieval["coverage"],
-                    "stop_reason": retrieval["stop_reason"],
-                    "final_synthesis_mode": synthesis_mode,
-                    "token_strategy": ", ".join(token_strategy_parts),
-                },
-                indent=2,
-            ),
+            json.dumps(plan_payload, indent=2),
             encoding="utf-8",
         )
+        if frontier_schedule_payload:
+            frontier_schedule_path.write_text(
+                json.dumps(frontier_schedule_payload, indent=2),
+                encoding="utf-8",
+            )
+            frontier_shards_path.write_text(
+                json.dumps(frontier_shard_payload, indent=2),
+                encoding="utf-8",
+            )
+            frontier_shards_markdown_path.write_text(
+                frontier_shard_markdown,
+                encoding="utf-8",
+            )
         analysis_report_path.write_text(
             self._analysis_report_markdown(
                 objective,
@@ -255,6 +1226,7 @@ class ResearchArtifactsMixin:
                 sources,
                 plan,
                 pc_context_info,
+                analysis_retrieval,
             ),
             encoding="utf-8",
         )
@@ -293,6 +1265,21 @@ class ResearchArtifactsMixin:
             json.dumps(synthesis_packet, indent=2),
             encoding="utf-8",
         )
+        if shard_synthesis_packets:
+            synthesis_shards_path.write_text(
+                json.dumps(shard_synthesis_packets, indent=2),
+                encoding="utf-8",
+            )
+        if merge_coordinator:
+            synthesis_merge_path.write_text(
+                json.dumps(merge_coordinator, indent=2),
+                encoding="utf-8",
+            )
+        if replay_manifest:
+            synthesis_replay_manifest_path.write_text(
+                json.dumps(replay_manifest, indent=2),
+                encoding="utf-8",
+            )
         diagnostics_path.write_text(
             json.dumps(self.provider_diagnostics, indent=2),
             encoding="utf-8",
@@ -309,6 +1296,15 @@ class ResearchArtifactsMixin:
             str(brief_path.relative_to(self.workspace_root)),
             str(digest_path.relative_to(self.workspace_root)),
             str(plan_path.relative_to(self.workspace_root)),
+            *(
+                [
+                    str(frontier_schedule_path.relative_to(self.workspace_root)),
+                    str(frontier_shards_path.relative_to(self.workspace_root)),
+                    str(frontier_shards_markdown_path.relative_to(self.workspace_root)),
+                ]
+                if frontier_schedule_payload
+                else []
+            ),
             str(analysis_report_path.relative_to(self.workspace_root)),
             str(paper_report_path.relative_to(self.workspace_root)),
             str(retrieval_metrics_path.relative_to(self.workspace_root)),
@@ -317,6 +1313,21 @@ class ResearchArtifactsMixin:
             str(evidence_graph_path.relative_to(self.workspace_root)),
             str(benchmark_adapters_path.relative_to(self.workspace_root)),
             str(synthesis_packet_path.relative_to(self.workspace_root)),
+            *(
+                [str(synthesis_shards_path.relative_to(self.workspace_root))]
+                if shard_synthesis_packets
+                else []
+            ),
+            *(
+                [str(synthesis_merge_path.relative_to(self.workspace_root))]
+                if merge_coordinator
+                else []
+            ),
+            *(
+                [str(synthesis_replay_manifest_path.relative_to(self.workspace_root))]
+                if replay_manifest
+                else []
+            ),
             str(diagnostics_path.relative_to(self.workspace_root)),
         ]
         artifacts.extend(

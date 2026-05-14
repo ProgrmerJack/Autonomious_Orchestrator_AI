@@ -16,6 +16,78 @@ class WorkflowContext:
     mode: str
     app_target: str | None
     artifact_path: str | None
+    research_artifact_path: str | None = None
+
+
+def workflow_prefers_research_tool(lower: str, mode: str) -> bool:
+    compact = re.sub(r"\s+", " ", lower).strip()
+    if not compact:
+        return False
+    if "http://" in compact or "https://" in compact:
+        return False
+    if any(
+        cue in compact
+        for cue in (
+            "checkout",
+            "purchase",
+            "buy ",
+            "book ",
+            "log in",
+            "login",
+            "sign in",
+            "submit form",
+            "fill out",
+        )
+    ):
+        return False
+    if any(
+        cue in compact
+        for cue in (
+            "research",
+            "analyze",
+            "analyse",
+            "compare",
+            "investigate",
+            "benchmark",
+            "summarize",
+            "summarise",
+            "stock",
+            "ticker",
+            "market",
+            "news",
+            "trend",
+            "competitive",
+            "capability",
+        )
+    ):
+        return True
+    if mode in {"report", "presentation"} and re.search(
+        r"\b(?:about|on|regarding)\b",
+        compact,
+    ):
+        return True
+    search_like = any(
+        cue in compact for cue in ("search for", "look up", "find ")
+    )
+    if not search_like:
+        return False
+    return any(
+        cue in compact
+        for cue in (
+            "benchmark",
+            "stock",
+            "ticker",
+            "market",
+            "news",
+            "agent",
+            "workflow",
+            "trend",
+            "compare",
+            "analyze",
+            "analyse",
+            "investigate",
+        )
+    )
 
 
 class GenericAppWorkflowAdapter:
@@ -269,6 +341,147 @@ class BrowserWorkflowAdapter:
                 return match.group("query").strip()
         fallback = re.sub(r"\s+", " ", lower).strip(" .")
         return fallback[:140]
+
+
+class ResearchWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        artifact_path = (context.research_artifact_path or "").replace("\\", "/")
+        if not artifact_path.endswith("research_brief.md"):
+            return []
+        if not workflow_prefers_research_tool(context.lower, context.mode):
+            return []
+        query = BrowserWorkflowAdapter._search_query(context.lower)
+        request = {
+            "kind": "workflow_research_brief",
+            "objective": context.objective,
+            "query": query,
+            "output_path": artifact_path,
+            "max_sources": 12 if context.mode == "report" else 8,
+            "per_provider_limit": 4,
+        }
+        return [
+            DesktopWorkflowStep(
+                action_type="tool",
+                selector="tool_executor:workflow_research",
+                description=(
+                    "Gather a bounded provider-backed research brief before "
+                    "any browser-first UI handoff."
+                ),
+                metadata={
+                    "tool_request": request,
+                    "control_channel": "code",
+                    "expected_observation": (
+                        "A provider-backed research brief is generated in the "
+                        "workspace before any UI handoff."
+                    ),
+                    "verification_contract": {
+                        "kind": "receipt_success",
+                        "expected": (
+                            "The workflow research lane writes a research "
+                            "brief with provider-backed sources."
+                        ),
+                        "target": "tool_executor:workflow_research",
+                        "required": True,
+                    },
+                    "research_lane": {
+                        "query": query,
+                        "output_path": artifact_path,
+                    },
+                },
+            )
+        ]
+
+
+class ApiIntentWorkflowAdapter:
+    URL_RE = re.compile(r"https?://[^\s)>,]+", re.I)
+    LOOPBACK_RE = re.compile(
+        r"\b(?P<host>localhost|127\.0\.0\.1)(?::(?P<port>\d{1,5}))?(?P<path>/[^\s)>,]*)?",
+        re.I,
+    )
+
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        endpoint = self._endpoint(context.objective)
+        if endpoint is None or not self._looks_like_api_task(context.lower, endpoint):
+            return []
+        method = self._method(context.lower)
+        metadata: dict[str, object] = {
+            "control_channel": "api",
+            "method": method,
+            "expected_observation": (
+                "The direct API action returns a structured response."
+            ),
+        }
+        if method == "GET":
+            metadata["methods"] = ["OPTIONS", "GET"]
+        return [
+            DesktopWorkflowStep(
+                action_type="api_call",
+                selector=endpoint,
+                description=(
+                    "Use the API lane directly instead of routing the task "
+                    "through a browser-only handoff."
+                ),
+                metadata=metadata,
+            )
+        ]
+
+    @classmethod
+    def _endpoint(cls, objective: str) -> str | None:
+        explicit = cls.URL_RE.search(objective)
+        if explicit is not None:
+            return explicit.group(0).rstrip(".,)")
+        local = cls.LOOPBACK_RE.search(objective)
+        if local is None:
+            return None
+        host = str(local.group("host") or "localhost")
+        port = str(local.group("port") or "")
+        path = str(local.group("path") or "")
+        authority = f"{host}:{port}" if port else host
+        return f"http://{authority}{path}"
+
+    @staticmethod
+    def _looks_like_api_task(lower: str, endpoint: str) -> bool:
+        endpoint_lower = endpoint.lower()
+        if any(
+            token in endpoint_lower
+            for token in (
+                "localhost",
+                "127.0.0.1",
+                "/api",
+                "graphql",
+                "openapi",
+                "swagger",
+                "webhook",
+                ".json",
+            )
+        ):
+            return True
+        return any(
+            cue in lower
+            for cue in (
+                " api",
+                "api ",
+                "endpoint",
+                "graphql",
+                "openapi",
+                "swagger",
+                "webhook",
+                "probe",
+                "health",
+            )
+        )
+
+    @staticmethod
+    def _method(lower: str) -> str:
+        if any(token in lower for token in (" delete ", " remove ")):
+            return "DELETE"
+        if any(token in lower for token in (" patch ", " update ")):
+            return "PATCH"
+        if " put " in lower:
+            return "PUT"
+        if any(token in lower for token in (" post ", " create ", " submit ", " send ")):
+            return "POST"
+        return "GET"
 
 
 class OfficeWorkflowAdapter:

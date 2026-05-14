@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
 from .models import ResearchSettings
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
 
 
 def settings_for_depth(depth: str) -> ResearchSettings:
@@ -17,9 +28,18 @@ def settings_for_depth(depth: str) -> ResearchSettings:
     if depth == "multi-hour":
         return ResearchSettings(
             depth="multi-hour",
-            max_sources=1800,
-            per_provider=140,
-            max_query_variants=120,
+            max_sources=_env_int(
+                "AGENTOS_RESEARCH_MULTI_HOUR_MAX_SOURCES",
+                1800,
+            ),
+            per_provider=_env_int(
+                "AGENTOS_RESEARCH_MULTI_HOUR_PER_PROVIDER",
+                140,
+            ),
+            max_query_variants=_env_int(
+                "AGENTOS_RESEARCH_MULTI_HOUR_MAX_QUERY_VARIANTS",
+                120,
+            ),
         )
     return ResearchSettings(
         depth="standard",
@@ -31,11 +51,41 @@ def settings_for_depth(depth: str) -> ResearchSettings:
 
 def settings_for_current_web(settings: ResearchSettings) -> ResearchSettings:
     if settings.depth == "multi-hour":
+        source_floor = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_SOURCE_FLOOR",
+            1200,
+        )
+        source_cap = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_SOURCE_CAP",
+            1600,
+        )
+        provider_floor = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_PER_PROVIDER_FLOOR",
+            48,
+        )
+        provider_cap = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_PER_PROVIDER_CAP",
+            72,
+        )
+        query_floor = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_QUERY_VARIANT_FLOOR",
+            48,
+        )
+        query_cap = _env_int(
+            "AGENTOS_RESEARCH_MULTI_HOUR_CURRENT_WEB_QUERY_VARIANT_CAP",
+            72,
+        )
         return ResearchSettings(
             depth=settings.depth,
-            max_sources=min(max(settings.max_sources, 1200), 1600),
-            per_provider=min(max(settings.per_provider, 48), 72),
-            max_query_variants=min(max(settings.max_query_variants, 48), 72),
+            max_sources=min(max(settings.max_sources, source_floor), source_cap),
+            per_provider=min(
+                max(settings.per_provider, provider_floor),
+                provider_cap,
+            ),
+            max_query_variants=min(
+                max(settings.max_query_variants, query_floor),
+                query_cap,
+            ),
         )
     if settings.depth == "standard":
         return ResearchSettings(
@@ -122,10 +172,16 @@ def provider_parallel_worker_count(
 def current_web_targets(depth: str) -> dict[str, int | float]:
     if depth == "multi-hour":
         return {
-            "max_retrieval_passes": 48,
+            "max_retrieval_passes": _env_int(
+                "AGENTOS_RESEARCH_MULTI_HOUR_MAX_RETRIEVAL_PASSES",
+                48,
+            ),
             "depth_pass_floor": 8,
             "max_low_novelty_streak": 6,
-            "min_unique_urls": 400,
+            "min_unique_urls": _env_int(
+                "AGENTOS_RESEARCH_MULTI_HOUR_MIN_UNIQUE_URLS",
+                400,
+            ),
             "min_perspective_count": 6,
             "min_perspective_ratio": 0.75,
         }

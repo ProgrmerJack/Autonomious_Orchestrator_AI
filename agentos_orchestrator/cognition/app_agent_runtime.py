@@ -32,6 +32,7 @@ class AppAgentSkillPack:
     visual_heavy: bool = False
     launch_target: str = ""
     primary_selector: str = ""
+    action_policy: dict[str, Any] = field(default_factory=dict)
     policy_action: dict[str, Any] = field(default_factory=dict)
 
     def asdict(self) -> dict[str, Any]:
@@ -54,6 +55,7 @@ class AppAgentSkillPack:
             "visual_heavy": self.visual_heavy,
             "launch_target": self.launch_target,
             "primary_selector": self.primary_selector,
+            "action_policy": dict(self.action_policy),
             "policy_action": dict(self.policy_action),
         }
 
@@ -82,6 +84,7 @@ class AppAgentSession:
             "launch_target": self.skill_pack.launch_target,
             "primary_selector": self.skill_pack.primary_selector,
             "adapter_context": dict(self.adapter_context),
+            "action_policy": dict(self.skill_pack.action_policy),
             "policy_action": dict(self.skill_pack.policy_action),
             "nodes_seen": self.nodes_seen,
             "handoff_notes": list(self.handoff_notes),
@@ -160,6 +163,7 @@ class AppAgentRuntime:
             visual_heavy=spec.visual_heavy,
             launch_target=spec.launch_target,
             primary_selector=spec.primary_selector,
+            action_policy=_action_policy_dict(spec.action_policy),
             policy_action=_policy_action_dict(policy_action),
         )
         return AppAgentSession(
@@ -217,6 +221,9 @@ class AppAgentRuntime:
             or verification_result.get("reason")
             or ""
         )
+        action_for_memory = _action_from_metadata(
+            action.metadata.get("policy_anchor_action"),
+        ) or action
         evidence = {
             "verification": dict(verification_result),
             "receipt": receipt,
@@ -225,7 +232,7 @@ class AppAgentRuntime:
         self.policy_memory.record(
             app_signature,
             objective,
-            action,
+            action_for_memory,
             success,
             control_channel=control_channel,
             observed=observed,
@@ -253,3 +260,35 @@ def _policy_action_dict(action: UiAction | None) -> dict[str, Any]:
         "value": action.value,
         "metadata": dict(action.metadata or {}),
     }
+
+
+def _action_policy_dict(policy: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {}
+    payload: dict[str, Any] = {}
+    for key, value in policy.items():
+        if isinstance(value, tuple):
+            payload[key] = list(value)
+        elif isinstance(value, list):
+            payload[key] = [str(item) for item in value]
+        elif isinstance(value, dict):
+            payload[key] = dict(value)
+        else:
+            payload[key] = value
+    return payload
+
+
+def _action_from_metadata(raw: Any) -> UiAction | None:
+    if not isinstance(raw, dict):
+        return None
+    action_type = str(raw.get("action_type") or "").strip()
+    selector = str(raw.get("selector") or "").strip()
+    if not action_type or not selector:
+        return None
+    value = raw.get("value")
+    return UiAction(
+        action_type=action_type,
+        selector=selector,
+        value=str(value) if value is not None else None,
+        metadata=dict(raw.get("metadata") or {}),
+    )

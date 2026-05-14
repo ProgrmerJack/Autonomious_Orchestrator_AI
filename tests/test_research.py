@@ -825,6 +825,179 @@ class ResearchTests(unittest.TestCase):
             self.assertIn(root_url, seeds)
             self.assertIn(child_url, seeds)
 
+    def test_detached_frontier_schedule_builds_shard_assignments_and_summaries(
+        self,
+    ) -> None:
+        engine = FakeDeepResearchEngine(
+            crawl_broker_url="http://broker.local",
+            crawl_broker_token="secret-token",
+        )
+        metrics = {
+            "backend": "sqlite-sharded",
+            "shard_count": 2,
+            "queue": {"total": 7},
+            "observations": {"total": 3},
+            "worker_utilization": {"active_worker_count": 2},
+            "shards": [
+                {
+                    "shard_index": 0,
+                    "queue_total": 4,
+                    "domain_total": 2,
+                    "status_counts": {"queued": 2, "processed": 2},
+                    "active_claims": 1,
+                    "observation_total": 2,
+                    "browser_observation_total": 1,
+                    "workers": [{"worker_id": "worker-a"}],
+                },
+                {
+                    "shard_index": 1,
+                    "queue_total": 3,
+                    "domain_total": 1,
+                    "status_counts": {"queued": 1, "claimed": 1, "processed": 1},
+                    "active_claims": 1,
+                    "observation_total": 1,
+                    "browser_observation_total": 0,
+                    "workers": [{"worker_id": "worker-b"}],
+                },
+            ],
+        }
+        inspected = {
+            0: {
+                "items": [
+                    {
+                        "url": "https://docs.example.org/a",
+                        "domain": "docs.example.org",
+                        "status": "queued",
+                        "source_query": "agentos shard alpha",
+                    },
+                    {
+                        "url": "https://docs.example.org/processed-a",
+                        "domain": "docs.example.org",
+                        "status": "processed",
+                        "source_query": "agentos processed alpha",
+                    },
+                ]
+            },
+            1: {
+                "items": [
+                    {
+                        "url": "https://research.example.net/b",
+                        "domain": "research.example.net",
+                        "status": "claimed",
+                        "source_query": "agentos shard beta",
+                    },
+                    {
+                        "url": "https://research.example.net/processed-b",
+                        "domain": "research.example.net",
+                        "status": "processed",
+                        "source_query": "agentos processed beta",
+                    },
+                ]
+            },
+        }
+
+        def inspect(*, shard_index: int | None = None, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            return inspected[int(shard_index or 0)]
+
+        variants = [
+            "agentos shard alpha",
+            "agentos shard beta",
+            "agentos shard gamma",
+        ]
+        seeds = [
+            "https://docs.example.org/a",
+            "https://research.example.net/b",
+        ]
+        with (
+            patch.object(engine, "crawl_broker_metrics", return_value=metrics),
+            patch.object(engine, "crawl_broker_queue_inspect", side_effect=inspect),
+        ):
+            schedule, shards, markdown = engine._detached_frontier_schedule(
+                "agentos detached frontier scaling",
+                "agentos detached frontier scaling",
+                variants,
+                {"source_seeds": seeds},
+                {"stop_reason": "max_passes_reached"},
+            )
+
+        self.assertEqual(schedule["mode"], "detached-sharded-frontier")
+        self.assertEqual(schedule["shard_count"], 2)
+        assigned_variants = [
+            item
+            for shard in schedule["shards"]
+            for item in shard["assigned_query_variants"]
+        ]
+        self.assertEqual(sorted(assigned_variants), sorted(variants))
+        self.assertEqual(len(shards), 2)
+        self.assertIn("Shard 0", markdown)
+        self.assertIn("Shard 1", markdown)
+        self.assertTrue(
+            any(
+                "docs.example.org" in domain or "research.example.net" in domain
+                for shard in shards
+                for domain in shard["top_domains"]
+            )
+        )
+
+    def test_research_run_writes_detached_frontier_schedule_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            objective = "accessibility tree desktop agents"
+            queued_url = "https://docs.example.org/queued"
+            processed_url = "https://docs.example.org/processed"
+
+            engine._ensure_research_state_store()
+            engine._enqueue_url_batch(
+                [queued_url, processed_url],
+                objective,
+                "run_frontier_schedule",
+                source_url="https://seed.example.org/objective",
+                priority=9.0,
+            )
+            engine._record_crawl_observation(
+                ResearchSource(
+                    provider="test",
+                    title="Accessibility Tree Agents",
+                    url=processed_url,
+                    authors=["docs.example.org"],
+                    abstract="Processed shard evidence for accessibility tree agents.",
+                    score=4.0,
+                ),
+                "Processed shard evidence for accessibility tree agents.",
+                objective,
+                ["accessibility tree agent benchmarks"],
+                [],
+                "worker-1",
+                False,
+            )
+
+            brief = engine.run(
+                "[standard] accessibility tree desktop agents",
+                "run_frontier_schedule",
+            )
+
+            artifact_dir = Path(temp_dir) / "runs/run_frontier_schedule/research"
+            schedule_path = artifact_dir / "frontier_schedule.json"
+            shard_path = artifact_dir / "frontier_shards.json"
+            shard_markdown_path = artifact_dir / "frontier_shards.md"
+            report_path = artifact_dir / "analysis_report.md"
+
+            self.assertTrue(schedule_path.exists())
+            self.assertTrue(shard_path.exists())
+            self.assertTrue(shard_markdown_path.exists())
+            self.assertIn("frontier_schedule.json", " ".join(brief.artifacts))
+            self.assertIn("frontier_shards.md", " ".join(brief.artifacts))
+
+            schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+            shards = json.loads(shard_path.read_text(encoding="utf-8"))
+            report = report_path.read_text(encoding="utf-8")
+
+            self.assertGreaterEqual(schedule["shard_count"], 1)
+            self.assertTrue(shards)
+            self.assertIn("## Detached Frontier Schedule", report)
+            self.assertIn("Shard 0", report)
+
     def test_crawl_broker_shares_queue_and_evidence_across_remote_workers(
         self,
     ) -> None:
@@ -1658,6 +1831,128 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("Evidence found (96 sources)", engine.last_user)
         self.assertIn("Source 95", engine.last_user)
         self.assertNotIn("Source 120", engine.last_user)
+
+    def test_merge_shard_synthesis_packets_reconciles_merge_ready_evidence(
+        self,
+    ) -> None:
+        engine = FakeDeepResearchEngine()
+        shard_packets = [
+            {
+                "packet_kind": "shard-synthesis-packet",
+                "merge_ready": True,
+                "shard_index": 0,
+                "total_ranked_sources": 2,
+                "source_count_in_shard": 2,
+                "synthesis_source_count": 1,
+                "durable_notes_available": True,
+                "provider_counts": {"web-search": 2},
+                "perspective_coverage": {
+                    "count": 1,
+                    "total": 2,
+                    "covered": ["architecture"],
+                    "missing": ["evaluation"],
+                },
+                "findings": [
+                    {
+                        "perspective": "architecture",
+                        "finding": "Planner-routing gap persists across browser tasks.",
+                        "confidence": "medium",
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                    }
+                ],
+                "market_signals": [],
+                "top_sources": [
+                    {
+                        "provider": "web-search",
+                        "title": "Lower Score Source",
+                        "url": "https://example.org/lower-score",
+                        "year": 2024,
+                        "evidence_grade": "moderate",
+                        "score": 5.0,
+                        "abstract": "Lower score source abstract.",
+                    }
+                ],
+                "frontier_summary": {
+                    "backlog_status": "medium",
+                    "queue_total": 18,
+                },
+            },
+            {
+                "packet_kind": "shard-synthesis-packet",
+                "merge_ready": True,
+                "shard_index": 1,
+                "total_ranked_sources": 2,
+                "source_count_in_shard": 2,
+                "synthesis_source_count": 1,
+                "durable_notes_available": False,
+                "provider_counts": {"web-search": 1, "openalex": 1},
+                "perspective_coverage": {
+                    "count": 1,
+                    "total": 2,
+                    "covered": ["evaluation"],
+                    "missing": ["architecture"],
+                },
+                "findings": [
+                    {
+                        "perspective": "architecture",
+                        "finding": "Planner-routing gap persists across browser tasks.",
+                        "confidence": "high",
+                        "support_count": 1,
+                        "contradiction_count": 0,
+                    },
+                    {
+                        "perspective": "evaluation",
+                        "finding": "Benchmark coverage is missing shard-level merge checks.",
+                        "confidence": "medium",
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                    },
+                ],
+                "market_signals": [],
+                "top_sources": [
+                    {
+                        "provider": "openalex",
+                        "title": "Higher Score Source",
+                        "url": "https://example.org/higher-score",
+                        "year": 2025,
+                        "evidence_grade": "strong",
+                        "score": 9.0,
+                        "abstract": "Higher score source abstract.",
+                    }
+                ],
+                "frontier_summary": {
+                    "backlog_status": "high",
+                    "queue_total": 42,
+                },
+            },
+        ]
+
+        merged_packet, coordinator = engine._merge_shard_synthesis_packets(
+            "packet objective",
+            "packet objective",
+            "standard",
+            {"subquestions": ["What merged evidence is stable?"]},
+            "",
+            "hybrid",
+            shard_packets,
+        )
+
+        self.assertEqual(coordinator["mode"], "detached-shard-merge")
+        self.assertEqual(coordinator["shard_count"], 2)
+        self.assertEqual(coordinator["merge_ready_packet_count"], 2)
+        self.assertEqual(merged_packet["provider_counts"]["web-search"], 3)
+        self.assertEqual(merged_packet["provider_counts"]["openalex"], 1)
+        self.assertEqual(merged_packet["perspective_coverage"]["count"], 2)
+        self.assertEqual(merged_packet["synthesis_source_count"], 2)
+        self.assertEqual(merged_packet["top_sources"][0]["title"], "Higher Score Source")
+        architecture_finding = next(
+            finding
+            for finding in merged_packet["findings"]
+            if finding["perspective"] == "architecture"
+        )
+        self.assertEqual(architecture_finding["support_count"], 3)
+        self.assertEqual(architecture_finding["confidence"], "high")
 
     def test_multi_hour_synthesis_defaults_to_hybrid_with_durable_notes(self) -> None:
         with patch.dict(
@@ -2584,10 +2879,126 @@ class ResearchTests(unittest.TestCase):
             self.assertTrue(packet_path.exists())
             packet = json.loads(packet_path.read_text(encoding="utf-8"))
             self.assertGreater(packet["synthesis_source_count"], 0)
+            self.assertEqual(
+                packet.get("merge_coordinator", {}).get("mode"),
+                "detached-shard-merge",
+            )
+            shard_packet_path = (
+                Path(temp_dir)
+                / "runs/run_synthesis_packet/research/synthesis_shards.json"
+            )
+            merge_path = (
+                Path(temp_dir)
+                / "runs/run_synthesis_packet/research/synthesis_merge_coordinator.json"
+            )
+            report_path = (
+                Path(temp_dir)
+                / "runs/run_synthesis_packet/research/analysis_report.md"
+            )
+            self.assertTrue(shard_packet_path.exists())
+            self.assertTrue(merge_path.exists())
+            shard_packets = json.loads(shard_packet_path.read_text(encoding="utf-8"))
+            merge_payload = json.loads(merge_path.read_text(encoding="utf-8"))
+            self.assertTrue(shard_packets)
+            self.assertEqual(merge_payload["mode"], "detached-shard-merge")
+            self.assertIn(
+                "## Detached Merge Coordinator",
+                report_path.read_text(encoding="utf-8"),
+            )
             self.assertTrue(
                 any(
                     artifact.replace("\\", "/")
                     == "runs/run_synthesis_packet/research/synthesis_packet.json"
+                    for artifact in brief.artifacts
+                )
+            )
+            self.assertTrue(
+                any(
+                    artifact.replace("\\", "/")
+                    == "runs/run_synthesis_packet/research/synthesis_shards.json"
+                    for artifact in brief.artifacts
+                )
+            )
+            self.assertTrue(
+                any(
+                    artifact.replace("\\", "/")
+                    == "runs/run_synthesis_packet/research/synthesis_merge_coordinator.json"
+                    for artifact in brief.artifacts
+                )
+            )
+
+    def test_progress_checkpoint_writes_detached_merge_replay_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            engine.run(
+                "[quick] accessibility tree desktop agents",
+                "run_checkpoint_merge",
+            )
+
+            progress_path = (
+                Path(temp_dir) / "runs/run_checkpoint_merge/research/progress.json"
+            )
+            replay_manifest_path = (
+                Path(temp_dir)
+                / "runs/run_checkpoint_merge/research/synthesis_replay_manifest.json"
+            )
+            shard_packet_path = (
+                Path(temp_dir)
+                / "runs/run_checkpoint_merge/research/synthesis_shards.json"
+            )
+            merge_path = (
+                Path(temp_dir)
+                / "runs/run_checkpoint_merge/research/synthesis_merge_coordinator.json"
+            )
+
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["stage"], "retrieval-active")
+            self.assertEqual(
+                payload["detached_merge"]["mode"],
+                "detached-shard-merge",
+            )
+            self.assertTrue(replay_manifest_path.exists())
+            self.assertTrue(shard_packet_path.exists())
+            self.assertTrue(merge_path.exists())
+            manifest = json.loads(replay_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["run_id"], "run_checkpoint_merge")
+            self.assertIn("coverage", manifest["retrieval"])
+
+    def test_replay_detached_merge_rebuilds_synthesis_without_rerunning_retrieval(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            engine.run(
+                "[quick] accessibility tree desktop agents",
+                "run_merge_replay",
+            )
+
+            artifact_dir = Path(temp_dir) / "runs/run_merge_replay/research"
+            for artifact_name in (
+                "synthesis_packet.json",
+                "brief.md",
+                "analysis_report.md",
+            ):
+                path = artifact_dir / artifact_name
+                if path.exists():
+                    path.unlink()
+
+            with patch.object(
+                engine,
+                "_search_query_across_providers",
+                side_effect=AssertionError("retrieval should not rerun during replay"),
+            ):
+                brief = engine.replay_detached_merge("run_merge_replay")
+
+            self.assertEqual(brief.metadata["replay_mode"], "detached-merge-only")
+            self.assertTrue((artifact_dir / "synthesis_packet.json").exists())
+            self.assertTrue((artifact_dir / "brief.md").exists())
+            self.assertTrue((artifact_dir / "analysis_report.md").exists())
+            self.assertTrue(
+                any(
+                    artifact.replace("\\", "/")
+                    == "runs/run_merge_replay/research/synthesis_replay_manifest.json"
                     for artifact in brief.artifacts
                 )
             )
@@ -2823,6 +3234,140 @@ class ResearchTests(unittest.TestCase):
             int(caps["headless_browser_workers"]),
         )
         self.assertGreaterEqual(engine._headless_browser_pool_size(24), 1)
+
+    def test_headless_browser_prefetch_plan_respects_transient_ram_budget(
+        self,
+    ) -> None:
+        engine = DeepResearchEngine()
+
+        with patch.object(
+            DeepResearchEngine,
+            "_local_browser_pressure_caps",
+            return_value={
+                "headless_browser_workers": 4,
+                "headless_prefetch_url_limit": 10,
+                "headless_prefetch_per_url_chars": 24_000,
+                "headless_prefetch_total_chars": 72_000,
+            },
+        ):
+            plan = engine._headless_browser_prefetch_plan(12, 80_000)
+
+        self.assertEqual(plan["max_chars"], 24_000)
+        self.assertEqual(plan["url_limit"], 3)
+        self.assertEqual(plan["total_chars"], 72_000)
+
+    def test_headless_browser_pool_fetch_caps_prefetch_urls_before_render(
+        self,
+    ) -> None:
+        engine = DeepResearchEngine()
+        captured: dict[str, Any] = {}
+
+        class FakePool:
+            def __init__(self, *args, **kwargs) -> None:
+                del args, kwargs
+
+            def render_many(
+                self,
+                urls: list[str],
+                max_chars: int,
+                timeout_ms: int,
+            ) -> dict[str, str]:
+                captured["urls"] = list(urls)
+                captured["max_chars"] = max_chars
+                captured["timeout_ms"] = timeout_ms
+                return {url: ("X" * max_chars) for url in urls}
+
+        urls = [f"https://example.com/page-{index}" for index in range(8)]
+        with patch.object(
+            DeepResearchEngine,
+            "_local_browser_pressure_caps",
+            return_value={
+                "headless_browser_workers": 4,
+                "headless_prefetch_url_limit": 6,
+                "headless_prefetch_per_url_chars": 20_000,
+                "headless_prefetch_total_chars": 60_000,
+            },
+        ), patch(
+            "agentos_orchestrator.research.retrieval._HeadlessBrowserWorkerPool",
+            FakePool,
+        ):
+            results = engine._headless_browser_pool_fetch(
+                urls,
+                max_chars=80_000,
+                timeout_ms=1_234,
+            )
+
+        self.assertEqual(len(captured["urls"]), 3)
+        self.assertEqual(captured["max_chars"], 20_000)
+        self.assertEqual(captured["timeout_ms"], 1_234)
+        self.assertEqual(set(results), set(captured["urls"]))
+
+    def test_async_provider_dispatch_honors_sync_json_test_double(self) -> None:
+        engine = FakeDeepResearchEngine()
+
+        with patch.object(
+            DeepResearchEngine,
+            "_provider_parallel_worker_count",
+            return_value=4,
+        ):
+            sources = engine._search_query_across_providers(
+                "accessibility tree desktop agents",
+                {"openalex", "semantic-scholar"},
+                4,
+            )
+
+        titles = {source.title for source in sources}
+        self.assertIn("Accessibility Tree Agents", titles)
+        self.assertIn("Desktop Agent Evaluation", titles)
+
+    def test_iterative_retrieval_falls_back_when_plan_queries_are_empty(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = FakeDeepResearchEngine(workspace_root=temp_dir)
+            query = "accessibility tree desktop agents"
+            retrieval = engine._iterative_retrieval(
+                query=query,
+                settings=DeepResearchEngine._settings_for_depth("standard"),
+                plan={
+                    "core_question": query,
+                    "query_plan": [],
+                    "perspectives": [],
+                },
+                targets={
+                    "max_retrieval_passes": 3,
+                    "depth_pass_floor": 1,
+                    "min_source_count": 1,
+                },
+                pc_context=None,
+                run_id="run_empty_plan_fallback",
+            )
+
+        self.assertNotEqual(retrieval["stop_reason"], "no_query_variants")
+        self.assertTrue(retrieval["query_variants"])
+
+    def test_software_agent_queries_accept_academic_papers(self) -> None:
+        query = "accessibility tree desktop agents"
+        source = ResearchSource(
+            provider="openalex",
+            title="Accessibility Tree Agents",
+            url="https://openalex.org/W1",
+            year=2025,
+            abstract="Accessibility agents control desktop interfaces.",
+            score=7.0,
+        )
+
+        DeepResearchEngine._assign_source_semantics(source, query)
+
+        self.assertEqual(source.evidence_kind, "academic-paper")
+        self.assertEqual(source.subject_kind, "academic-topic")
+        self.assertTrue(DeepResearchEngine._matches_intent_spec(source, query))
+
+    def test_software_agent_text_probe_accepts_academic_language(self) -> None:
+        query = "accessibility tree desktop agents"
+        text = "Accessibility Tree Agents accessibility agents control desktop interfaces."
+
+        self.assertTrue(DeepResearchEngine._text_matches_intent_spec(text, query))
 
     def test_generic_market_words_do_not_make_source_on_topic(self) -> None:
         query = "public stocks with highest potential to soar as of now"

@@ -111,6 +111,18 @@ The run writes evidence artifacts under `runs/<run_id>/research/` and records
 events, workflow steps, checkpoints, approvals, trust state, and memory in
 `.agentos/`.
 
+Long research runs now checkpoint detached synthesis state during retrieval, not
+just at the end. Each run refreshes shard packets and merge artifacts under
+`runs/<run_id>/research/` so interrupted crawls still leave replayable synthesis
+state on disk.
+
+Rebuild final synthesis strictly from persisted shard packets and merge
+artifacts without rerunning retrieval:
+
+```powershell
+python -m agentos_orchestrator replay-merge --run-id <run_id>
+```
+
 Run verification:
 
 ```powershell

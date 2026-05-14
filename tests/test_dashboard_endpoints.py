@@ -15,6 +15,7 @@ from agentos_orchestrator.os_control.base import UiAction
 from agentos_orchestrator.os_control.workflow.service import (
     WorkflowVerificationError,
 )
+from agentos_orchestrator.research import ResearchBrief, ResearchSource
 
 from tests.gateway_test_support import (
     FakeResearchEngine,
@@ -471,6 +472,114 @@ class DashboardEndpointsTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job["status"], "failed")
         self.assertIn("unexpected worker failure", job["error"])
+
+    def test_dashboard_research_routes_use_workspace_root(self) -> None:
+        temp_dir, app, client = self._client()
+        run_id = "run_workspace_root"
+        research_dir = Path(temp_dir.name) / "runs" / run_id / "research"
+        research_dir.mkdir(parents=True)
+        (research_dir / "brief.md").write_text(
+            "checkpointed research brief",
+            encoding="utf-8",
+        )
+        (research_dir / "sources.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "title": "Checkpointed Source",
+                        "provider": "test",
+                        "url": "https://example.com/checkpointed",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (research_dir / "progress.json").write_text(
+            json.dumps({"run_id": run_id, "stage": "retrieval-running"}),
+            encoding="utf-8",
+        )
+
+        with temp_dir:
+            with client as api:
+                headers = self._auth_headers(api, app)
+                research = api.get(f"/runs/{run_id}/research", headers=headers)
+                progress = api.get(f"/runs/{run_id}/progress", headers=headers)
+
+                self.assertEqual(research.status_code, 200)
+                self.assertEqual(progress.status_code, 200)
+                self.assertEqual(research.json()["brief"], "checkpointed research brief")
+                self.assertEqual(progress.json()["stage"], "retrieval-running")
+
+    def test_dashboard_replay_merge_endpoint_dispatches_to_research_engine(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi dashboard extra is not installed")
+
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        orchestrator = new_orchestrator(
+            root,
+            {
+                "default": "deny",
+                "allow": {
+                    "actions": [
+                        "file.write",
+                        "mcp.call",
+                        "mcp.list",
+                        "memory.commit",
+                        "network.fetch",
+                        "os.act",
+                        "os.snapshot",
+                    ],
+                    "paths": ["runs/**", "memory://*", "mcp://*"],
+                    "network_hosts": base_network_hosts(),
+                },
+                "forbid": {"actions": [], "paths": []},
+                "require_approval": {"actions": ["os.act"]},
+            },
+        )
+        calls: list[str] = []
+
+        class ReplayEngineStub:
+            def replay_detached_merge(self, run_id: str) -> ResearchBrief:
+                calls.append(run_id)
+                return ResearchBrief(
+                    objective="Replayed research",
+                    query="replay query",
+                    summary="Recovered detached merge output.",
+                    sources=[
+                        ResearchSource(
+                            provider="test",
+                            title="Recovered Source",
+                            url="https://example.com/recovered",
+                            abstract="Recovered evidence.",
+                        )
+                    ],
+                    artifacts=["runs/run_replay/research/brief.md"],
+                    confidence=0.91,
+                )
+
+        orchestrator.worker.research_engine = ReplayEngineStub()
+        hub = DashboardEventHub()
+        hub.attach(orchestrator.event_bus)
+        app = create_dashboard_app(
+            hub,
+            orchestrator.approvals,
+            orchestrator=orchestrator,
+        )
+
+        with temp_dir:
+            with TestClient(app) as api:
+                headers = self._auth_headers(api, app)
+                response = api.post(
+                    "/runs/run_replay/replay-merge",
+                    headers=headers,
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["objective"], "Replayed research")
+                self.assertEqual(calls, ["run_replay"])
 
 
 if __name__ == "__main__":

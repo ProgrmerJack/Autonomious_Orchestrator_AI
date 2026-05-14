@@ -150,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     recover_parser.add_argument("--run-id", required=True)
     recover_parser.add_argument("--backend", default="")
 
+    replay_merge_parser = subparsers.add_parser(
+        "replay-merge",
+        help="Rebuild final research synthesis from persisted shard packets.",
+    )
+    replay_merge_parser.add_argument("--run-id", required=True)
+    replay_merge_parser.add_argument("--workspace-root", default=".")
+
     inspect_parser = subparsers.add_parser(
         "inspect-policy",
         help="Evaluate a single action against the policy.",
@@ -711,6 +718,11 @@ def main(argv: list[str] | None = None) -> int:
         return _daemon(args)
     if args.command == "crawl-worker":
         return _crawl_worker(args)
+    if args.command == "replay-merge":
+        engine = DeepResearchEngine(workspace_root=Path(args.workspace_root))
+        brief = engine.replay_detached_merge(args.run_id)
+        print(json.dumps(asdict(brief), indent=2))
+        return 0
 
     policy_path = Path(args.policy)
 

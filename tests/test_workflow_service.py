@@ -1,14 +1,32 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
+from agentos_orchestrator.app_family_registry import (
+    spec_for_family,
+)
+from agentos_orchestrator.cognition.app_agent_runtime import (
+    AppAgentSession,
+    AppAgentSkillPack,
+)
+from agentos_orchestrator.cognition.live_fire_eval_recipes import (
+    abstract_state,
+)
+from agentos_orchestrator.research.models import ResearchSource
+from agentos_orchestrator.os_control.base import UiAction
 from agentos_orchestrator.os_control.base import UiNode
 from agentos_orchestrator.os_control.workflow.planner import (
     DesktopWorkflowPlanner,
+)
+from agentos_orchestrator.os_control.workflow.reasoner import (
+    DesktopWorkflowReasoner,
 )
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
@@ -19,6 +37,69 @@ from agentos_orchestrator.os_control.workflow.service import (
     DesktopWorkflowService,
     WorkflowVerificationError,
 )
+
+
+def _sample_research_sources() -> list[ResearchSource]:
+    return [
+        ResearchSource(
+            provider="web-search",
+            title="Tesla investor update highlights delivery outlook",
+            url="https://example.com/tesla-update",
+            year=2026,
+            abstract=(
+                "Tesla reiterated its delivery guidance and highlighted a "
+                "new cost-reduction program in its latest investor update."
+            ),
+        ),
+        ResearchSource(
+            provider="google-news-rss",
+            title="Analysts compare Tesla margin trends with EV peers",
+            url="https://example.com/tesla-margins",
+            year=2026,
+            abstract=(
+                "Analysts compared Tesla margins with major EV peers and "
+                "noted continued pricing pressure alongside software upside."
+            ),
+        ),
+    ]
+
+
+def _sample_research_brief_markdown() -> str:
+    return "\n".join(
+        [
+            "# Workflow Research Brief",
+            "",
+            "## Objective",
+            "Universal OS control agents benchmark comparison",
+            "",
+            "## Query",
+            "universal os control agents benchmark comparison",
+            "",
+            "## Coverage",
+            "Collected 2 provider-backed sources before any browser-first UI handoff.",
+            "",
+            "## Sources",
+            "1. [OSWorld-Verified benchmark audit](https://example.com/osworld)",
+            "   Provider: web-search | Year: 2026",
+            "   Evidence: OSWorld-Verified documents repaired benchmark tasks and centralized verification for cross-app desktop evaluation.",
+            "2. [OpenCUA capability update](https://example.com/opencua)",
+            "   Provider: google-news-rss | Year: 2026",
+            "   Evidence: OpenCUA reports open computer-use baselines and reflective action supervision for general desktop tasks.",
+            "",
+            "## Next Step",
+            "Use this brief as the evidence-backed handoff input for the final deliverable.",
+            "",
+        ]
+    )
+
+
+class ToolOnlyBackend:
+    def snapshot(self) -> list[UiNode]:
+        return []
+
+    def perform(self, action) -> str:
+        del action
+        return json.dumps({"status": "executed"})
 
 
 class FakeSelectorRecoveryBackend:
@@ -145,6 +226,59 @@ class MetadataRecordingBackend(VerificationBackend):
         return super().perform(action)
 
 
+class CanvasRoutingBackend:
+    def __init__(self) -> None:
+        self.action_metadata: list[dict[str, Any]] = []
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="drawing-canvas",
+                role="Canvas",
+                name="Design Canvas",
+                focused=True,
+            ),
+            UiNode(node_id="layers", role="Pane", name="Layers"),
+        ]
+
+    def perform(self, action) -> str:
+        self.action_metadata.append(dict(action.metadata or {}))
+        return json.dumps(
+            {
+                "status": "executed",
+                "action": action.action_type,
+                "selector": action.selector,
+            }
+        )
+
+
+class TerminalRoutingBackend:
+    def __init__(self) -> None:
+        self.action_metadata: list[dict[str, Any]] = []
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="terminal-doc",
+                role="Document",
+                name="PowerShell Terminal",
+                focused=True,
+            ),
+            UiNode(node_id="terminal-pane", role="Pane", name="Console"),
+        ]
+
+    def perform(self, action) -> str:
+        self.action_metadata.append(dict(action.metadata or {}))
+        return json.dumps(
+            {
+                "status": "executed",
+                "action": action.action_type,
+                "selector": action.selector,
+                "value": action.value,
+            }
+        )
+
+
 class PreActionBlockingBackend:
     def __init__(self) -> None:
         self.perform_calls = 0
@@ -163,6 +297,189 @@ class PreActionBlockingBackend:
         del action
         self.perform_calls += 1
         return json.dumps({"status": "executed"})
+
+
+class CodeToolBypassBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="explorer-file-list",
+                role="List",
+                name="Explorer File List",
+                focused=True,
+            )
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class ApiPromotionBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="api-dashboard",
+                role="Pane",
+                name="API Dashboard",
+                focused=True,
+                metadata={"api": "http"},
+            ),
+            UiNode(node_id="refresh-button", role="Button", name="Refresh"),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class TradingTerminalPolicyBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="order-ticket",
+                role="Edit",
+                name="Order Ticket",
+                focused=True,
+            ),
+            UiNode(node_id="watchlist", role="Table", name="Watchlist"),
+            UiNode(node_id="confirm-order", role="Button", name="Confirm"),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class ChatPolicyBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="conversation-list",
+                role="List",
+                name="Conversation",
+            ),
+            UiNode(
+                node_id="chat-composer",
+                role="Edit",
+                name="Chat Composer",
+                focused=True,
+            ),
+            UiNode(
+                node_id="channel-broadcast",
+                role="Button",
+                name="Channel Broadcast",
+            ),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class BrowserPolicyBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="browser-address",
+                role="Edit",
+                name="Address and search bar",
+                focused=True,
+            ),
+            UiNode(node_id="checkout", role="Button", name="Checkout"),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class FileDialogPolicyBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="file-name",
+                role="Edit",
+                name="File Name",
+                focused=True,
+            ),
+            UiNode(node_id="save-button", role="Button", name="Save"),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class EnterpriseGridPolicyBackend:
+    def __init__(self) -> None:
+        self.perform_calls = 0
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="record-grid",
+                role="Table",
+                name="Enterprise Record Grid",
+                focused=True,
+            ),
+            UiNode(node_id="bulk-delete", role="Button", name="Bulk Delete"),
+        ]
+
+    def perform(self, action) -> str:
+        del action
+        self.perform_calls += 1
+        return json.dumps({"status": "executed"})
+
+
+class _LocalApiHandler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"allow": ["GET", "OPTIONS"]}')
+
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status": "ok", "source": "local-api"}')
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        del fmt, args
+
+
+def _start_local_api_server(
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LocalApiHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, thread, f"http://{host}:{port}/health"
 
 
 class GoalLockBlockingBackend:
@@ -321,7 +638,11 @@ class WorkflowServiceTests(unittest.TestCase):
                 "search for desktop control benchmarks and open file explorer "
                 "to move notes.txt to archive, then draft a python script"
             )
-            result = service.execute(objective, backend)
+            with patch(
+                "agentos_orchestrator.research.deep_research.DeepResearchEngine._search_query_across_providers",
+                return_value=_sample_research_sources(),
+            ):
+                result = service.execute(objective, backend)
             launches = [
                 item["receipt"].get("launched")
                 for item in result["receipts"]
@@ -329,10 +650,15 @@ class WorkflowServiceTests(unittest.TestCase):
                 and item["receipt"].get("launched")
             ]
 
-            self.assertIn("msedge.exe", launches)
             self.assertIn("explorer.exe", launches)
             self.assertIn("code", launches)
             self.assertTrue(
+                any(
+                    item["selector"] == "tool_executor:workflow_research"
+                    for item in result["receipts"]
+                )
+            )
+            self.assertFalse(
                 any(item["action_type"] == "open_url" for item in result["receipts"])
             )
             self.assertTrue(
@@ -374,6 +700,71 @@ class WorkflowServiceTests(unittest.TestCase):
         plan = planner.plan("open file explorer to rename report.md to report_final.md")
         self.assertIn(plan.app_target, {"explorer.exe", None})
         self.assertTrue(any(step.action_type == "rename_file" for step in plan.steps))
+
+    def test_planner_emits_explicit_programmer_tool_step(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan("write a workflow handoff report from current receipts")
+
+        self.assertTrue(plan.steps)
+        self.assertEqual(plan.steps[0].action_type, "tool")
+        self.assertEqual(plan.steps[0].selector, "tool_executor:workflow_programmer")
+        tool_request = plan.steps[0].metadata.get("tool_request") or {}
+        self.assertEqual(tool_request.get("mode"), "report")
+        self.assertTrue(tool_request.get("outputs"))
+
+    def test_planner_emits_research_tool_for_research_report_objective(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan("write a report about universal OS control agents")
+
+        self.assertTrue(plan.steps)
+        self.assertEqual(plan.steps[0].action_type, "tool")
+        self.assertEqual(plan.steps[0].selector, "tool_executor:workflow_research")
+        self.assertTrue(
+            any(artifact.kind == "research-brief" for artifact in plan.artifacts)
+        )
+        self.assertTrue(any(artifact.kind == "report" for artifact in plan.artifacts))
+        self.assertTrue(
+            any(
+                step.selector == "tool_executor:workflow_programmer"
+                for step in plan.steps
+            )
+        )
+
+    def test_planner_emits_research_tool_for_presentation_objective(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan(
+            "create a presentation about universal OS control agents"
+        )
+
+        self.assertTrue(plan.steps)
+        self.assertEqual(plan.steps[0].selector, "tool_executor:workflow_research")
+        self.assertTrue(
+            any(artifact.kind == "research-brief" for artifact in plan.artifacts)
+        )
+        self.assertTrue(
+            any(
+                artifact.kind == "presentation-outline"
+                for artifact in plan.artifacts
+            )
+        )
+        presentation_steps = [
+            step
+            for step in plan.steps
+            if step.action_type == "type"
+            and step.selector == "presentation-canvas"
+        ]
+        self.assertTrue(presentation_steps)
+        self.assertIn("presentation_outline.md", presentation_steps[0].value or "")
+        self.assertNotIn("research_brief.md", presentation_steps[0].value or "")
+
+    def test_planner_emits_api_call_for_explicit_local_endpoint(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan("probe http://127.0.0.1:8765/api/health")
+
+        api_steps = [step for step in plan.steps if step.action_type == "api_call"]
+        self.assertTrue(api_steps)
+        self.assertEqual(api_steps[0].selector, "http://127.0.0.1:8765/api/health")
+        self.assertIsNone(plan.app_target)
 
     def test_open_paint_and_draw_generic_scene_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -441,7 +832,7 @@ class WorkflowServiceTests(unittest.TestCase):
                 )
             )
 
-    def test_find_stock_and_analyze_routes_to_browser(self) -> None:
+    def test_find_stock_and_analyze_prefers_research_tool_lane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             from agentos_orchestrator.os_control import (
@@ -450,10 +841,14 @@ class WorkflowServiceTests(unittest.TestCase):
 
             service = DesktopWorkflowService(root)
             backend = VirtualDesktopSandboxBackend(root / "sandbox_state_stock.json")
-            result = service.execute(
-                "find tesla stock and analyze it",
-                backend,
-            )
+            with patch(
+                "agentos_orchestrator.research.deep_research.DeepResearchEngine._search_query_across_providers",
+                return_value=_sample_research_sources(),
+            ):
+                result = service.execute(
+                    "find tesla stock and analyze it",
+                    backend,
+                )
 
             launches = [
                 item["receipt"].get("launched")
@@ -461,17 +856,18 @@ class WorkflowServiceTests(unittest.TestCase):
                 if isinstance(item.get("receipt"), dict)
                 and item["receipt"].get("launched")
             ]
-            self.assertIn("msedge.exe", launches)
-            open_urls = [
-                item
-                for item in result["receipts"]
-                if item["action_type"] == "open_url"
-                and isinstance(item.get("receipt"), dict)
-            ]
-            self.assertTrue(open_urls)
-            query_url = str(open_urls[0]["receipt"].get("value", "")).lower()
-            self.assertIn("bing.com/search", query_url)
-            self.assertIn("tesla", query_url)
+            self.assertNotIn("msedge.exe", launches)
+            self.assertFalse(
+                any(item["action_type"] == "open_url" for item in result["receipts"])
+            )
+            self.assertEqual(result["receipts"][0]["action_type"], "tool")
+            self.assertEqual(
+                result["receipts"][0]["selector"],
+                "tool_executor:workflow_research",
+            )
+            brief_path = root / "artifacts" / "workflows" / "find-tesla-stock-and-analyze-it" / "research_brief.md"
+            self.assertTrue(brief_path.exists())
+            self.assertIn("Tesla", brief_path.read_text(encoding="utf-8"))
 
     def test_adaptive_reasoner_applies_generic_surface_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -499,6 +895,72 @@ class WorkflowServiceTests(unittest.TestCase):
                     for item in adaptive_receipts
                 )
             )
+
+    def test_reasoner_emits_programmer_tool_before_ui_handoff(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan("write a workflow handoff report from current receipts")
+        reasoner = DesktopWorkflowReasoner()
+
+        decision = reasoner.next_decision(
+            "write a report about adaptive desktop workflows",
+            plan,
+            [UiNode("doc", "Document", "Document Canvas", focused=True)],
+            [],
+        )
+
+        self.assertIsNotNone(decision.step)
+        assert decision.step is not None
+        self.assertEqual(decision.step.action_type, "tool")
+        self.assertEqual(decision.step.selector, "tool_executor:workflow_programmer")
+
+    def test_reasoner_emits_research_tool_before_ui_handoff(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan("find tesla stock and analyze it")
+        reasoner = DesktopWorkflowReasoner()
+
+        decision = reasoner.next_decision(
+            "find tesla stock and analyze it",
+            plan,
+            [UiNode("doc", "Document", "Document Canvas", focused=True)],
+            [],
+        )
+
+        self.assertIsNotNone(decision.step)
+        assert decision.step is not None
+        self.assertEqual(decision.step.action_type, "tool")
+        self.assertEqual(decision.step.selector, "tool_executor:workflow_research")
+
+    def test_reasoner_emits_api_call_for_api_surface_node(self) -> None:
+        endpoint = "http://127.0.0.1:9000/api/status"
+        reasoner = DesktopWorkflowReasoner()
+        plan = DesktopWorkflowPlan(
+            objective="refresh api dashboard",
+            mode="app-task",
+            app_target=None,
+            summary="api surface plan",
+            steps=[],
+            artifacts=[],
+        )
+
+        decision = reasoner.next_decision(
+            "refresh the local api dashboard",
+            plan,
+            [
+                UiNode(
+                    "api-dashboard",
+                    "Pane",
+                    "API Dashboard",
+                    focused=True,
+                    metadata={"endpoint": endpoint, "api": "http"},
+                )
+            ],
+            [],
+        )
+
+        self.assertIsNotNone(decision.step)
+        assert decision.step is not None
+        self.assertEqual(decision.step.action_type, "api_call")
+        self.assertEqual(decision.step.selector, endpoint)
 
     def test_perform_with_recovery_records_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -730,6 +1192,182 @@ class WorkflowServiceTests(unittest.TestCase):
                 )
             )
 
+    def test_programmer_lane_synthesizes_report_from_research_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            brief_path = (
+                root
+                / "artifacts"
+                / "workflows"
+                / "benchmark-report"
+                / "research_brief.md"
+            )
+            brief_path.parent.mkdir(parents=True, exist_ok=True)
+            brief_path.write_text(
+                _sample_research_brief_markdown(),
+                encoding="utf-8",
+            )
+            service = DesktopWorkflowService(root)
+            backend = ToolOnlyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="research-backed report plan",
+                steps=[],
+                artifacts=[
+                    WorkflowArtifact(
+                        path=(
+                            "artifacts/workflows/benchmark-report/"
+                            "research_brief.md"
+                        ),
+                        kind="research-brief",
+                        description="Evidence-backed brief",
+                    ),
+                    WorkflowArtifact(
+                        path="artifacts/workflows/benchmark-report/report.md",
+                        kind="report",
+                        description="Workflow report",
+                    ),
+                ],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute(
+                "write a report about universal OS control agents",
+                backend,
+            )
+
+            report_path = (
+                root
+                / "artifacts"
+                / "workflows"
+                / "benchmark-report"
+                / "report.md"
+            )
+            self.assertEqual(result["receipts"][0]["selector"], "tool_executor:workflow_programmer")
+            self.assertTrue(report_path.exists())
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("synthesized directly from the workflow research brief", report_text)
+            self.assertIn("OSWorld-Verified benchmark audit", report_text)
+            self.assertIn("OpenCUA capability update", report_text)
+
+    def test_programmer_lane_synthesizes_presentation_from_research_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            brief_path = (
+                root
+                / "artifacts"
+                / "workflows"
+                / "benchmark-deck"
+                / "research_brief.md"
+            )
+            brief_path.parent.mkdir(parents=True, exist_ok=True)
+            brief_path.write_text(
+                _sample_research_brief_markdown(),
+                encoding="utf-8",
+            )
+            service = DesktopWorkflowService(root)
+            backend = ToolOnlyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="presentation",
+                app_target=None,
+                summary="research-backed presentation plan",
+                steps=[],
+                artifacts=[
+                    WorkflowArtifact(
+                        path=(
+                            "artifacts/workflows/benchmark-deck/"
+                            "research_brief.md"
+                        ),
+                        kind="research-brief",
+                        description="Evidence-backed brief",
+                    ),
+                    WorkflowArtifact(
+                        path=(
+                            "artifacts/workflows/benchmark-deck/"
+                            "presentation_outline.md"
+                        ),
+                        kind="presentation-outline",
+                        description="Slide outline",
+                    ),
+                ],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute(
+                "create a presentation about universal OS control agents",
+                backend,
+            )
+
+            outline_path = (
+                root
+                / "artifacts"
+                / "workflows"
+                / "benchmark-deck"
+                / "presentation_outline.md"
+            )
+            self.assertEqual(result["receipts"][0]["selector"], "tool_executor:workflow_programmer")
+            self.assertTrue(outline_path.exists())
+            outline_text = outline_path.read_text(encoding="utf-8")
+            self.assertIn("## Slide 3: Key Evidence", outline_text)
+            self.assertIn("OSWorld-Verified benchmark audit", outline_text)
+            self.assertIn("OpenCUA capability update", outline_text)
+
+    def test_visual_heavy_canvas_click_prefers_native_vision_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = CanvasRoutingBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="canvas route plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="click",
+                        selector="drawing-canvas",
+                        description="Click the design canvas",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute("edit the design canvas", backend)
+
+            control = result["receipts"][0]["control"]
+            self.assertEqual(control["control_route"], "native_vision")
+            self.assertEqual(control["app_agent"]["family"], "design_canvas")
+
+    def test_terminal_text_entry_keeps_structured_ui_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = TerminalRoutingBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="terminal route plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="name=PowerShell Terminal",
+                        value="dir",
+                        description="Type a terminal command",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            result = service.execute("run a shell command in terminal", backend)
+
+            control = result["receipts"][0]["control"]
+            self.assertEqual(control["control_route"], "structured_ui")
+            self.assertEqual(control["app_agent"]["family"], "terminal")
+
     def test_goal_lock_blocks_unrelated_external_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = DesktopWorkflowService(Path(temp_dir))
@@ -807,6 +1445,386 @@ class WorkflowServiceTests(unittest.TestCase):
                 )
             )
             self.assertTrue(golden_candidates)
+
+    def test_code_tool_route_avoids_backend_for_file_op(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "notes.txt"
+            source.write_text("route replacement", encoding="utf-8")
+            service = DesktopWorkflowService(root)
+            backend = CodeToolBypassBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="file-ops",
+                app_target=None,
+                summary="code tool file op plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="copy_file",
+                        selector="explorer-file-list",
+                        value="notes.txt -> archive/notes_copy.txt",
+                        description="Copy the note through the code tool lane",
+                        metadata={
+                            "operation": "copy",
+                            "source": "notes.txt",
+                            "destination": "archive/notes_copy.txt",
+                        },
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+            service._execute_adaptive_steps = cast(
+                Any,
+                lambda *args, **kwargs: None,
+            )
+
+            result = service.execute(
+                "copy notes.txt to archive/notes_copy.txt",
+                backend,
+            )
+
+            copied = root / "archive" / "notes_copy.txt"
+            self.assertTrue(copied.exists())
+            self.assertEqual(backend.perform_calls, 0)
+            control = result["receipts"][0]["control"]
+            self.assertEqual(control["control_route"], "code_tool")
+            self.assertEqual(control["materialized_action_type"], "tool")
+
+    def test_api_route_uses_policy_memory_probe_without_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = DesktopWorkflowService(root)
+            backend = ApiPromotionBackend()
+            nodes = backend.snapshot()
+            profile = service.capability_profiler.profile(
+                abstract_state("unknown", nodes),
+                nodes,
+            )
+            server, thread, endpoint = _start_local_api_server()
+            try:
+                service.app_agent_runtime.policy_memory.record(
+                    profile.app_signature,
+                    "refresh api dashboard",
+                    UiAction(
+                        "api_call",
+                        endpoint,
+                        metadata={"control_channel": "api"},
+                    ),
+                    True,
+                    control_channel="api",
+                )
+                plan = DesktopWorkflowPlan(
+                    objective="",
+                    mode="report",
+                    app_target=None,
+                    summary="api promotion plan",
+                    steps=[
+                        DesktopWorkflowStep(
+                            action_type="click",
+                            selector="refresh-button",
+                            description="Refresh the dashboard data",
+                        )
+                    ],
+                    artifacts=[],
+                )
+                service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+                result = service.execute("refresh api dashboard", backend)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+
+            self.assertEqual(backend.perform_calls, 0)
+            control = result["receipts"][0]["control"]
+            self.assertEqual(control["control_route"], "api_mcp")
+            self.assertEqual(control["materialized_action_type"], "tool")
+            receipt = result["receipts"][0]["receipt"]
+            self.assertTrue(receipt["success"])
+            self.assertEqual(receipt["kind"], "http_probe")
+
+    def test_explicit_api_call_plan_materializes_direct_endpoint_without_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = DesktopWorkflowService(root)
+            backend = ApiPromotionBackend()
+            server, thread, endpoint = _start_local_api_server()
+            try:
+                plan = DesktopWorkflowPlan(
+                    objective="",
+                    mode="app-task",
+                    app_target=None,
+                    summary="direct api plan",
+                    steps=[
+                        DesktopWorkflowStep(
+                            action_type="api_call",
+                            selector=endpoint,
+                            description="Probe the local API directly",
+                            metadata={"method": "GET"},
+                        )
+                    ],
+                    artifacts=[],
+                )
+                service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+                result = service.execute("probe the local api surface", backend)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+
+            self.assertEqual(backend.perform_calls, 0)
+            control = result["receipts"][0]["control"]
+            self.assertEqual(control["control_route"], "api_mcp")
+            self.assertEqual(control["materialized_action_type"], "tool")
+            receipt = result["receipts"][0]["receipt"]
+            self.assertTrue(receipt["success"])
+            self.assertEqual(receipt["kind"], "http_probe")
+
+    def test_trading_terminal_policy_requires_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = TradingTerminalPolicyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="trading approval plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="click",
+                        selector="name=Confirm",
+                        description="Confirm the order ticket",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+            trading_skill_pack = AppAgentSkillPack(
+                skill_pack_id="trading_terminal:test",
+                family="trading_terminal",
+                app_context="trading_terminal",
+                app_signature="trading-terminal-test",
+                preferred_channels=["api", "accessibility"],
+                affordance_hints=[],
+                verification_contracts=[],
+                repair_recipes=[],
+                action_policy={
+                    "require_approval_selectors": ["confirm"],
+                },
+            )
+            service.app_agent_runtime.resolve = cast(
+                Any,
+                lambda profile, objective, nodes: AppAgentSession(
+                    skill_pack=trading_skill_pack,
+                    adapter_context={},
+                    objective=objective,
+                    nodes_seen=len(nodes or []),
+                ),
+            )
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute(
+                    "review the watchlist and current positions",
+                    backend,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn(
+                "trading_terminal policy",
+                failure["verification"]["reason"],
+            )
+            self.assertIn(
+                "requires approval",
+                failure["verification"]["reason"],
+            )
+
+    def test_chat_policy_blocks_channel_broadcast(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = ChatPolicyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="report",
+                app_target=None,
+                summary="chat forbid plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="click",
+                        selector="name=Channel Broadcast",
+                        description="Broadcast a message to the full channel",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute(
+                    "review the current conversation thread",
+                    backend,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn(
+                "chat_app policy",
+                failure["verification"]["reason"],
+            )
+            self.assertIn("forbids", failure["verification"]["reason"])
+
+    def test_browser_policy_requires_approval_for_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = BrowserPolicyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="app-task",
+                app_target=None,
+                summary="browser policy plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="click",
+                        selector="name=Checkout",
+                        description="Checkout the current cart",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+            browser_spec = spec_for_family("browser")
+            browser_skill_pack = AppAgentSkillPack(
+                skill_pack_id="browser:test",
+                family=browser_spec.family,
+                app_context=browser_spec.app_context,
+                app_signature="browser-test",
+                preferred_channels=list(browser_spec.preferred_channels),
+                affordance_hints=list(browser_spec.affordance_hints),
+                verification_contracts=list(browser_spec.verification_contracts),
+                repair_recipes=list(browser_spec.repair_recipes),
+                action_policy=dict(browser_spec.action_policy),
+            )
+            service.app_agent_runtime.resolve = cast(
+                Any,
+                lambda profile, objective, nodes: AppAgentSession(
+                    skill_pack=browser_skill_pack,
+                    adapter_context={},
+                    objective=objective,
+                    nodes_seen=len(nodes or []),
+                ),
+            )
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute("review the current cart and page state", backend)
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn("browser policy", failure["verification"]["reason"])
+            self.assertIn("requires approval", failure["verification"]["reason"])
+
+    def test_file_dialog_policy_forbids_system_path_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = FileDialogPolicyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="app-task",
+                app_target=None,
+                summary="file dialog policy plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="name=File Name",
+                        value=r"C:\Windows\System32\drivers\etc\hosts",
+                        description="Attempt to save into a protected system path",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+            file_dialog_spec = spec_for_family("file_dialog")
+            file_dialog_skill_pack = AppAgentSkillPack(
+                skill_pack_id="file_dialog:test",
+                family=file_dialog_spec.family,
+                app_context=file_dialog_spec.app_context,
+                app_signature="file-dialog-test",
+                preferred_channels=list(file_dialog_spec.preferred_channels),
+                affordance_hints=list(file_dialog_spec.affordance_hints),
+                verification_contracts=list(file_dialog_spec.verification_contracts),
+                repair_recipes=list(file_dialog_spec.repair_recipes),
+                action_policy=dict(file_dialog_spec.action_policy),
+            )
+            service.app_agent_runtime.resolve = cast(
+                Any,
+                lambda profile, objective, nodes: AppAgentSession(
+                    skill_pack=file_dialog_skill_pack,
+                    adapter_context={},
+                    objective=objective,
+                    nodes_seen=len(nodes or []),
+                ),
+            )
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute("save the draft safely", backend)
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn("file_dialog policy", failure["verification"]["reason"])
+            self.assertIn("forbids", failure["verification"]["reason"])
+
+    def test_enterprise_grid_policy_requires_approval_for_bulk_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = EnterpriseGridPolicyBackend()
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="app-task",
+                app_target=None,
+                summary="enterprise grid policy plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="click",
+                        selector="name=Bulk Delete",
+                        description="Bulk delete the selected enterprise records",
+                    )
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+            enterprise_spec = spec_for_family("enterprise_grid")
+            enterprise_skill_pack = AppAgentSkillPack(
+                skill_pack_id="enterprise_grid:test",
+                family=enterprise_spec.family,
+                app_context=enterprise_spec.app_context,
+                app_signature="enterprise-grid-test",
+                preferred_channels=list(enterprise_spec.preferred_channels),
+                affordance_hints=list(enterprise_spec.affordance_hints),
+                verification_contracts=list(enterprise_spec.verification_contracts),
+                repair_recipes=list(enterprise_spec.repair_recipes),
+                action_policy=dict(enterprise_spec.action_policy),
+            )
+            service.app_agent_runtime.resolve = cast(
+                Any,
+                lambda profile, objective, nodes: AppAgentSession(
+                    skill_pack=enterprise_skill_pack,
+                    adapter_context={},
+                    objective=objective,
+                    nodes_seen=len(nodes or []),
+                ),
+            )
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute("review the enterprise queue", backend)
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn(
+                "enterprise_grid policy",
+                failure["verification"]["reason"],
+            )
+            self.assertIn("requires approval", failure["verification"]["reason"])
 
 
 if __name__ == "__main__":

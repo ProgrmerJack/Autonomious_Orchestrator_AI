@@ -118,6 +118,7 @@ def blocked_market_query_site_hosts() -> set[str]:
         "fred.stlouisfed.org",
         "bls.gov",
         "bea.gov",
+        "finance.yahoo.com",
     }
 
 

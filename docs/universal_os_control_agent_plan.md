@@ -46,13 +46,15 @@ The gap is not that AgentOS lacks a universal agent. The gap is that the univers
 
 The plan below is grounded in these findings:
 
-- OSWorld and OSWorld-Verified define the right evaluation style: real desktop tasks, reproducible setup, cross-app workflows, and execution-based evaluation instead of prompt-only judgment. OSWorld also identifies current agent failures as GUI grounding, operational knowledge, long-horizon planning, UI layout sensitivity, and noisy visual state. Source: [OSWorld](https://os-world.github.io/).
+- OSWorld and OSWorld-Verified define the right evaluation style: real desktop tasks, reproducible setup, cross-app workflows, and execution-based evaluation instead of prompt-only judgment. The OSWorld-Verified update is especially relevant to AgentOS because it documents 300-plus benchmark repairs, centralized verification, AWS-backed reproducibility, and the exact failure pressures that matter in deployment: environment drift, timing dependencies, anti-bot friction, ambiguous tasks, and brittle evaluators. Source: [OSWorld-Verified](https://xlang.ai/blog/osworld-verified).
 - Microsoft UFO2 shows a scalable desktop architecture pattern: a HostAgent delegates to AppAgents, uses Windows UIA, Win32, WinCOM, screenshots, control filters, app APIs, speculative multi-action execution, a continuous knowledge substrate, and Picture-in-Picture execution for isolation. Sources: [UFO overview](https://microsoft.github.io/UFO/overview/) and [UFO2 paper](https://arxiv.org/html/2504.14603).
+- OpenCUA reinforces the data and model side of the roadmap: large-scale cross-OS computer-use traces, reflective action supervision, and open foundation models are now strong enough to set meaningful open-source baselines. Its reported 45.0 percent OSWorld-Verified result is a useful target for what open substrate improvements can unlock before proprietary frontier models are involved. Source: [OpenCUA](https://arxiv.org/html/2508.09123v3).
 - Agent-S shows that strong GUI agents now combine a main planner, specialized grounding, reflection, local code execution, and behavior best-of-N. Its README reports Agent S3 reaching 66 percent OSWorld in a 100-step setting and 72.6 percent with behavior best-of-N. Source: [Agent-S](https://github.com/simular-ai/Agent-S).
-- CoAct-1's key design lesson is that coding must be treated as an action. Data processing, reports, file transforms, stock analysis, and presentations should be done through code when possible, with GUI used for tasks only the GUI can do. Source found through current web search: [CoAct-1](https://arxiv.org/abs/2509.07316).
+- CoAct-1's key design lesson is that coding must be treated as an action. Data processing, reports, file transforms, stock analysis, and presentations should be done through code when possible, with GUI used for tasks only the GUI can do. It also supports the HostAgent plus delegated executor pattern already emerging in this repo. Source: [CoAct-1](https://arxiv.org/abs/2508.03923).
 - CUA emphasizes infrastructure: desktop sandboxes, screenshot, shell, mouse, keyboard, mobile gestures, OSWorld and Windows Arena benchmarking, trajectory export, and background computer use that does not steal the user's active cursor. Source: [CUA](https://github.com/trycua/cua).
 - VeriSafe Agent shows why pre-action verification matters. Reflection after execution cannot prevent irreversible actions. Logic-based pre-action verification can catch intent/action mismatches before the action takes effect. Source: [VeriSafe Agent](https://arxiv.org/html/2503.18492).
 - CORA shows the right safety control shape: post-policy, pre-action selective execution, action-conditional risk scoring, conformal risk calibration, Goal-Lock, and a diagnostician that chooses confirm, reflect, or abort. Source: [CORA](https://arxiv.org/html/2604.09155).
+- The 2026 deployment-grounded reliability framework for computer-use agents maps directly onto what AgentOS is missing: explicit separation of perception, decision, and execution layers, plus a lifecycle split between creation, deployment, operation, and maintenance. Its central lesson is that failure manifestation and failure origin are often different, so controls must be attached where authority is bound, not only where incidents become visible. Source: [Securing Computer-Use Agents](https://arxiv.org/abs/2605.07110).
 - Anthropic's computer-use guidance reinforces the deployment posture: use a VM/container or isolated environment, constrain access, avoid sensitive accounts when possible, and treat computer-use agents as high-risk executors. Source: [Anthropic computer use](https://www.anthropic.com/news/3-5-models-and-computer-use).
 
 ## Target Architecture
@@ -180,6 +182,13 @@ Acceptance gates:
 - Unknown-app flow can profile a new window and select a channel without hand-coded one-off logic.
 - Re-running a successful app-family task reuses memory and reduces step count.
 
+Implementation status:
+
+- [app_agent_runtime.py](../agentos_orchestrator/cognition/app_agent_runtime.py) now carries `action_policy` through AppAgent skill-pack resolution and records policy anchors in session memory.
+- [app_family_registry.py](../agentos_orchestrator/app_family_registry.py) now defines explicit policy coverage for `browser`, `file_dialog`, and `enterprise_grid` in addition to the earlier `chat_app` and `trading_terminal` families.
+- [service.py](../agentos_orchestrator/os_control/workflow/service.py) and [control_substrate.py](../agentos_orchestrator/cognition/control_substrate.py) already feed app-family context into routing and pre-action verification, so skill-pack metadata now affects both execution choice and approval/forbid behavior.
+- [test_workflow_service.py](../tests/test_workflow_service.py) covers browser checkout approval, file-dialog path escape blocking, enterprise-grid bulk-delete approval, and the family-policy regression surface.
+
 ### Phase 3: Code-as-Action Programmer Lane
 
 Goal: use code for artifacts, analysis, and data tasks instead of wasting GUI steps.
@@ -198,6 +207,20 @@ Acceptance gates:
 - Report workflow creates markdown/PDF and verifies content criteria.
 - Code lane refuses high-risk local execution unless sandbox and policy gates allow it.
 
+Implementation status:
+
+- [planner.py](../agentos_orchestrator/os_control/workflow/planner.py) and [reasoner.py](../agentos_orchestrator/os_control/workflow/reasoner.py) now emit explicit `tool` and `api_call` steps directly instead of relying on late service-time inference for the first non-UI promotion.
+- [service.py](../agentos_orchestrator/os_control/workflow/service.py) already materializes `code_tool` and `api_mcp` routes, preserves explicit `api_call` endpoints, and now executes a bounded `workflow_research_brief` tool request through the existing research provider stack.
+- [adapters.py](../agentos_orchestrator/os_control/workflow/adapters.py) now adds a first-class research adapter that emits `tool_executor:workflow_research` for research/search/report objectives and suppresses browser-first fallback when a provider-backed brief can satisfy the first step.
+- The workflow research lane writes `research_brief.md` into the workspace before any browser handoff and is now the default first move for objectives like market analysis, benchmark search, external-topic reports, and external-topic presentations.
+- [retrieval.py](../agentos_orchestrator/research/retrieval.py) now applies platform-aware headless browser prefetch budgets before JS-heavy enrichment and crawl-worker rendering, capping URL count, per-page render size, and aggregate prefetched text so browser-backed research stays enabled without recreating the transient Windows OOM spike.
+- [planner.py](../agentos_orchestrator/os_control/workflow/planner.py) now merges pronoun-style analytical continuations such as `find X and analyze it` back into a single segment so the research lane does not duplicate evidence gathering across artificial fragments.
+- [reasoner.py](../agentos_orchestrator/os_control/workflow/reasoner.py) now gives deterministic direct-lane research/programmer/API decisions precedence over model-backed UI suggestions so the explicit non-UI path remains authoritative.
+- [programmer.py](../agentos_orchestrator/os_control/workflow/programmer.py) now treats `research_brief.md` as an input artifact and synthesizes both `report.md` and `presentation_outline.md` directly from the brief before any document or slide-editing UI handoff.
+- [artifacts.py](../agentos_orchestrator/research/artifacts.py) now emits `frontier_schedule.json`, `frontier_shards.json`, and `frontier_shards.md` for every research run, turning detached crawl and broker shard state into explicit run-level scheduling and shard summaries instead of hiding that state behind the broker only.
+- [planning_synthesis.py](../agentos_orchestrator/research/planning_synthesis.py) now surfaces the detached frontier schedule directly in `analysis_report.md`, so the report records shard count, backlog pressure, assigned query slices, and representative queued or processed URLs.
+- Remaining gap: the first shard-aware reporting layer now exists, but true 10k-scale fanout still needs detached execution beyond crawl-only workers, durable shard-level synthesis packets, and a final merge stage that can reconcile shard claims without forcing one live synthesis window to hold the full crawl in memory.
+
 ### Phase 4: Pre-Action Verification and Risk Control
 
 Goal: prevent unsafe actions before they happen.
@@ -215,6 +238,12 @@ Acceptance gates:
 - Unsafe actions in payments, credential entry, external messaging, file deletion, trading/order placement, and permission grants are blocked or require approval.
 - Benign tasks do not suffer more than a defined interruption budget.
 - Every blocked action produces an actionable repair or confirmation path.
+
+Implementation status:
+
+- [control_substrate.py](../agentos_orchestrator/cognition/control_substrate.py) already evaluates family-specific pre-action policy before execution and now limits policy matching to semantic action fields instead of accidentally matching policy definitions themselves.
+- [service.py](../agentos_orchestrator/os_control/workflow/service.py) now skips selector preflight for explicit API actions and preserves route-specific verification contracts when a control route is materialized into a tool lane.
+- [test_workflow_service.py](../tests/test_workflow_service.py) verifies the current guardrail surface end to end with approval, forbid, file-exists, receipt-success, and direct-lane regression tests.
 
 ### Phase 5: Speculative Planning with Safe Commit
 
@@ -286,20 +315,21 @@ Repo hooks: [native.rs](../crates/agent_body/src/native.rs), [visual_fallback.py
 Preferred route:
 
 1. Code/tool lane fetches data and computes indicators.
-2. Research lane gathers current context if needed.
+2. Research lane gathers current context through a provider-backed `research_brief.md` when external evidence is needed.
 3. Code lane creates charts and report artifacts.
 4. GUI lane only opens a browser, spreadsheet, or presentation app if final delivery requires it.
 
-Repo hooks: [tool_executor.py](../agentos_orchestrator/cognition/tool_executor.py), [hierarchical_task_decomposer.py](../agentos_orchestrator/cognition/hierarchical_task_decomposer.py).
+Repo hooks: [tool_executor.py](../agentos_orchestrator/cognition/tool_executor.py), [adapters.py](../agentos_orchestrator/os_control/workflow/adapters.py), [service.py](../agentos_orchestrator/os_control/workflow/service.py).
 
 ### Create Presentations and Reports
 
 Preferred route:
 
-1. Code lane generates markdown, PPTX, DOCX, PDF, charts, and images.
-2. Verify files by existence, hash, slide/page count, and required text.
-3. UI lane opens PowerPoint, browser, or design app only for manual-style finishing.
-4. If GUI export is required, post-action verification checks exported hash.
+1. If the objective needs external context, the research lane generates a bounded provider-backed brief before any browser-first UI handoff.
+2. Code lane synthesizes `report.md` and `presentation_outline.md` directly from that brief before any document or slide UI handoff.
+3. Verify files by existence, hash, slide/page count, and required text.
+4. UI lane opens PowerPoint, browser, or design app only for manual-style finishing.
+5. If GUI export is required, post-action verification checks exported hash.
 
 Repo hooks: [tool_executor.py](../agentos_orchestrator/cognition/tool_executor.py), [verification_contracts.py](../agentos_orchestrator/cognition/verification_contracts.py), [os_control/workflow/service.py](../agentos_orchestrator/os_control/workflow/service.py).
 

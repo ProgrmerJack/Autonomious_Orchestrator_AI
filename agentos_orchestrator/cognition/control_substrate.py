@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from agentos_orchestrator.os_control.base import UiAction, UiNode
 
@@ -221,8 +221,8 @@ class FourLaneActionRouter:
         observation: ObservationFrame,
         objective: str = "",
     ) -> ActionProposal:
-        route_scores = self._route_scores(action, observation, objective)
-        route = max(route_scores.items(), key=lambda item: item[1])[0]
+        route_scores = self._route_scores(action, observation)
+        route = _select_route(route_scores, action, observation)
         risk_score = _risk_score(action, route, objective)
         reversibility = _reversibility(action)
         required_approval = _requires_approval(
@@ -276,12 +276,10 @@ class FourLaneActionRouter:
         self,
         action: UiAction,
         observation: ObservationFrame,
-        objective: str,
     ) -> dict[str, float]:
         action_type = action.action_type.lower()
         selector = str(action.selector or "").lower()
         metadata = dict(action.metadata or {})
-        lower_goal = f"{objective} {action_type} {selector}".lower()
         channel_max = _max_channel_scores(observation.elements)
         route_scores = {
             "api_mcp": 0.2 + 0.55 * channel_max.get("api", 0.0),
@@ -291,12 +289,17 @@ class FourLaneActionRouter:
             + 0.35 * channel_max.get("native", 0.0)
             + 0.35 * channel_max.get("vision", 0.0),
         }
-        if action_type in _API_ACTIONS or metadata.get("control_channel") == "api":
+        compatible_routes = _compatible_routes(action, observation)
+        if action_type in _API_ACTIONS:
             route_scores["api_mcp"] += 0.45
-        if action_type in _CODE_ACTIONS or _code_task(lower_goal):
+        if action_type in _CODE_ACTIONS:
             route_scores["code_tool"] += 0.42
         if _semantic_selector(selector) or action_type in _STRUCTURED_UI_ACTIONS:
-            route_scores["structured_ui"] += 0.3
+            route_scores["structured_ui"] += (
+                0.08 if _targets_visual_canvas(selector, observation) else 0.3
+            )
+        if _targets_visual_canvas(selector, observation):
+            route_scores["native_vision"] += 0.12
         if action_type in _NATIVE_VISION_ACTIONS or _coordinate_action(action):
             route_scores["native_vision"] += 0.5
         canvas_likelihood = observation.capability_profile.get(
@@ -307,6 +310,18 @@ class FourLaneActionRouter:
             route_scores["native_vision"] += 0.12
         if observation.discovered_surfaces:
             route_scores["api_mcp"] += 0.12
+        app_agent = _app_agent_metadata(metadata)
+        route_scores = _apply_skill_pack_route_bias(
+            route_scores,
+            action=action,
+            observation=observation,
+            metadata=metadata,
+            app_agent=app_agent,
+            compatible_routes=compatible_routes,
+        )
+        for route in ACTION_ROUTES:
+            if route not in compatible_routes:
+                route_scores[route] = 0.0
         return {key: max(0.0, min(1.0, value)) for key, value in route_scores.items()}
 
 
@@ -333,6 +348,9 @@ class PreActionVerifier:
                 high_stakes_actions=high_stakes,
             )
         )
+        self._compile_intent: Callable[..., Any] | None = None
+        self._verify_action_intent: Callable[..., Any] | None = None
+        self._assess_action_risk: Callable[..., Any] | None = None
 
         # Phase 4 — intent verifier (lazy import to avoid circular deps)
         try:
@@ -373,15 +391,29 @@ class PreActionVerifier:
             objective=objective,
             approval_token=approval_token,
         )
+        family_policy = _family_policy_decision(
+            action,
+            proposal,
+            objective,
+            approval_token,
+        )
         if not safety.allowed:
+            if family_policy is not None:
+                return family_policy
             return _decision_from_safety(safety, proposal)
+        if family_policy is not None:
+            return family_policy
 
         # ── Layer 2: intent-constraint verifier (Phase 4) ────────────────── #
         if self._compile_intent is not None and self._verify_action_intent is not None:
             try:
                 constraints = self._compile_intent(objective)
                 intent_decision = self._verify_action_intent(
-                    action, objective, constraints, proposal, goal_lock
+                    action,
+                    objective,
+                    constraints,
+                    proposal=proposal,
+                    goal_lock=goal_lock,
                 )
                 diag = getattr(intent_decision, "diagnostician", "execute")
                 if diag in ("abort",):
@@ -422,14 +454,17 @@ class PreActionVerifier:
                             ),
                         },
                     )
-            except Exception:
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass  # never block on verifier crash
 
         # ── Layer 3: risk guardian (Phase 4) ─────────────────────────────── #
         if self._assess_action_risk is not None:
             try:
                 assessment = self._assess_action_risk(
-                    action, proposal, observation, objective
+                    action,
+                    proposal=proposal,
+                    observation=observation,
+                    objective=objective,
                 )
                 if assessment.adjusted_risk >= 0.92:
                     return PreActionDecision(
@@ -465,7 +500,7 @@ class PreActionVerifier:
                             "risk_level": assessment.risk_level,
                         },
                     )
-            except Exception:
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass  # never block on guardian crash
 
         # ── Approval gate (original) ─────────────────────────────────────── #
@@ -607,7 +642,7 @@ class AdaptiveControlLedger:
             return []
         lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
         events: list[dict[str, Any]] = []
-        for line in lines[-max(1, limit) :]:
+        for line in lines[-max(1, limit):]:
             try:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
@@ -869,6 +904,11 @@ def _focused_element(elements: Iterable[ObservationElement]) -> str:
     return ""
 
 
+def _app_agent_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    raw = metadata.get("app_agent")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
 def _max_channel_scores(
     elements: list[ObservationElement],
 ) -> dict[str, float]:
@@ -881,6 +921,187 @@ def _max_channel_scores(
                 element_scores.get(channel, 0.0),
             )
     return scores
+
+
+def _compatible_routes(
+    action: UiAction,
+    observation: ObservationFrame,
+) -> set[str]:
+    action_type = action.action_type.lower()
+    metadata = dict(action.metadata or {})
+    app_agent = _app_agent_metadata(metadata)
+    if action_type in _API_ACTIONS:
+        return {"api_mcp"}
+    if action_type in _CODE_ACTIONS:
+        return {"code_tool"}
+    if action_type in _NATIVE_VISION_ACTIONS or _coordinate_action(action):
+        return {"native_vision", "structured_ui"}
+    if action_type in _STRUCTURED_UI_ACTIONS:
+        routes = {"structured_ui"}
+        if _targets_visual_canvas(action.selector, observation):
+            routes.add("native_vision")
+        if _has_api_route_candidate(observation, app_agent):
+            routes.add("api_mcp")
+        return routes
+    return {"structured_ui", "native_vision"}
+
+
+def _select_route(
+    route_scores: dict[str, float],
+    action: UiAction,
+    observation: ObservationFrame,
+) -> str:
+    best_score = max(route_scores.values(), default=0.0)
+    candidates = [
+        route
+        for route, score in route_scores.items()
+        if abs(score - best_score) < 1e-6
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if (
+        _targets_visual_canvas(action.selector, observation)
+        and "native_vision" in candidates
+    ):
+        return "native_vision"
+    preferred = _preferred_route_from_action(action)
+    if preferred in candidates:
+        return preferred
+    for route in ("api_mcp", "code_tool", "structured_ui", "native_vision"):
+        if route in candidates:
+            return route
+    return "structured_ui"
+
+
+def _preferred_route_from_action(action: UiAction) -> str:
+    metadata = dict(action.metadata or {})
+    channel = str(metadata.get("control_channel") or "").strip().lower()
+    return {
+        "api": "api_mcp",
+        "code": "code_tool",
+        "accessibility": "structured_ui",
+        "dom": "structured_ui",
+        "clipboard": "structured_ui",
+        "ocr": "native_vision",
+        "vision": "native_vision",
+        "explore": "native_vision",
+        "native": "native_vision",
+    }.get(channel, "")
+
+
+def _apply_skill_pack_route_bias(
+    route_scores: dict[str, float],
+    *,
+    action: UiAction,
+    observation: ObservationFrame,
+    metadata: dict[str, Any],
+    app_agent: dict[str, Any],
+    compatible_routes: set[str],
+) -> dict[str, float]:
+    control_channel = str(metadata.get("control_channel") or "").strip().lower()
+    channel_route = {
+        "api": "api_mcp",
+        "code": "code_tool",
+        "accessibility": "structured_ui",
+        "dom": "structured_ui",
+        "clipboard": "structured_ui",
+        "ocr": "native_vision",
+        "vision": "native_vision",
+        "explore": "native_vision",
+        "native": "native_vision",
+    }
+    preferred = [
+        str(item or "").strip().lower()
+        for item in app_agent.get("preferred_channels") or []
+        if str(item or "").strip()
+    ]
+    for rank, channel in enumerate(preferred[:3]):
+        route = channel_route.get(channel)
+        if route is None or route not in compatible_routes:
+            continue
+        route_scores[route] += 0.16 if rank == 0 else 0.09 if rank == 1 else 0.04
+    preferred_route = channel_route.get(control_channel)
+    if preferred_route in compatible_routes:
+        route_scores[preferred_route] += 0.1
+    recommended_mode = str(app_agent.get("recommended_mode") or "").strip().lower()
+    if recommended_mode == "hybrid":
+        for route in ("structured_ui", "native_vision"):
+            if route in compatible_routes:
+                route_scores[route] += 0.03
+    elif recommended_mode == "explore" and "native_vision" in compatible_routes:
+        route_scores["native_vision"] += 0.05
+    if app_agent.get("dom_like") and "structured_ui" in compatible_routes:
+        route_scores["structured_ui"] += 0.08
+    if app_agent.get("api_like") and action.action_type.lower() in _API_ACTIONS:
+        route_scores["api_mcp"] += 0.1
+    if (
+        app_agent.get("visual_heavy")
+        and "native_vision" in compatible_routes
+        and _targets_visual_canvas(action.selector, observation)
+    ):
+        route_scores["native_vision"] += 0.28
+        if "structured_ui" in compatible_routes:
+            route_scores["structured_ui"] = max(
+                0.0,
+                route_scores["structured_ui"] - 0.04,
+            )
+    policy_action = app_agent.get("policy_action") or {}
+    if isinstance(policy_action, dict):
+        policy_metadata = policy_action.get("metadata") or {}
+        if isinstance(policy_metadata, dict):
+            memory_channel = str(
+                policy_metadata.get("control_channel")
+                or policy_metadata.get("control_route")
+                or ""
+            ).strip().lower()
+            memory_route = channel_route.get(memory_channel, memory_channel)
+            if memory_route in compatible_routes:
+                route_scores[memory_route] += 0.08
+        if _has_api_route_candidate(observation, app_agent):
+            route_scores["api_mcp"] += 0.16
+    return route_scores
+
+
+def _has_api_route_candidate(
+    observation: ObservationFrame,
+    app_agent: dict[str, Any],
+) -> bool:
+    for surface in observation.discovered_surfaces:
+        if not isinstance(surface, dict):
+            continue
+        if surface.get("workflow") or str(surface.get("endpoint") or "").strip():
+            return True
+    policy_action = app_agent.get("policy_action") or {}
+    if not isinstance(policy_action, dict):
+        return False
+    action_type = str(policy_action.get("action_type") or "").strip().lower()
+    if action_type in _API_ACTIONS:
+        return True
+    selector = str(policy_action.get("selector") or "").strip().lower()
+    policy_metadata = policy_action.get("metadata") or {}
+    if not isinstance(policy_metadata, dict):
+        policy_metadata = {}
+    control_channel = str(
+        policy_metadata.get("control_channel")
+        or policy_metadata.get("control_route")
+        or ""
+    ).strip().lower()
+    endpoint = str(policy_metadata.get("endpoint") or "").strip().lower()
+    return control_channel == "api" and bool(selector or endpoint)
+
+
+def _targets_visual_canvas(
+    selector: str,
+    observation: ObservationFrame,
+) -> bool:
+    lower_selector = str(selector or "").lower()
+    if "canvas" in lower_selector or "drawing" in lower_selector:
+        return True
+    if observation.app_context == "design_canvas":
+        return True
+    if float(observation.capability_profile.get("canvas_likelihood", 0.0)) >= 0.65:
+        return True
+    return any(element.role.lower() == "canvas" for element in observation.elements)
 
 
 def _verification_contract(action: UiAction) -> dict[str, Any]:
@@ -996,6 +1217,106 @@ def _decision_from_safety(
     )
 
 
+def _family_policy_decision(
+    action: UiAction,
+    proposal: ActionProposal,
+    objective: str,
+    approval_token: str | None,
+) -> PreActionDecision | None:
+    metadata = dict(action.metadata or {})
+    app_agent = _app_agent_metadata(metadata)
+    family = str(app_agent.get("family") or app_agent.get("app_context") or "")
+    policy = app_agent.get("action_policy") or {}
+    if not family or not isinstance(policy, dict):
+        return None
+    haystack = _action_haystack(action, objective)
+    selector = str(action.selector or "").lower()
+    action_type = action.action_type.lower()
+
+    forbidden = _matched_family_policy(
+        haystack=haystack,
+        selector=selector,
+        action_type=action_type,
+        policy=policy,
+        prefix="forbidden",
+    )
+    if forbidden:
+        return PreActionDecision(
+            allowed=False,
+            decision="abort",
+            reason=f"{family} policy forbids this action: {forbidden}.",
+            risk_score=max(proposal.risk_score, 0.9),
+            required_approval=True,
+            approval_state="not_applicable",
+            diagnostician="abort",
+            evidence={
+                "proposal_id": proposal.proposal_id,
+                "family": family,
+                "policy_match": forbidden,
+            },
+        )
+
+    approval_match = _matched_family_policy(
+        haystack=haystack,
+        selector=selector,
+        action_type=action_type,
+        policy=policy,
+        prefix="require_approval",
+    )
+    if approval_match and not approval_token:
+        return PreActionDecision(
+            allowed=False,
+            decision="confirm",
+            reason=(
+                f"{family} policy requires approval for this action: "
+                f"{approval_match}."
+            ),
+            risk_score=max(proposal.risk_score, 0.78),
+            required_approval=True,
+            approval_state="missing",
+            diagnostician="confirm",
+            evidence={
+                "proposal_id": proposal.proposal_id,
+                "family": family,
+                "policy_match": approval_match,
+            },
+        )
+    return None
+
+
+def _matched_family_policy(
+    *,
+    haystack: str,
+    selector: str,
+    action_type: str,
+    policy: dict[str, Any],
+    prefix: str,
+) -> str:
+    for candidate in _policy_terms(policy, f"{prefix}_action_types"):
+        if action_type == candidate:
+            return candidate
+    for candidate in _policy_terms(policy, f"{prefix}_selectors"):
+        if candidate in selector:
+            return candidate
+    for candidate in _policy_terms(policy, f"{prefix}_terms"):
+        if candidate in haystack:
+            return candidate
+    return ""
+
+
+def _policy_terms(policy: dict[str, Any], key: str) -> list[str]:
+    raw = policy.get(key) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    elif not isinstance(raw, list):
+        raw = list(raw) if isinstance(raw, tuple) else []
+    return [
+        str(item or "").strip().lower()
+        for item in raw
+        if str(item or "").strip()
+    ]
+
+
 def _goal_lock_conflict(
     action: UiAction,
     objective: str,
@@ -1054,6 +1375,12 @@ def _goal_lock_conflict(
 
 
 def _action_haystack(action: UiAction, objective: str) -> str:
+    metadata = dict(action.metadata or {})
+    semantic_metadata = {
+        key: _json_safe(metadata.get(key))
+        for key in ("path", "file_path", "source", "destination", "new_name", "text")
+        if key in metadata
+    }
     return " ".join(
         str(part).lower()
         for part in (
@@ -1061,7 +1388,7 @@ def _action_haystack(action: UiAction, objective: str) -> str:
             action.action_type,
             action.selector,
             action.value,
-            json.dumps(_json_safe(action.metadata), sort_keys=True),
+            json.dumps(semantic_metadata, sort_keys=True),
         )
         if part is not None
     )
@@ -1086,25 +1413,6 @@ def _coordinate_action(action: UiAction) -> bool:
         or "bounds" in metadata
         or "bbox" in metadata
         or re.match(r"^\s*(point=)?-?\d+\s*,\s*-?\d+\s*$", selector)
-    )
-
-
-def _code_task(lower_goal: str) -> bool:
-    return any(
-        cue in lower_goal
-        for cue in (
-            "analyze",
-            "analysis",
-            "stock",
-            "report",
-            "presentation",
-            "slides",
-            "chart",
-            "script",
-            "convert",
-            "generate",
-            "file",
-        )
     )
 
 

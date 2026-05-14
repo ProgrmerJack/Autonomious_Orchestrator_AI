@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 import json
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 
@@ -16,6 +18,9 @@ from agentos_orchestrator.cognition.live_fire_eval_recipes import (
 )
 from agentos_orchestrator.cognition.capability_profile import (
     CapabilityProfiler,
+)
+from agentos_orchestrator.cognition.control_surface_discovery import (
+    GenericControlSurfaceDiscoverer,
 )
 from agentos_orchestrator.cognition.control_substrate import (
     AdaptiveControlLedger,
@@ -31,6 +36,10 @@ from agentos_orchestrator.cognition.verification_contracts import (
     VerificationContract,
     ensure_verification_contract,
     verify_action_contract,
+)
+from agentos_orchestrator.cognition.tool_executor import (
+    QuantAnalysisRequest,
+    ToolExecutor,
 )
 from agentos_orchestrator.os_control.base import UiAction
 from agentos_orchestrator.os_control.selector_debug import debug_selector
@@ -89,13 +98,22 @@ class DesktopWorkflowService:
     def __init__(self, workspace_root: str | Path) -> None:
         self.planner = DesktopWorkflowPlanner()
         self.writer = WorkflowArtifactWriter(workspace_root)
-        self.programmer_lane = ProgrammerLane(workspace_root)
+        self.tool_executor = ToolExecutor(
+            self.writer.workspace_root / ".agentos",
+        )
+        self.programmer_lane = ProgrammerLane(
+            workspace_root,
+            tool_executor=self.tool_executor,
+        )
         self.reasoner = DesktopWorkflowReasoner()
         self.max_adaptive_steps = 4
         self._universal_agent: Any | None = None
         self._universal_backend_id: int | None = None
         self.capability_profiler = CapabilityProfiler()
         self.app_agent_runtime = AppAgentRuntime(self.writer.workspace_root)
+        self.control_surface_discoverer = GenericControlSurfaceDiscoverer(
+            self.writer.workspace_root,
+        )
         self.observation_builder = ObservationFrameBuilder()
         self.action_router = FourLaneActionRouter()
         self.pre_action_verifier = PreActionVerifier()
@@ -184,7 +202,7 @@ class DesktopWorkflowService:
             item["path"]: item
             for item in self.writer.materialize(
                 plan,
-                skip_paths=self.programmer_lane.reserved_paths(plan),
+                skip_paths=self._reserved_artifact_paths(plan),
             )
         }
         receipts: list[dict[str, Any]] = []
@@ -437,7 +455,14 @@ class DesktopWorkflowService:
         remaining_steps: list[Any] | None,
     ) -> tuple[str, str, UiAction]:
         selector = step.selector
-        if step.action_type not in {"launch_app", "tool"}:
+        if step.action_type not in {
+            "launch_app",
+            "tool",
+            "api_call",
+            "mcp_call",
+            "http_request",
+            "browser_devtools",
+        }:
             selector = self._preflight_selector(
                 backend,
                 step.selector,
@@ -581,7 +606,20 @@ class DesktopWorkflowService:
                 verification=verification,
                 recovery=recovery,
             )
-        return enriched
+        materialized = self._materialize_control_route(
+            enriched,
+            proposal=proposal,
+            observation=observation,
+            objective=objective,
+            app_agent=app_agent,
+        )
+        if materialized is not enriched:
+            control = dict(materialized.metadata.get("control") or control)
+            recovery["control"] = control
+            history = recovery.setdefault("control_history", [])
+            if history:
+                history[-1] = control
+        return materialized
 
     @staticmethod
     def _empty_recovery() -> dict[str, Any]:
@@ -590,6 +628,441 @@ class DesktopWorkflowService:
             "attempted": False,
             "reason": "",
         }
+
+    def _materialize_control_route(
+        self,
+        action: UiAction,
+        *,
+        proposal: Any,
+        observation: ObservationFrame,
+        objective: str,
+        app_agent: AppAgentSession | None,
+    ) -> UiAction:
+        route = str(
+            action.metadata.get("control_route") or proposal.route or ""
+        ).strip().lower()
+        replacement: UiAction | None = None
+        if route == "code_tool":
+            replacement = self._code_tool_replacement(action)
+        elif route == "api_mcp":
+            replacement = self._api_tool_replacement(
+                action,
+                observation,
+                objective,
+                app_agent,
+            )
+        if replacement is None:
+            return action
+        return self._merge_materialized_action(action, replacement, route)
+
+    def _code_tool_replacement(self, action: UiAction) -> UiAction | None:
+        request = self._workspace_file_request(action)
+        if request is None:
+            return None
+        if not self._workspace_file_request_is_actionable(request):
+            return None
+        verification_contract: dict[str, Any] = {
+            "kind": "receipt_success",
+            "expected": "The workspace file operation completes successfully.",
+            "target": "tool_executor:workflow_workspace_file_op",
+            "required": True,
+        }
+        target_path = str(request.get("target_path") or "").strip()
+        if target_path and request.get("operation") != "delete":
+            verification_contract = {
+                "kind": "file_exists",
+                "expected": f"The file exists at {target_path}.",
+                "path": target_path,
+                "required": True,
+            }
+        return UiAction(
+            action_type="tool",
+            selector="tool_executor:workflow_workspace_file_op",
+            metadata={
+                "tool_request": request,
+                "control_channel": "code",
+                "expected_observation": (
+                    "The workspace file operation completes through the "
+                    "code tool lane."
+                ),
+                "verification_contract": verification_contract,
+                "policy_anchor_action": {
+                    "action_type": action.action_type,
+                    "selector": action.selector,
+                    "value": action.value,
+                    "metadata": {
+                        **dict(action.metadata or {}),
+                        "control_channel": "code",
+                    },
+                },
+            },
+        )
+
+    def _workspace_file_request_is_actionable(
+        self,
+        request: dict[str, Any],
+    ) -> bool:
+        operation = str(request.get("operation") or "").strip().lower()
+        if operation not in {"copy", "move", "rename", "delete"}:
+            return False
+        source_raw = str(request.get("source") or "").strip()
+        if not source_raw:
+            return False
+        try:
+            source_path = self._resolve_workspace_path(source_raw)
+        except ValueError:
+            return False
+        return source_path.exists()
+
+    def _api_tool_replacement(
+        self,
+        action: UiAction,
+        observation: ObservationFrame,
+        objective: str,
+        app_agent: AppAgentSession | None,
+    ) -> UiAction | None:
+        request = self._api_tool_request(
+            action,
+            observation,
+            objective,
+            app_agent,
+        )
+        if request is None:
+            return None
+        selector = str(
+            request.get("selector") or "tool_executor:workflow_api"
+        )
+        return UiAction(
+            action_type="tool",
+            selector=selector,
+            metadata={
+                "tool_request": request,
+                "control_channel": "api",
+                "expected_observation": str(
+                    request.get("expected_observation") or ""
+                ),
+                "verification_contract": {
+                    "kind": "receipt_success",
+                    "expected": str(
+                        request.get("expected_observation") or ""
+                    ),
+                    "target": selector,
+                    "required": True,
+                },
+                "policy_anchor_action": {
+                    "action_type": "http_request",
+                    "selector": str(
+                        request.get("endpoint")
+                        or request.get("selector")
+                        or ""
+                    ),
+                    "metadata": {"control_channel": "api"},
+                },
+            },
+        )
+
+    @staticmethod
+    def _merge_materialized_action(
+        original: UiAction,
+        replacement: UiAction,
+        route: str,
+    ) -> UiAction:
+        metadata = dict(original.metadata or {})
+        metadata.update(dict(replacement.metadata or {}))
+        metadata.setdefault(
+            "original_action",
+            {
+                "action_type": original.action_type,
+                "selector": original.selector,
+                "value": original.value,
+            },
+        )
+        control = dict(metadata.get("control") or {})
+        control["executed_via_route"] = route
+        control["materialized_action_type"] = replacement.action_type
+        control["materialized_selector"] = replacement.selector
+        metadata["control"] = control
+        return UiAction(
+            action_type=replacement.action_type,
+            selector=replacement.selector,
+            value=replacement.value,
+            metadata=metadata,
+        )
+
+    def _workspace_file_request(
+        self,
+        action: UiAction,
+    ) -> dict[str, Any] | None:
+        metadata = dict(action.metadata or {})
+        operation = str(metadata.get("operation") or "").strip().lower()
+        if not operation and action.action_type.endswith("_file"):
+            operation = action.action_type[:-5]
+        if operation not in {"copy", "move", "rename", "delete"}:
+            return None
+        request: dict[str, Any] = {
+            "kind": "workspace_file_op",
+            "operation": operation,
+        }
+        source, destination = self._parse_file_operation_payload(
+            action,
+            operation,
+        )
+        if operation in {"copy", "move"}:
+            if not source or not destination:
+                return None
+            request["source"] = source
+            request["destination"] = destination
+            try:
+                request["target_path"] = str(
+                    self._resolve_workspace_path(destination),
+                )
+            except ValueError:
+                pass
+            return request
+        if operation == "rename":
+            if not source or not destination:
+                return None
+            request["source"] = source
+            request["new_name"] = destination
+            try:
+                source_path = self._resolve_workspace_path(source)
+                request["target_path"] = str(
+                    (source_path.parent / destination).resolve(),
+                )
+            except ValueError:
+                pass
+            return request
+        if not source:
+            return None
+        request["source"] = source
+        return request
+
+    @staticmethod
+    def _parse_file_operation_payload(
+        action: UiAction,
+        operation: str,
+    ) -> tuple[str, str]:
+        metadata = dict(action.metadata or {})
+        source = str(
+            metadata.get("source")
+            or metadata.get("path")
+            or metadata.get("file_path")
+            or ""
+        ).strip()
+        destination = str(
+            metadata.get("destination") or metadata.get("new_name") or ""
+        ).strip()
+        if source and destination:
+            return source, destination
+        raw_value = str(action.value or "")
+        if "->" not in raw_value:
+            return source, destination
+        left, right = raw_value.split("->", 1)
+        left = left.strip()
+        right = right.strip()
+        if not source:
+            source = left
+        if not destination:
+            destination = right
+        if operation == "delete":
+            return source or raw_value.strip(), ""
+        return source, destination
+
+    def _api_tool_request(
+        self,
+        action: UiAction,
+        observation: ObservationFrame,
+        objective: str,
+        app_agent: AppAgentSession | None,
+    ) -> dict[str, Any] | None:
+        explicit = self._explicit_api_tool_request(action, objective)
+        if explicit is not None:
+            return explicit
+        for surface in observation.discovered_surfaces:
+            if not isinstance(surface, dict):
+                continue
+            surface_metadata = dict(surface.get("metadata") or {})
+            auth_env_keys = [
+                str(item)
+                for item in surface_metadata.get("auth_env_keys", [])
+                if str(item)
+            ]
+            workflow = surface.get("workflow") or []
+            if isinstance(workflow, list) and workflow:
+                selector = str(
+                    surface.get("endpoint")
+                    or surface_metadata.get("documentation_url")
+                    or "tool_executor:workflow_api"
+                )
+                return {
+                    "kind": "api_workflow",
+                    "selector": f"tool_executor:workflow_api:{selector}",
+                    "workflow": {
+                        "steps": workflow,
+                        "headers": {},
+                        "auth_env_keys": auth_env_keys,
+                    },
+                    "auth_env_keys": auth_env_keys,
+                    "objective": objective,
+                    "expected_observation": (
+                        "The synthesized API workflow returns structured "
+                        "HTTP results."
+                    ),
+                }
+            endpoint = str(
+                surface.get("endpoint")
+                or surface_metadata.get("endpoint")
+                or ""
+            ).strip()
+            if endpoint:
+                return {
+                    "kind": "http_probe",
+                    "selector": (
+                        f"tool_executor:control_surface_probe:{endpoint}"
+                    ),
+                    "endpoint": endpoint,
+                    "methods": ["OPTIONS", "GET"],
+                    "objective": objective,
+                    "expected_observation": (
+                        "The API probe returns a structured HTTP result."
+                    ),
+                }
+        if app_agent is None:
+            return None
+        policy_action = dict(app_agent.skill_pack.policy_action or {})
+        action_type = str(
+            policy_action.get("action_type") or ""
+        ).strip().lower()
+        selector = str(policy_action.get("selector") or "").strip()
+        policy_metadata = dict(policy_action.get("metadata") or {})
+        endpoint = selector or str(
+            policy_metadata.get("endpoint") or ""
+        ).strip()
+        if action_type in {
+            "api_call",
+            "mcp_call",
+            "http_request",
+            "browser_devtools",
+        } and endpoint.startswith(("http://", "https://")):
+            return {
+                "kind": "http_probe",
+                "selector": f"tool_executor:control_surface_probe:{endpoint}",
+                "endpoint": endpoint,
+                "methods": ["OPTIONS", "GET"],
+                "objective": objective,
+                "expected_observation": (
+                    "The remembered API affordance returns a structured "
+                    "HTTP result."
+                ),
+            }
+        return None
+
+    def _explicit_api_tool_request(
+        self,
+        action: UiAction,
+        objective: str,
+    ) -> dict[str, Any] | None:
+        action_type = str(action.action_type or "").strip().lower()
+        if action_type not in {
+            "api_call",
+            "mcp_call",
+            "http_request",
+            "browser_devtools",
+        }:
+            return None
+        metadata = dict(action.metadata or {})
+        auth_env_keys = [
+            str(item)
+            for item in metadata.get("auth_env_keys", [])
+            if str(item)
+        ]
+        expected_observation = str(
+            metadata.get("expected_observation")
+            or "The direct API action returns a structured response."
+        )
+        workflow = metadata.get("workflow")
+        if isinstance(workflow, list) and workflow:
+            selector = str(
+                metadata.get("endpoint")
+                or action.selector
+                or workflow[0].get("url")
+                or "tool_executor:workflow_api"
+            )
+            headers = dict(metadata.get("headers") or {})
+            return {
+                "kind": "api_workflow",
+                "selector": f"tool_executor:workflow_api:{selector}",
+                "workflow": {
+                    "steps": workflow,
+                    "headers": headers,
+                    "auth_env_keys": auth_env_keys,
+                },
+                "auth_env_keys": auth_env_keys,
+                "objective": objective,
+                "expected_observation": expected_observation,
+            }
+
+        endpoint = str(
+            metadata.get("endpoint") or action.selector or ""
+        ).strip()
+        if not endpoint.startswith(("http://", "https://")):
+            return None
+        method = str(metadata.get("method") or "GET").strip().upper() or "GET"
+        headers = dict(metadata.get("headers") or {})
+        json_body = metadata.get("json_body")
+        if json_body is None and "body" in metadata:
+            json_body = metadata.get("body")
+        if (
+            json_body is not None
+            or method not in {"GET", "OPTIONS"}
+            or headers
+        ):
+            return {
+                "kind": "api_workflow",
+                "selector": f"tool_executor:workflow_api:{endpoint}",
+                "workflow": {
+                    "steps": [
+                        {
+                            "name": "explicit_action",
+                            "method": method,
+                            "url": endpoint,
+                            "json_body": json_body,
+                        }
+                    ],
+                    "headers": headers,
+                    "auth_env_keys": auth_env_keys,
+                },
+                "auth_env_keys": auth_env_keys,
+                "objective": objective,
+                "expected_observation": expected_observation,
+            }
+
+        methods = [
+            str(item).strip().upper()
+            for item in metadata.get("methods", [])
+            if str(item).strip()
+        ]
+        if not methods:
+            methods = ["OPTIONS", "GET"] if method == "GET" else [method]
+        return {
+            "kind": "http_probe",
+            "selector": f"tool_executor:control_surface_probe:{endpoint}",
+            "endpoint": endpoint,
+            "methods": methods,
+            "objective": objective,
+            "expected_observation": expected_observation,
+        }
+
+    def _resolve_workspace_path(self, raw_path: str) -> Path:
+        root = self.writer.workspace_root.resolve()
+        candidate = Path(raw_path)
+        candidate = candidate if candidate.is_absolute() else root / candidate
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(
+                f"Path '{raw_path}' escapes the workspace root.",
+            )
+        return resolved
 
     def _preflight_selector(
         self,
@@ -725,7 +1198,7 @@ class DesktopWorkflowService:
             objective,
             recovery,
         )
-        retry_receipt = backend.perform(retry_action)
+        retry_receipt = self._perform_action(backend, retry_action)
         return retry_selector, retry_receipt, retry_action
 
     def _observation_frame(
@@ -744,17 +1217,90 @@ class DesktopWorkflowService:
         )
         capability_profile = profile.to_prompt_dict()
         capability_profile["app_agent"] = app_agent.asdict()
+        discovered_surfaces = self._discover_control_surfaces(
+            profile,
+            nodes,
+            objective,
+            app_agent,
+        )
         frame = self.observation_builder.build(
             nodes=nodes,
             backend_name=backend_name,
             abstract_state=state,
             previous=self._last_observation_frame,
             capability_profile=capability_profile,
+            discovered_surfaces=discovered_surfaces,
         )
         if frame.app_context == "unknown":
             frame.app_context = app_agent.skill_pack.app_context
         self._last_observation_frame = frame
         return frame
+
+    def _discover_control_surfaces(
+        self,
+        profile: Any,
+        nodes: list[Any],
+        objective: str,
+        app_agent: AppAgentSession,
+    ) -> list[dict[str, Any]]:
+        if not self._should_discover_control_surfaces(objective, app_agent):
+            return []
+        candidates = self.control_surface_discoverer.discover(
+            profile,
+            nodes,
+            objective,
+            preferred_channels=list(app_agent.skill_pack.preferred_channels),
+            active_fingerprinting=self._should_probe_control_surfaces(
+                objective,
+                app_agent,
+            ),
+        )
+        return [asdict(candidate) for candidate in candidates[:5]]
+
+    @staticmethod
+    def _should_discover_control_surfaces(
+        objective: str,
+        app_agent: AppAgentSession,
+    ) -> bool:
+        lower = str(objective or "").lower()
+        if any(
+            keyword in lower
+            for keyword in (
+                "api",
+                "endpoint",
+                "graphql",
+                "json",
+                "webhook",
+                "developer",
+                "service",
+                "server",
+            )
+        ):
+            return True
+        if app_agent.skill_pack.api_like:
+            return True
+        policy_action = dict(app_agent.skill_pack.policy_action or {})
+        return str(policy_action.get("action_type") or "").lower() in {
+            "api_call",
+            "mcp_call",
+            "http_request",
+            "browser_devtools",
+        }
+
+    @staticmethod
+    def _should_probe_control_surfaces(
+        objective: str,
+        app_agent: AppAgentSession,
+    ) -> bool:
+        lower = str(objective or "").lower()
+        if any(
+            keyword in lower
+            for keyword in ("localhost", "port", "graphql")
+        ):
+            return True
+        policy_action = dict(app_agent.skill_pack.policy_action or {})
+        selector = str(policy_action.get("selector") or "")
+        return selector.startswith(("http://", "https://"))
 
     def _record_control_completion(
         self,
@@ -852,8 +1398,432 @@ class DesktopWorkflowService:
 
     def _perform_action(self, backend: Any, action: UiAction) -> str:
         if action.action_type == "tool":
-            return self.programmer_lane.execute_action(action)
+            return self._perform_tool_action(action)
         return backend.perform(action)
+
+    def _perform_tool_action(self, action: UiAction) -> str:
+        if action.selector == "tool_executor:workflow_programmer":
+            return self.programmer_lane.execute_action(action)
+        request = action.metadata.get("tool_request")
+        if not isinstance(request, dict):
+            return json.dumps(
+                {
+                    "status": "invalid-tool-request",
+                    "success": False,
+                    "error": "Missing workflow tool request metadata.",
+                },
+                sort_keys=True,
+            )
+        kind = str(request.get("kind") or "").strip().lower()
+        if kind == "workspace_file_op":
+            return self._execute_workspace_file_op(request)
+        if kind == "workflow_research_brief":
+            return self._execute_workflow_research_request(request)
+        if kind in {"api_workflow", "http_probe"}:
+            return self._execute_api_tool_request(request)
+        return json.dumps(
+            {
+                "status": "invalid-tool-request",
+                "success": False,
+                "error": f"Unsupported workflow tool kind '{kind}'.",
+            },
+            sort_keys=True,
+        )
+
+    def _execute_workspace_file_op(self, request: dict[str, Any]) -> str:
+        operation = str(request.get("operation") or "").strip().lower()
+        try:
+            source = self._resolve_workspace_path(
+                str(request.get("source") or ""),
+            )
+            destination = None
+            if operation in {"copy", "move"}:
+                destination = self._resolve_workspace_path(
+                    str(request.get("destination") or ""),
+                )
+            elif operation == "rename":
+                new_name = str(request.get("new_name") or "").strip()
+                if not new_name:
+                    raise ValueError(
+                        "Rename operation requires a new_name field.",
+                    )
+                destination = (source.parent / new_name).resolve()
+                if not destination.is_relative_to(
+                    self.writer.workspace_root.resolve(),
+                ):
+                    raise ValueError(
+                        "Rename target escapes the workspace root.",
+                    )
+
+            if operation == "copy":
+                if destination is None:
+                    raise ValueError("Copy operation requires a destination.")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, destination, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(source, destination)
+            elif operation == "move":
+                if destination is None:
+                    raise ValueError("Move operation requires a destination.")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+            elif operation == "rename":
+                if destination is None:
+                    raise ValueError(
+                        "Rename operation requires a destination.",
+                    )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(destination)
+            elif operation == "delete":
+                if source.is_dir():
+                    shutil.rmtree(source)
+                else:
+                    source.unlink()
+            else:
+                raise ValueError(
+                    f"Unsupported workspace file operation '{operation}'."
+                )
+        except (OSError, ValueError) as exc:
+            return json.dumps(
+                {
+                    "status": "tool_error",
+                    "success": False,
+                    "operation": operation,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+
+        file_op: dict[str, Any] = {
+            "operation": operation,
+            "source": str(request.get("source") or ""),
+            "status": "completed",
+        }
+        if operation in {"copy", "move"}:
+            file_op["destination"] = str(request.get("destination") or "")
+        elif operation == "rename":
+            file_op["new_name"] = str(request.get("new_name") or "")
+        return json.dumps(
+            {
+                "status": "file-op-executed",
+                "success": True,
+                "operation": operation,
+                "file_op": file_op,
+            },
+            sort_keys=True,
+        )
+
+    def _execute_workflow_research_request(self, request: dict[str, Any]) -> str:
+        from agentos_orchestrator.research.deep_research import DeepResearchEngine
+
+        objective = str(request.get("objective") or "").strip()
+        query = str(request.get("query") or objective).strip()
+        output_path_raw = str(request.get("output_path") or "").strip()
+        if not output_path_raw:
+            return json.dumps(
+                {
+                    "status": "invalid-tool-request",
+                    "success": False,
+                    "error": "workflow_research_brief requires an output_path.",
+                },
+                sort_keys=True,
+            )
+        try:
+            output_path = self._resolve_workspace_path(output_path_raw)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "status": "tool_error",
+                    "success": False,
+                    "kind": "workflow_research_brief",
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+
+        try:
+            per_provider_limit = max(
+                1,
+                min(8, int(request.get("per_provider_limit") or 4)),
+            )
+        except (TypeError, ValueError):
+            per_provider_limit = 4
+        try:
+            max_sources = max(1, min(20, int(request.get("max_sources") or 8)))
+        except (TypeError, ValueError):
+            max_sources = 8
+
+        engine = DeepResearchEngine(
+            self.writer.workspace_root,
+            limit_per_provider=per_provider_limit,
+            timeout_seconds=15,
+        )
+        providers = self._workflow_research_providers(engine, query)
+        try:
+            sources = engine._search_query_across_providers(
+                query,
+                providers,
+                per_provider_limit,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return json.dumps(
+                {
+                    "status": "tool_error",
+                    "success": False,
+                    "kind": "workflow_research_brief",
+                    "query": query,
+                    "providers": sorted(providers),
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+
+        curated_sources = self._dedupe_research_sources(sources)[:max_sources]
+        if not curated_sources:
+            return json.dumps(
+                {
+                    "status": "no_sources",
+                    "success": False,
+                    "kind": "workflow_research_brief",
+                    "query": query,
+                    "providers": sorted(providers),
+                    "error": "No provider-backed sources were retrieved.",
+                },
+                sort_keys=True,
+            )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        content = self._workflow_research_brief_markdown(
+            objective,
+            query,
+            curated_sources,
+            sorted(providers),
+        )
+        output_path.write_text(content, encoding="utf-8")
+        relative_path = self._workspace_relative_path(output_path)
+        generated_outputs = [
+            {
+                "path": relative_path,
+                "kind": "research-brief",
+                "description": "Provider-backed workflow research brief.",
+                "bytes": output_path.stat().st_size,
+            }
+        ]
+        return json.dumps(
+            {
+                "status": "success",
+                "success": True,
+                "kind": "workflow_research_brief",
+                "query": query,
+                "providers": sorted(providers),
+                "source_count": len(curated_sources),
+                "generated_outputs": generated_outputs,
+            },
+            sort_keys=True,
+        )
+
+    def _execute_api_tool_request(self, request: dict[str, Any]) -> str:
+        kind = str(request.get("kind") or "").strip().lower()
+        objective = str(request.get("objective") or "")
+        auth_env_keys = [
+            str(item)
+            for item in request.get("auth_env_keys", [])
+            if str(item)
+        ]
+        if kind == "api_workflow":
+            code = self.tool_executor.build_api_workflow_code(
+                dict(request.get("workflow") or {}),
+            )
+        elif kind == "http_probe":
+            code = self.tool_executor.build_http_probe_code(
+                [str(request.get("endpoint") or "")],
+                methods=[
+                    str(item)
+                    for item in request.get("methods", [])
+                    if str(item)
+                ],
+            )
+        else:
+            return json.dumps(
+                {
+                    "status": "invalid-tool-request",
+                    "success": False,
+                    "error": f"Unsupported API tool kind '{kind}'.",
+                },
+                sort_keys=True,
+            )
+        result = self.tool_executor.run(
+            QuantAnalysisRequest(
+                objective=objective or f"Workflow {kind} execution",
+                code=code,
+                allow_network=True,
+                timeout_seconds=20,
+                expose_env_keys=auth_env_keys,
+            ),
+        )
+        parsed_payload = self._api_tool_payload(kind, result.parsed_results)
+        success = bool(result.success and parsed_payload)
+        return json.dumps(
+            {
+                "status": "success" if success else "tool_error",
+                "success": success,
+                "kind": kind,
+                "endpoint": str(request.get("endpoint") or ""),
+                "tool_result": {
+                    "success": result.success,
+                    "stdout": result.stdout[-4000:],
+                    "stderr": result.stderr[-1000:],
+                    "error": result.error,
+                    "parsed_results": result.parsed_results,
+                    "artefacts": [str(path) for path in result.artefacts],
+                    "elapsed_ms": result.elapsed_ms,
+                },
+                "payload": parsed_payload,
+            },
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _api_tool_payload(kind: str, parsed_results: dict[str, Any]) -> Any:
+        if kind == "api_workflow":
+            payload = parsed_results.get("api_workflow")
+            if isinstance(payload, list) and payload:
+                if any(
+                    item.get("error")
+                    for item in payload
+                    if isinstance(item, dict)
+                ):
+                    return None
+                return payload
+            return None
+        payload = parsed_results.get("control_probe")
+        if not isinstance(payload, dict) or not payload:
+            return None
+        for endpoint_result in payload.values():
+            if not isinstance(endpoint_result, dict):
+                continue
+            if any(
+                not isinstance(method_result, dict)
+                or method_result.get("error")
+                for method_result in endpoint_result.values()
+            ):
+                continue
+            return payload
+        return None
+
+    def _reserved_artifact_paths(self, plan: Any) -> set[str]:
+        reserved = set(self.programmer_lane.reserved_paths(plan))
+        for artifact in getattr(plan, "artifacts", []) or []:
+            if getattr(artifact, "kind", "") == "research-brief":
+                reserved.add(str(getattr(artifact, "path", "")))
+        return reserved
+
+    @staticmethod
+    def _workflow_research_providers(engine: Any, query: str) -> set[str]:
+        if engine._looks_like_market_query(query):
+            return {
+                "sec-edgar",
+                "earnings-data",
+                "financial-portals",
+                "stockanalysis",
+                "fed-macro",
+                "google-news-rss",
+                "web-search",
+                "bing-search",
+                "seeking-alpha",
+            }
+        if engine._looks_like_academic_query(query):
+            return {
+                "openalex",
+                "semantic-scholar",
+                "crossref",
+                "web-search",
+                "bing-search",
+                "google-news-rss",
+            }
+        providers = {"web-search", "bing-search", "google-news-rss"}
+        if engine._looks_like_software_agent_query(query):
+            providers.add("github-repositories")
+        return providers
+
+    @staticmethod
+    def _dedupe_research_sources(sources: list[Any]) -> list[Any]:
+        deduped: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+        for source in sources:
+            url = str(getattr(source, "url", "") or "").strip()
+            title = str(getattr(source, "title", "") or "").strip().lower()
+            key = (url, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(source)
+        return deduped
+
+    @classmethod
+    def _workflow_research_brief_markdown(
+        cls,
+        objective: str,
+        query: str,
+        sources: list[Any],
+        providers: list[str],
+    ) -> str:
+        lines = [
+            "# Workflow Research Brief",
+            "",
+            "## Objective",
+            objective or query,
+            "",
+            "## Query",
+            query,
+            "",
+            "## Coverage",
+            (
+                f"Collected {len(sources)} provider-backed sources across "
+                f"{', '.join(providers)} before any browser-first UI handoff."
+            ),
+            "",
+            "## Sources",
+        ]
+        for index, source in enumerate(sources, start=1):
+            title = str(getattr(source, "title", "") or getattr(source, "url", "source"))
+            url = str(getattr(source, "url", "") or "")
+            provider = str(getattr(source, "provider", "unknown") or "unknown")
+            year = getattr(source, "year", None)
+            claim = cls._workflow_source_claim(source)
+            lines.extend(
+                [
+                    f"{index}. [{title}]({url})",
+                    f"   Provider: {provider}" + (f" | Year: {year}" if year else ""),
+                    f"   Evidence: {claim}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "## Next Step",
+                "Use this brief as the evidence-backed handoff input for any later authoring or app interaction.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _workflow_source_claim(source: Any) -> str:
+        evidence = getattr(source, "evidence", None)
+        if callable(evidence):
+            claim = str((evidence() or {}).get("claim") or "").strip()
+            if claim:
+                return claim
+        abstract = str(getattr(source, "abstract", "") or "").strip()
+        if abstract:
+            compact = re.sub(r"\s+", " ", abstract)
+            return compact[:240]
+        return str(getattr(source, "url", "") or "source snippet unavailable")
+
+    def _workspace_relative_path(self, path: Path) -> str:
+        return path.resolve().relative_to(self.writer.workspace_root.resolve()).as_posix()
 
     @staticmethod
     def _annotate_action_runtime(

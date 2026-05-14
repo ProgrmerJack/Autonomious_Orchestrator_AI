@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class AppFamilySpec:
     recommended_mode: str = "ui"
     clipboard_base: float = 0.55
     latency_base: float = 0.45
+    action_policy: dict[str, Any] = field(default_factory=dict)
     extra_metadata: dict[str, str] = field(default_factory=dict)
 
 
@@ -56,6 +58,36 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         recommended_mode="hybrid",
         clipboard_base=0.7,
         latency_base=0.7,
+        action_policy={
+            "require_approval_terms": (
+                "checkout",
+                "purchase",
+                "buy now",
+                "confirm payment",
+                "authorize payment",
+                "upload file",
+                "download file",
+            ),
+            "require_approval_selectors": (
+                "checkout",
+                "purchase",
+                "buy now",
+                "confirm payment",
+                "upload",
+                "download",
+            ),
+            "forbidden_terms": (
+                "install extension",
+                "add extension",
+                "grant persistent permission",
+                "allow notifications",
+            ),
+            "forbidden_selectors": (
+                "install extension",
+                "add extension",
+                "allow notifications",
+            ),
+        },
     ),
     AppFamilySpec(
         family="file_explorer",
@@ -101,6 +133,35 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         safe_windows=True,
         live_fire=True,
         api_like=True,
+        action_policy={
+            "require_approval_terms": (
+                "overwrite existing file",
+                "replace existing file",
+                "upload file",
+                "attach file",
+                "save outside workspace",
+                "open outside workspace",
+            ),
+            "require_approval_selectors": (
+                "overwrite",
+                "replace",
+                "upload",
+                "attach",
+            ),
+            "forbidden_terms": (
+                "c:\\windows\\system32",
+                "program files",
+                "appdata\\roaming",
+                "\\.ssh\\",
+                "id_rsa",
+                "secret",
+            ),
+            "forbidden_selectors": (
+                "system32",
+                ".ssh",
+                "id_rsa",
+            ),
+        },
     ),
     AppFamilySpec(
         family="terminal",
@@ -211,6 +272,30 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         affordance_hints=("message composer", "send button", "thread list"),
         verification_contracts=("field_contains", "receipt_success", "state_changed"),
         repair_recipes=("focus composer", "paste large text", "verify message echo"),
+        action_policy={
+            "require_approval_terms": (
+                "send",
+                "post",
+                "publish",
+                "share",
+                "invite",
+            ),
+            "require_approval_selectors": (
+                "send",
+                "post",
+                "publish",
+                "share",
+            ),
+            "forbidden_terms": (
+                "channel broadcast",
+                "mass notify",
+                "notify everyone",
+            ),
+            "forbidden_selectors": (
+                "channel broadcast",
+                "mass notify",
+            ),
+        },
         clipboard_base=0.7,
         latency_base=0.7,
     ),
@@ -286,6 +371,33 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         api_like=True,
         recommended_mode="hybrid",
         latency_base=0.7,
+        action_policy={
+            "require_approval_terms": (
+                "submit order",
+                "place order",
+                "buy",
+                "sell",
+                "trade",
+                "confirm order",
+            ),
+            "require_approval_selectors": (
+                "submit order",
+                "place order",
+                "buy",
+                "sell",
+                "confirm",
+            ),
+            "forbidden_terms": (
+                "disable risk limits",
+                "wire transfer",
+                "withdraw all",
+            ),
+            "forbidden_selectors": (
+                "disable risk limits",
+                "wire transfer",
+                "withdraw all",
+            ),
+        },
     ),
     AppFamilySpec(
         family="enterprise_grid",
@@ -313,6 +425,33 @@ APP_FAMILY_SPECS: tuple[AppFamilySpec, ...] = (
         ),
         live_fire=True,
         api_like=True,
+        action_policy={
+            "require_approval_terms": (
+                "bulk delete",
+                "mass update",
+                "approve all",
+                "export all",
+                "close case",
+                "delete record",
+            ),
+            "require_approval_selectors": (
+                "bulk delete",
+                "mass update",
+                "approve all",
+                "export all",
+                "close case",
+                "delete",
+            ),
+            "forbidden_terms": (
+                "purge tenant",
+                "disable audit",
+                "drop table",
+            ),
+            "forbidden_selectors": (
+                "purge tenant",
+                "disable audit",
+            ),
+        },
     ),
     AppFamilySpec(
         family="unknown",

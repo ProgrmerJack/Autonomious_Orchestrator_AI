@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 from agentos_orchestrator import cli
+from agentos_orchestrator.research import ResearchBrief, ResearchSource
 
 
 class DashboardEventLoopPolicyTests(unittest.TestCase):
@@ -82,6 +83,48 @@ class DashboardEventLoopPolicyTests(unittest.TestCase):
 
         set_policy.assert_called_once()
         self.assertIsInstance(set_policy.call_args.args[0], selector_policy)
+
+
+class ReplayMergeCliTests(unittest.TestCase):
+    def test_replay_merge_dispatches_to_deep_research_engine(self) -> None:
+        brief = ResearchBrief(
+            objective="checkpoint objective",
+            query="checkpoint objective",
+            summary="replayed summary",
+            sources=[
+                ResearchSource(
+                    provider="web-search",
+                    title="Checkpoint Source",
+                    url="https://example.org/checkpoint-source",
+                )
+            ],
+            artifacts=["runs/run_merge/research/synthesis_packet.json"],
+            confidence=0.75,
+            metadata={"replay_mode": "detached-merge-only"},
+        )
+
+        with (
+            mock.patch.object(cli, "DeepResearchEngine") as engine_cls,
+            mock.patch("builtins.print") as print_mock,
+        ):
+            engine_cls.return_value.replay_detached_merge.return_value = brief
+
+            exit_code = cli.main(
+                [
+                    "replay-merge",
+                    "--run-id",
+                    "run_merge",
+                    "--workspace-root",
+                    "workspace",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        engine_cls.assert_called_once()
+        engine_cls.return_value.replay_detached_merge.assert_called_once_with(
+            "run_merge"
+        )
+        print_mock.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import urllib.parse
+from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -178,6 +179,418 @@ class ResearchPlanningSynthesisMixin:
             ],
         }
 
+    @staticmethod
+    def _ordered_unique_text(items: list[str], limit: int | None = None) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+            if limit is not None and len(values) >= max(int(limit), 1):
+                break
+        return values
+
+    def _shard_durable_notes(
+        self,
+        durable_notes: str,
+        shard_urls: set[str],
+        limit_chars: int = 6_000,
+    ) -> str:
+        if not durable_notes.strip() or not shard_urls:
+            return ""
+        matched_lines: list[str] = []
+        current_heading = ""
+        for raw_line in durable_notes.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("### Pass "):
+                current_heading = line
+                continue
+            if not any(url in line for url in shard_urls):
+                continue
+            if current_heading and (
+                not matched_lines or matched_lines[-1] != current_heading
+            ):
+                matched_lines.append(current_heading)
+            matched_lines.append(line)
+        if not matched_lines:
+            return ""
+        payload = "\n".join(
+            ["# Durable Research Report", "", "## Incremental Findings", "", *matched_lines]
+        )
+        return payload[:limit_chars].rstrip()
+
+    def _build_shard_synthesis_packets(
+        self,
+        objective: str,
+        query: str,
+        sources: list[ResearchSource],
+        depth: str,
+        plan: dict[str, Any] | None,
+        durable_notes: str,
+        synthesis_mode: str,
+        *,
+        shard_count: int = 1,
+        frontier_shards: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        total_shards = max(
+            1,
+            int(shard_count or len(frontier_shards or []) or 1),
+        )
+        shard_lookup = {
+            int(item.get("shard_index") or 0): dict(item)
+            for item in (frontier_shards or [])
+            if isinstance(item, dict)
+        }
+        grouped_sources: dict[int, list[ResearchSource]] = {
+            index: [] for index in range(total_shards)
+        }
+        for source in sources:
+            shard_key = str(source.url or source.title or query or objective)
+            shard_index = self._frontier_shard_index(shard_key, total_shards)
+            grouped_sources.setdefault(shard_index, []).append(source)
+
+        packets: list[dict[str, Any]] = []
+        for shard_index in range(total_shards):
+            shard_sources = sorted(
+                grouped_sources.get(shard_index) or [],
+                key=lambda item: float(item.score or 0.0),
+                reverse=True,
+            )
+            shard_urls = {
+                str(source.url or "").strip()
+                for source in shard_sources
+                if str(source.url or "").strip()
+            }
+            shard_notes = self._shard_durable_notes(durable_notes, shard_urls)
+            packet = self._build_synthesis_packet(
+                objective,
+                query,
+                shard_sources,
+                depth,
+                plan,
+                shard_notes,
+                synthesis_mode,
+            )
+            frontier_summary = dict(shard_lookup.get(shard_index) or {})
+            packet.update(
+                {
+                    "packet_kind": "shard-synthesis-packet",
+                    "packet_version": 1,
+                    "merge_ready": True,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "shard_index": shard_index,
+                    "source_count_in_shard": len(shard_sources),
+                    "frontier_summary": {
+                        "backlog_status": str(
+                            frontier_summary.get("backlog_status") or "low"
+                        ),
+                        "queue_total": int(frontier_summary.get("queue_total") or 0),
+                        "observation_total": int(
+                            frontier_summary.get("observation_total") or 0
+                        ),
+                        "assigned_query_variants": list(
+                            frontier_summary.get("assigned_query_variants") or []
+                        ),
+                        "assigned_seed_urls": list(
+                            frontier_summary.get("assigned_seed_urls") or []
+                        ),
+                        "sample_urls": list(frontier_summary.get("sample_urls") or []),
+                        "processed_urls": list(
+                            frontier_summary.get("processed_urls") or []
+                        ),
+                        "pending_queries": list(
+                            frontier_summary.get("pending_queries") or []
+                        ),
+                        "top_domains": list(frontier_summary.get("top_domains") or []),
+                    },
+                }
+            )
+            packets.append(packet)
+        return packets
+
+    def _merge_shard_perspective_coverage(
+        self,
+        shard_packets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        covered: list[str] = []
+        missing: list[str] = []
+        total = 0
+        for packet in shard_packets:
+            coverage = dict(packet.get("perspective_coverage") or {})
+            total = max(total, int(coverage.get("total") or 0))
+            covered.extend(str(item) for item in (coverage.get("covered") or []))
+            missing.extend(str(item) for item in (coverage.get("missing") or []))
+        covered = self._ordered_unique_text(covered)
+        missing = [item for item in self._ordered_unique_text(missing) if item not in covered]
+        total = max(total, len(covered) + len(missing))
+        return {
+            "count": len(covered),
+            "total": total,
+            "covered": covered,
+            "missing": missing,
+        }
+
+    def _merge_shard_findings(
+        self,
+        shard_packets: list[dict[str, Any]],
+        *,
+        limit: int = 16,
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for packet in shard_packets:
+            for finding in packet.get("findings") or []:
+                if not isinstance(finding, dict):
+                    continue
+                perspective = str(finding.get("perspective") or "General").strip()
+                finding_text = str(finding.get("finding") or "").strip()
+                if not finding_text:
+                    continue
+                key = (
+                    f"{self._normalize_title(perspective)}|"
+                    f"{self._normalize_title(finding_text)[:180]}"
+                )
+                current = merged.get(key)
+                if current is None:
+                    merged[key] = {
+                        **finding,
+                        "perspective": perspective,
+                        "finding": finding_text,
+                        "support_count": int(finding.get("support_count") or 0),
+                        "contradiction_count": int(
+                            finding.get("contradiction_count") or 0
+                        ),
+                    }
+                    continue
+                current["support_count"] = int(current.get("support_count") or 0) + int(
+                    finding.get("support_count") or 0
+                )
+                current["contradiction_count"] = int(
+                    current.get("contradiction_count") or 0
+                ) + int(finding.get("contradiction_count") or 0)
+                if self._finding_confidence_rank(
+                    str(finding.get("confidence") or "")
+                ) > self._finding_confidence_rank(str(current.get("confidence") or "")):
+                    current["confidence"] = str(finding.get("confidence") or "")
+                for field in ("supporting_urls", "contradicting_urls", "source_urls"):
+                    current_values = [str(item) for item in (current.get(field) or [])]
+                    incoming_values = [str(item) for item in (finding.get(field) or [])]
+                    merged_values = self._ordered_unique_text(
+                        current_values + incoming_values,
+                        limit=12,
+                    )
+                    if merged_values:
+                        current[field] = merged_values
+        merged_findings = sorted(
+            merged.values(),
+            key=lambda item: (
+                -self._finding_confidence_rank(str(item.get("confidence") or "")),
+                -int(item.get("support_count") or 0),
+                int(item.get("contradiction_count") or 0),
+                str(item.get("perspective") or ""),
+                str(item.get("finding") or ""),
+            ),
+        )
+        return merged_findings[: max(int(limit), 1)]
+
+    def _merge_shard_top_sources(
+        self,
+        objective: str,
+        depth: str,
+        synthesis_mode: str,
+        shard_packets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for packet in shard_packets:
+            for source in packet.get("top_sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                title = str(source.get("title") or "Untitled").strip()
+                url = str(source.get("url") or "").strip()
+                key = url or self._normalize_title(title)
+                candidate = {
+                    "provider": str(source.get("provider") or "unknown"),
+                    "title": title,
+                    "url": url,
+                    "year": source.get("year"),
+                    "evidence_grade": str(source.get("evidence_grade") or "ungraded"),
+                    "score": round(float(source.get("score") or 0.0), 3),
+                    "abstract": str(source.get("abstract") or "")[:240],
+                }
+                current = merged.get(key)
+                if current is None:
+                    merged[key] = candidate
+                    continue
+                current_rank = (
+                    float(current.get("score") or 0.0),
+                    self._evidence_grade_rank(str(current.get("evidence_grade") or "")),
+                    int(current.get("year") or 0),
+                    len(str(current.get("abstract") or "")),
+                )
+                candidate_rank = (
+                    float(candidate.get("score") or 0.0),
+                    self._evidence_grade_rank(str(candidate.get("evidence_grade") or "")),
+                    int(candidate.get("year") or 0),
+                    len(str(candidate.get("abstract") or "")),
+                )
+                if candidate_rank > current_rank:
+                    merged[key] = candidate
+        ranked = sorted(
+            merged.values(),
+            key=lambda item: (
+                -float(item.get("score") or 0.0),
+                -self._evidence_grade_rank(str(item.get("evidence_grade") or "")),
+                -int(item.get("year") or 0),
+                str(item.get("title") or ""),
+                str(item.get("url") or ""),
+            ),
+        )
+        source_limit = self._synthesis_source_limit(
+            depth,
+            len(ranked),
+            synthesis_mode,
+            objective,
+        )
+        return ranked[:source_limit] if source_limit > 0 else []
+
+    def _synthesis_packet_sources(
+        self,
+        synthesis_packet: dict[str, Any],
+    ) -> list[ResearchSource]:
+        sources: list[ResearchSource] = []
+        for item in synthesis_packet.get("top_sources") or []:
+            if not isinstance(item, dict):
+                continue
+            year = item.get("year")
+            sources.append(
+                ResearchSource(
+                    provider=str(item.get("provider") or "unknown"),
+                    title=str(item.get("title") or "Untitled"),
+                    url=str(item.get("url") or ""),
+                    year=int(year) if isinstance(year, int) else None,
+                    abstract=str(item.get("abstract") or ""),
+                    score=float(item.get("score") or 0.0),
+                    evidence_grade=str(item.get("evidence_grade") or "ungraded"),
+                )
+            )
+        return sources
+
+    def _merge_shard_synthesis_packets(
+        self,
+        objective: str,
+        query: str,
+        depth: str,
+        plan: dict[str, Any] | None,
+        durable_notes: str,
+        synthesis_mode: str,
+        shard_packets: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        packets = [dict(packet) for packet in shard_packets if isinstance(packet, dict)]
+        provider_counts: dict[str, int] = {}
+        for packet in packets:
+            for provider, count in dict(packet.get("provider_counts") or {}).items():
+                provider_key = str(provider or "unknown").strip() or "unknown"
+                provider_counts[provider_key] = provider_counts.get(provider_key, 0) + int(
+                    count or 0
+                )
+        merged_top_sources = self._merge_shard_top_sources(
+            objective,
+            depth,
+            synthesis_mode,
+            packets,
+        )
+        merged_findings = self._merge_shard_findings(packets)
+        merged_perspective_coverage = self._merge_shard_perspective_coverage(packets)
+        market_signals = self._ordered_unique_text(
+            [
+                str(item)
+                for packet in packets
+                for item in (packet.get("market_signals") or [])
+            ],
+            limit=24,
+        )
+        shard_manifest = [
+            {
+                "shard_index": int(packet.get("shard_index") or 0),
+                "merge_ready": bool(packet.get("merge_ready", True)),
+                "source_count_in_shard": int(
+                    packet.get("source_count_in_shard")
+                    or packet.get("total_ranked_sources")
+                    or 0
+                ),
+                "synthesis_source_count": int(
+                    packet.get("synthesis_source_count") or 0
+                ),
+                "backlog_status": str(
+                    ((packet.get("frontier_summary") or {}).get("backlog_status"))
+                    or "low"
+                ),
+                "queue_total": int(
+                    ((packet.get("frontier_summary") or {}).get("queue_total")) or 0
+                ),
+                "assigned_query_variants": list(
+                    ((packet.get("frontier_summary") or {}).get("assigned_query_variants"))
+                    or []
+                ),
+                "sample_urls": list(
+                    ((packet.get("frontier_summary") or {}).get("sample_urls")) or []
+                ),
+            }
+            for packet in packets
+        ]
+        coordinator = {
+            "mode": "detached-shard-merge",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "objective": objective,
+            "query": query,
+            "depth": depth,
+            "synthesis_mode": synthesis_mode,
+            "shard_count": len(packets),
+            "merge_ready_packet_count": sum(
+                1 for packet in packets if bool(packet.get("merge_ready", True))
+            ),
+            "non_empty_shards": sum(
+                1
+                for packet in packets
+                if int(packet.get("source_count_in_shard") or packet.get("total_ranked_sources") or 0)
+                > 0
+            ),
+            "total_ranked_sources": sum(
+                int(packet.get("total_ranked_sources") or 0) for packet in packets
+            ),
+            "synthesis_source_count": len(merged_top_sources),
+            "merge_fields": [
+                "provider_counts",
+                "perspective_coverage",
+                "findings",
+                "market_signals",
+                "top_sources",
+            ],
+            "shards": shard_manifest,
+        }
+        merged_packet = {
+            "objective": objective,
+            "query": query,
+            "depth": depth,
+            "synthesis_mode": synthesis_mode,
+            "total_ranked_sources": coordinator["total_ranked_sources"],
+            "synthesis_source_count": len(merged_top_sources),
+            "durable_notes_available": bool(durable_notes.strip())
+            or any(bool(packet.get("durable_notes_available")) for packet in packets),
+            "provider_counts": provider_counts,
+            "perspective_coverage": merged_perspective_coverage,
+            "findings": merged_findings,
+            "market_signals": market_signals,
+            "top_sources": merged_top_sources,
+            "merge_coordinator": coordinator,
+            "shard_packets": shard_manifest,
+        }
+        return merged_packet, coordinator
+
     def _summarize(
         self,
         objective: str,
@@ -187,6 +600,7 @@ class ResearchPlanningSynthesisMixin:
         query: str = "",
         durable_notes: str = "",
         synthesis_mode: str = "hybrid",
+        coverage: dict[str, Any] | None = None,
         synthesis_packet: dict[str, Any] | None = None,
     ) -> str:
         if not sources:
@@ -195,6 +609,29 @@ class ResearchPlanningSynthesisMixin:
                 f"providers for: {objective}. Check network policy, API "
                 "availability, or attach MCP research servers."
             )
+        coverage_hint = coverage or {}
+        if coverage_hint:
+            source_count = int(coverage_hint.get("source_count") or len(sources))
+            provider_count = int(coverage_hint.get("provider_count") or 0)
+            strong_count = int(coverage_hint.get("strong_or_moderate") or 0)
+            weak_ratio = float(coverage_hint.get("weak_ratio") or 1.0)
+            perspective_ratio = float(coverage_hint.get("perspective_ratio") or 0.0)
+            on_topic_ratio = float(coverage_hint.get("on_topic_ratio") or 0.0)
+            if (
+                source_count < 4
+                or provider_count < 2
+                or strong_count < 1
+                or weak_ratio > 0.75
+                or perspective_ratio < 0.5
+                or on_topic_ratio < 0.65
+            ):
+                return self._coverage_failure_summary(
+                    objective,
+                    coverage_hint,
+                    stop_reason=str(
+                        (synthesis_packet or {}).get("retrieval_stop_reason") or ""
+                    ),
+                )
         packet = synthesis_packet or self._build_synthesis_packet(
             objective,
             query,
@@ -1283,7 +1720,17 @@ class ResearchPlanningSynthesisMixin:
         sources: list[ResearchSource],
         plan: dict[str, Any],
         pc_context_info: dict[str, Any],
+        retrieval: dict[str, Any] | None = None,
     ) -> str:
+        coverage = dict((retrieval or {}).get("coverage") or {})
+        stop_reason = str((retrieval or {}).get("stop_reason") or "")
+        frontier_schedule = dict((retrieval or {}).get("detached_frontier") or {})
+        detached_merge = dict((retrieval or {}).get("detached_merge") or {})
+        frontier_shards = [
+            dict(item)
+            for item in ((retrieval or {}).get("frontier_shards") or [])
+            if isinstance(item, dict)
+        ]
         lines = [
             "# Deep Research Analysis Report",
             "",
@@ -1297,6 +1744,30 @@ class ResearchPlanningSynthesisMixin:
             "",
             "Subquestions:",
         ]
+        if coverage:
+            lines.extend(
+                [
+                    "## Coverage Diagnostics",
+                    "",
+                    f"Stop reason: {stop_reason or 'unknown'}",
+                    (
+                        "Coverage: "
+                        f"sources={int(coverage.get('source_count') or 0)}, "
+                        f"providers={int(coverage.get('provider_count') or 0)}, "
+                        f"strong_or_moderate={int(coverage.get('strong_or_moderate') or 0)}, "
+                        f"weak_ratio={float(coverage.get('weak_ratio') or 0.0):.2f}, "
+                        f"on_topic_ratio={float(coverage.get('on_topic_ratio') or 0.0):.2f}, "
+                        f"perspective_ratio={float(coverage.get('perspective_ratio') or 0.0):.2f}"
+                    ),
+                    "",
+                ]
+            )
+            missing = list(coverage.get("missing_perspectives") or [])
+            if missing:
+                lines.append("Missing perspectives:")
+                for item in missing:
+                    lines.append(f"- {item}")
+                lines.append("")
         for item in plan["subquestions"]:
             lines.append(f"- {item}")
 
@@ -1337,6 +1808,71 @@ class ResearchPlanningSynthesisMixin:
             for label in pc_context_info["top_labels"]:
                 lines.append(f"- {label}")
             lines.append("")
+
+        if frontier_schedule:
+            lines.extend(
+                [
+                    "## Detached Frontier Schedule",
+                    "",
+                    (
+                        f"Mode: {frontier_schedule.get('mode') or 'detached-frontier'}; "
+                        f"backend: {frontier_schedule.get('backend') or 'unknown'}; "
+                        f"shards: {int(frontier_schedule.get('shard_count') or 0)}; "
+                        f"queue_total: {int(frontier_schedule.get('queue_total') or 0)}; "
+                        f"observations: {int(frontier_schedule.get('observation_total') or 0)}; "
+                        f"active_workers: {int(frontier_schedule.get('active_worker_count') or 0)}"
+                    ),
+                    "",
+                ]
+            )
+            if frontier_shards:
+                lines.append("Shard summaries:")
+                for shard in frontier_shards:
+                    shard_index = int(shard.get("shard_index") or 0)
+                    assigned_queries = list(shard.get("assigned_query_variants") or [])
+                    sample_urls = list(shard.get("sample_urls") or [])
+                    lines.append(
+                        "- "
+                        f"Shard {shard_index}: backlog={shard.get('backlog_status') or 'low'}; "
+                        f"queue_total={int(shard.get('queue_total') or 0)}; "
+                        f"observations={int(shard.get('observation_total') or 0)}; "
+                        f"assigned_queries={len(assigned_queries)}; "
+                        "sample_urls="
+                        f"{', '.join(sample_urls[:2]) or 'none'}"
+                    )
+                lines.append("")
+
+        if detached_merge:
+            lines.extend(
+                [
+                    "## Detached Merge Coordinator",
+                    "",
+                    (
+                        f"Mode: {detached_merge.get('mode') or 'detached-shard-merge'}; "
+                        f"shards: {int(detached_merge.get('shard_count') or 0)}; "
+                        f"merge_ready_packets: {int(detached_merge.get('merge_ready_packet_count') or 0)}; "
+                        f"non_empty_shards: {int(detached_merge.get('non_empty_shards') or 0)}; "
+                        f"merged_sources: {int(detached_merge.get('synthesis_source_count') or 0)}"
+                    ),
+                    "",
+                ]
+            )
+            shard_rows = [
+                dict(item)
+                for item in (detached_merge.get("shards") or [])
+                if isinstance(item, dict)
+            ]
+            if shard_rows:
+                lines.append("Merge shard inputs:")
+                for shard in shard_rows:
+                    lines.append(
+                        "- "
+                        f"Shard {int(shard.get('shard_index') or 0)}: "
+                        f"sources={int(shard.get('source_count_in_shard') or 0)}, "
+                        f"queue_total={int(shard.get('queue_total') or 0)}, "
+                        f"backlog={shard.get('backlog_status') or 'low'}"
+                    )
+                lines.append("")
 
         lines.extend(
             [
@@ -1386,11 +1922,103 @@ class ResearchPlanningSynthesisMixin:
         )
         for prefix in prefixes:
             cleaned = cleaned.replace(prefix, "")
+        cleaned = cls._best_query_focus_clause(cleaned)
         diagnostic_queries = cls._software_agent_diagnostic_queries(cleaned)
         if diagnostic_queries:
             return diagnostic_queries[0]
         distilled = cls._query_core_terms(cleaned)
         return distilled[:240].strip() or cleaned[:240].strip() or objective[:240]
+
+    @classmethod
+    def _best_query_focus_clause(cls, objective: str) -> str:
+        """Pick the clause that carries the actual research subject.
+
+        User prompts often prepend orchestration verbs ("rerun", "tune recall",
+        "assess quality") before the true research clause.  For retrieval we want
+        the clause with the strongest domain-bearing evidence terms, not the
+        workflow wrapper around it.
+        """
+        normalized = re.sub(r"\s+", " ", objective).strip(" ,.;:-")
+        if not normalized:
+            return ""
+        clauses = [
+            re.sub(r"\s+", " ", part).strip(" ,.;:-")
+            for part in re.split(r"(?:\n+|(?<=[.!?;])\s+)", normalized)
+            if re.sub(r"\s+", " ", part).strip(" ,.;:-")
+        ]
+        if len(clauses) <= 1:
+            return normalized
+
+        market_terms = (
+            "publicly traded",
+            "public company",
+            "public companies",
+            "stocks",
+            "shares",
+            "ticker",
+            "earnings",
+            "guidance",
+            "valuation",
+            "price target",
+            "analyst",
+            "10-k",
+            "10-q",
+            "8-k",
+        )
+        software_terms = (
+            "agent",
+            "agents",
+            "browser",
+            "desktop",
+            "sandbox",
+            "routing",
+            "retrieval",
+            "benchmark",
+        )
+        orchestration_terms = (
+            "tune",
+            "rerun",
+            "run",
+            "launch",
+            "ensure",
+            "assess",
+            "evaluate",
+            "judge",
+            "quality",
+            "provider-side",
+            "recall",
+            "exact",
+            "end-to-end",
+            "full analyst-style",
+            "report generation",
+        )
+
+        best_clause = normalized
+        best_score = float("-inf")
+        for clause in clauses:
+            lower = clause.lower()
+            token_count = len(
+                re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b", lower)
+            )
+            score = min(token_count, 24) / 12.0
+            if cls._looks_like_public_security_query(clause):
+                score += 10.0
+            elif cls._looks_like_market_query(clause):
+                score += 7.0
+            elif cls._looks_like_software_agent_diagnostic_objective(clause):
+                score += 6.0
+            score += 1.5 * len(_extract_ticker_candidates(clause))
+            score += sum(1.5 for term in market_terms if term in lower)
+            score += sum(1.0 for term in software_terms if term in lower)
+            score -= sum(1.0 for term in orchestration_terms if term in lower)
+            if lower.startswith(
+                ("tune ", "rerun ", "run ", "launch ", "ensure ", "assess ")
+            ) and not cls._looks_like_public_security_query(clause):
+                score -= 2.0
+            if score > best_score:
+                best_score = score
+                best_clause = clause
+        return best_clause or normalized
 
     @classmethod
     def _software_agent_diagnostic_queries(cls, objective: str) -> list[str]:
@@ -1773,6 +2401,42 @@ class ResearchPlanningSynthesisMixin:
         core = cls._query_core_terms(query)
         if not core:
             return []
+
+        if cls._looks_like_public_security_query(query):
+            is_current = cls._looks_like_current_evidence_query(query)
+            variants = [
+                core,
+                f"{core} primary evidence",
+                *(
+                    [
+                        f"{core} latest filings analyst revisions timeline",
+                        f"{core} current price targets earnings today",
+                        f"{core} near-term catalysts this month",
+                    ]
+                    if is_current
+                    else []
+                ),
+                f"{core} sec filings 10-k 10-q 8-k",
+                f"{core} earnings guidance revenue growth",
+                f"{core} analyst price target revisions",
+                f"{core} valuation multiples ev ebitda pe",
+                f"{core} upcoming catalysts product launch contract win",
+                f"{core} short interest insider buying selling",
+                f"{core} balance sheet debt free cash flow",
+            ]
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for variant in variants:
+                candidate = cls._normalize_research_plan_query(variant, query)
+                if not candidate:
+                    continue
+                normalized = cls._normalize_title(candidate)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                deduped.append(candidate)
+            limit = 4 if depth == "quick" else 8 if depth == "standard" else 14
+            return deduped[:limit]
 
         max_variants = 4 if depth == "quick" else 8 if depth == "standard" else 14
         math_mode = cls._looks_like_math_query(query)

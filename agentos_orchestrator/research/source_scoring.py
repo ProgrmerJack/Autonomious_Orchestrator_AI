@@ -187,6 +187,8 @@ class ResearchSourceScoringMixin:
             "community",
             "contact",
             "download",
+            "filing",
+            "filings",
             "free",
             "home",
             "info",
@@ -415,14 +417,17 @@ class ResearchSourceScoringMixin:
                     "software-product",
                     "benchmark",
                     "documentation",
+                    "academic-topic",
                 ),
                 accepted_evidence_kinds=(
                     "repository",
                     "benchmark",
                     "documentation",
+                    "developer-docs",
                     "issue",
                     "release-note",
                     "technical-blog",
+                    "academic-paper",
                 ),
                 rejected_evidence_kinds=("app-listing", "map-story"),
                 required_context_terms=(
@@ -705,6 +710,23 @@ class ResearchSourceScoringMixin:
         spec = cls._intent_spec(query)
         if spec.mode == "general":
             return True
+        if source.provider == "gemini-flash":
+            combined = cls._strip_dom_noise_tokens(
+                f"{source.title} {source.abstract}"
+            ).lower()
+            if not combined:
+                return False
+            if spec.required_context_terms and not any(
+                term in combined for term in spec.required_context_terms
+            ):
+                if spec.mode in {"market", "public-company-market"}:
+                    if cls._market_signal_strength(combined) < 2 and (
+                        cls._objective_alignment_score(combined, query) < 0.2
+                    ):
+                        return False
+                else:
+                    return False
+            return True
         cls._assign_source_semantics(source, query)
         if source.evidence_kind in spec.rejected_evidence_kinds:
             return False
@@ -761,6 +783,12 @@ class ResearchSourceScoringMixin:
         spec = cls._intent_spec(query)
         if spec.mode == "general":
             return True
+        if spec.mode == "software-agent":
+            lower = cls._strip_dom_noise_tokens(text).lower()
+            return bool(lower) and (
+                not spec.required_context_terms
+                or any(term in lower for term in spec.required_context_terms)
+            )
         probe = ResearchSource(
             provider="intent-probe",
             title=(text or "")[:200],
@@ -786,10 +814,19 @@ class ResearchSourceScoringMixin:
             term in lower for term in spec.required_context_terms
         ):
             if spec.mode in {"market", "public-company-market"}:
-                if cls._market_signal_strength(variant) < 2:
+                entity_terms = cls._entity_terms_from_query(query)
+                company_binding = cls._extract_company_binding(query).lower()
+                has_entity = any(term in lower for term in entity_terms) or (
+                    bool(company_binding) and company_binding in lower
+                )
+                if cls._market_signal_strength(variant) < 2 and not (
+                    has_entity and cls._objective_alignment_score(variant, query) >= 0.2
+                ):
                     return False
             else:
                 return False
+        if spec.mode in {"market", "public-company-market"}:
+            return True
         if spec.mode == "software-agent":
             # Query variants for software/agent discovery are text-only probes;
             # requiring full source-semantic classification is over-strict here.
@@ -839,6 +876,8 @@ class ResearchSourceScoringMixin:
             existing.abstract = source.abstract
         existing.citation_count = max(existing.citation_count, source.citation_count)
         existing.score = max(existing.score, source.score)
+        if {existing.provider, source.provider} == {"seed-url", "web-search"}:
+            existing.provider = "web-search"
     @classmethod
     def _source_identity_keys(cls, source: ResearchSource) -> list[str]:
         keys: list[str] = []
@@ -1746,17 +1785,6 @@ class ResearchSourceScoringMixin:
             candidate = " ".join(tokens)
             if len(candidate) >= 3:
                 matched.add(candidate)
-        if cls._looks_like_public_security_query(query):
-            if "publicly traded" in lower or "public company" in lower:
-                matched.update({"publicly traded", "public company"})
-            if "public companies" in lower:
-                matched.add("public companies")
-            if "listed company" in lower or "listed companies" in lower:
-                matched.add("listed company")
-            if "stock" in lower or "stocks" in lower:
-                matched.add("stocks")
-            if "equity" in lower or "equities" in lower:
-                matched.add("equity")
         return matched
     @staticmethod
     def _quality_summary(sources: list[ResearchSource]) -> str:
@@ -1945,24 +1973,118 @@ class ResearchSourceScoringMixin:
     @staticmethod
     def _generic_query_terms() -> set[str]:
         return _generic_query_terms_policy()
+
+    @staticmethod
+    def _generic_market_comparison_terms() -> set[str]:
+        return {
+            "among",
+            "best",
+            "highest",
+            "lowest",
+            "most",
+            "next",
+            "month",
+            "months",
+            "over",
+            "potential",
+            "probability",
+            "probability-adjusted",
+            "adjusted",
+            "top",
+            "upside",
+            "downside",
+            "year",
+            "years",
+        }
+
+    @staticmethod
+    def _anchor_present(term: str, lower_text: str, words: set[str]) -> bool:
+        normalized = term.strip().lower()
+        if not normalized:
+            return False
+        if " " in normalized:
+            return normalized in lower_text
+        return normalized in words
+
     @classmethod
     def _objective_anchor_terms(cls, query: str) -> set[str]:
         stopwords = cls._generic_query_terms()
-        return {
+        anchors = {
             token
             for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", query.lower())
             if token not in stopwords
         }
+        spec = cls._intent_spec(query)
+        if spec.mode in {"market", "public-company-market"}:
+            anchors -= cls._generic_market_comparison_terms()
+            atomic_market_terms = {
+                "10-k",
+                "10-q",
+                "8-k",
+                "analyst",
+                "earnings",
+                "equities",
+                "equity",
+                "filing",
+                "guidance",
+                "revenue",
+                "share",
+                "shares",
+                "stock",
+                "stocks",
+                "ticker",
+                "valuation",
+            }
+            for phrase in spec.required_context_terms:
+                normalized = phrase.strip().lower()
+                if not normalized:
+                    continue
+                anchors.add(normalized)
+                for token in re.findall(
+                    r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b",
+                    normalized,
+                ):
+                    if (
+                        token in atomic_market_terms
+                        and token not in stopwords
+                        and token not in cls._generic_market_comparison_terms()
+                    ):
+                        anchors.add(token)
+            if spec.mode == "public-company-market" and not cls._extract_company_binding(
+                query
+            ):
+                anchors.update(
+                    {
+                        "public company",
+                        "public companies",
+                        "publicly traded",
+                        "listed company",
+                        "analyst",
+                        "earnings",
+                        "guidance",
+                        "valuation",
+                        "price target",
+                        "filing",
+                    }
+                )
+        return {term for term in anchors if term and term not in stopwords}
+
     @classmethod
     def _objective_alignment_score(cls, text: str, query: str) -> float:
         anchors = cls._objective_anchor_terms(query)
-        entity_terms = cls._entity_terms_from_query(query)
+        entity_terms = {term.lower() for term in cls._entity_terms_from_query(query)}
         lower_text = text.lower()
         words = {token for token in re.findall(r"\b[a-z][a-z0-9-]{2,}\b", lower_text)}
         if not words and not lower_text.strip():
             return 0.0
-        overlap = len(anchors & words)
-        overlap += sum(1 for term in entity_terms if term and term in lower_text)
+        overlap = sum(
+            1 for term in anchors if cls._anchor_present(term, lower_text, words)
+        )
+        overlap += sum(
+            1
+            for term in entity_terms
+            if cls._anchor_present(term, lower_text, words)
+        )
         denominator = len(anchors) + len(entity_terms)
         if denominator <= 0:
             return 0.0

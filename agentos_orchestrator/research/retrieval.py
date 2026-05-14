@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import gc
 import html
 import json
 import os
@@ -18,8 +20,37 @@ from .models import (
     extract_ticker_candidates as _extract_ticker_candidates,
 )
 
+# --- Memory-pressure root-cause caps (overheat fix) -------------------------
+# These caps are *upper bounds on retained-in-RAM state*, not capability caps.
+# Capability (max_sources, retrieval passes, parallel workers, URL chaining)
+# is preserved; we only stop holding stale data after it has been folded into
+# the durable on-disk report.  Values can be overridden via env for tuning.
+_CHAINED_SOURCES_RAM_CAP = int(
+    os.environ.get("AGENTOS_CHAINED_SOURCES_RAM_CAP", "512") or 512
+)
+_ALL_SOURCES_RAM_CAP = int(
+    os.environ.get("AGENTOS_ALL_SOURCES_RAM_CAP", "2048") or 2048
+)
+_SOURCE_ABSTRACT_RAM_CAP = int(
+    os.environ.get("AGENTOS_SOURCE_ABSTRACT_RAM_CAP", "1800") or 1800
+)
+_GC_EVERY_N_PASSES = int(os.environ.get("AGENTOS_GC_EVERY_N_PASSES", "1") or 1)
+_SEMANTIC_GATE_CACHE_RAM_CAP = int(
+    os.environ.get("AGENTOS_SEMANTIC_GATE_CACHE_RAM_CAP", "4096") or 4096
+)
+
 
 class ResearchRetrievalMixin:
+    def _remember_semantic_gate_result(self, cache_key: str, value: bool) -> None:
+        cache = self._semantic_gate_cache
+        if cache_key in cache:
+            cache.pop(cache_key, None)
+        elif _SEMANTIC_GATE_CACHE_RAM_CAP > 0 and len(cache) >= _SEMANTIC_GATE_CACHE_RAM_CAP:
+            oldest = next(iter(cache), None)
+            if oldest is not None:
+                cache.pop(oldest, None)
+        cache[cache_key] = value
+
     def _iterative_retrieval(
         self,
         query: str,
@@ -60,6 +91,10 @@ class ResearchRetrievalMixin:
             plan["query_plan"][: settings.max_query_variants * 4],
             query,
         )
+        if not all_variants:
+            all_variants = self._query_variants(query, settings.depth)[
+                : settings.max_query_variants * 4
+            ]
         # Artificial runtime floors removed — depth is driven by
         # information exhaustion (enrichment, citation chasing, gap analysis)
         # not wall-clock timers.
@@ -206,6 +241,29 @@ class ResearchRetrievalMixin:
             # of the 1000+ URL fetch mechanism.
             chained = getattr(self, "_chained_sources", [])
             if chained:
+                # Bound retained chained sources to prevent unbounded RAM growth
+                # across 48-pass multi-hour runs.  Lower-priority chained URLs
+                # are persisted into the crawl queue/durable report and dropped
+                # from RAM; the next pass re-claims them via the persistent
+                # crawl queue, so capability is preserved.
+                if len(chained) > _CHAINED_SOURCES_RAM_CAP:
+                    chained_sorted = sorted(
+                        chained,
+                        key=lambda s: float(getattr(s, "score", 0.0) or 0.0),
+                        reverse=True,
+                    )
+                    keep = chained_sorted[:_CHAINED_SOURCES_RAM_CAP]
+                    overflow = chained_sorted[_CHAINED_SOURCES_RAM_CAP:]
+                    # Re-enqueue overflow into the persistent crawl queue so it
+                    # is *not lost* — capability preserved, RAM bounded.
+                    self._enqueue_url_batch(
+                        [c.url for c in overflow if getattr(c, "url", "")],
+                        query,
+                        run_id,
+                        source_url="",
+                        priority=0.5,
+                    )
+                    chained = keep
                 all_sources.extend(chained)
                 self._chained_sources = []
 
@@ -472,7 +530,8 @@ class ResearchRetrievalMixin:
                 "elapsed_seconds": round(time.monotonic() - started_at, 1),
             }
             retrieval_passes.append(pass_record)
-            if starvation_streak >= 2:
+            starvation_persisted = starvation_streak >= 2
+            if starvation_persisted:
                 pivot_queries = self._domain_diversification_queries(
                     plan.get("core_question") or query,
                     selected,
@@ -526,6 +585,34 @@ class ResearchRetrievalMixin:
                         except (OSError, json.JSONDecodeError, TypeError, ValueError):
                             progress_history = []
                     progress_history.append(dict(pass_record))
+                    checkpoint_summary = self._write_periodic_synthesis_checkpoint(
+                        run_id=run_id,
+                        objective=str(plan.get("core_question") or query),
+                        query=query,
+                        settings=settings,
+                        query_variants=self._reported_query_variants(
+                            all_variants,
+                            query,
+                            settings.max_query_variants,
+                        ),
+                        plan=plan,
+                        pc_context_info=self._pc_context_summary(pc_context),
+                        retrieval={
+                            "coverage": dict(coverage),
+                            "passes": list(progress_history),
+                            "stop_reason": "",
+                            "query_variants": self._reported_query_variants(
+                                all_variants,
+                                query,
+                                settings.max_query_variants,
+                            ),
+                        },
+                        synthesis_mode=self._resolve_final_synthesis_mode(
+                            settings.depth,
+                            self._load_durable_notes(run_id),
+                        ),
+                        sources=selected,
+                    )
                     progress_path.write_text(
                         json.dumps(
                             {
@@ -540,6 +627,7 @@ class ResearchRetrievalMixin:
                                 "stage": "retrieval-active",
                                 "stop_reason": None,
                                 "recent_queries": pass_variants[:3],
+                                **checkpoint_summary,
                                 "passes": progress_history,
                                 "last_updated": datetime.now(UTC).isoformat(),
                             },
@@ -603,7 +691,11 @@ class ResearchRetrievalMixin:
                     "coverage": coverage,
                     "passes": retrieval_passes,
                     "stop_reason": stop_reason,
-                    "query_variants": all_variants,
+                    "query_variants": self._reported_query_variants(
+                        all_variants,
+                        query,
+                        settings.max_query_variants,
+                    ),
                 }
             if (
                 low_novelty_pass
@@ -615,7 +707,10 @@ class ResearchRetrievalMixin:
             if (
                 low_marginal_yield_pass
                 and depth_met
-                and not source_starved
+                and (
+                    not source_starved
+                    or starvation_persisted
+                )
                 and low_marginal_yield_streak >= max_low_marginal_yield_streak
             ):
                 stop_reason = "marginal_yield_exhausted"
@@ -683,6 +778,40 @@ class ResearchRetrievalMixin:
                     )
             all_variants = self._sanitize_query_variants(all_variants, query)
 
+            # --- MEMORY HYGIENE (overheat root-cause fix) ----------------
+            # After every pass, evict surplus sources that have already been
+            # written to the durable on-disk report.  We keep the top-ranked
+            # working set in RAM (capability for ranking/dedup/diversity) and
+            # spill the long tail to the persistent crawl queue so it can be
+            # re-claimed in later passes without holding it in RAM.
+            if len(all_sources) > _ALL_SOURCES_RAM_CAP:
+                ranked_for_evict = self._rank_sources(
+                    self._dedupe_sources(all_sources), query
+                )
+                keep = ranked_for_evict[:_ALL_SOURCES_RAM_CAP]
+                evicted = ranked_for_evict[_ALL_SOURCES_RAM_CAP:]
+                if evicted:
+                    self._enqueue_url_batch(
+                        [s.url for s in evicted if getattr(s, "url", "")],
+                        query,
+                        run_id,
+                        source_url="",
+                        priority=0.3,
+                    )
+                all_sources = list(keep)
+            # Trim abstract bytes on retained sources: real content is already
+            # in the durable report; we only need a snippet for ranking.
+            for _s in all_sources:
+                _abs = getattr(_s, "abstract", "") or ""
+                if len(_abs) > _SOURCE_ABSTRACT_RAM_CAP:
+                    _s.abstract = _abs[:_SOURCE_ABSTRACT_RAM_CAP]
+            # Force a generational GC so transient HTML/JSON blobs from this
+            # pass are released before the next pass spawns more Playwright
+            # contexts.  This is the single biggest lever against the
+            # "RAM creep -> swap thrash -> fan ramp" overheat signature.
+            if _GC_EVERY_N_PASSES > 0 and (pass_index % _GC_EVERY_N_PASSES == 0):
+                gc.collect()
+
         if passing_snapshot is not None:
             selected = self._finalize_selected_sources(
                 list(passing_snapshot["selected"]),
@@ -705,7 +834,11 @@ class ResearchRetrievalMixin:
                     if stop_reason == "max_passes_reached"
                     else stop_reason
                 ),
-                "query_variants": all_variants[: settings.max_query_variants],
+                "query_variants": self._reported_query_variants(
+                    all_variants,
+                    query,
+                    settings.max_query_variants,
+                ),
             }
 
         ranked = self._rank_sources(self._dedupe_sources(all_sources), query)
@@ -727,8 +860,39 @@ class ResearchRetrievalMixin:
             "coverage": coverage,
             "passes": retrieval_passes,
             "stop_reason": stop_reason,
-            "query_variants": all_variants[: settings.max_query_variants],
+            "query_variants": self._reported_query_variants(
+                all_variants,
+                query,
+                settings.max_query_variants,
+            ),
         }
+
+    def _reported_query_variants(
+        self,
+        variants: list[str],
+        query: str,
+        limit: int,
+    ) -> list[str]:
+        deduped = self._sanitize_query_variants(variants, query)
+        if len(deduped) <= limit:
+            return deduped
+
+        head_limit = min(max(3, limit // 3), limit)
+        reported = list(deduped[:head_limit])
+        seen = {self._normalize_title(item) for item in reported}
+
+        tail: list[str] = []
+        for candidate in reversed(deduped):
+            normalized = self._normalize_title(candidate)
+            if not normalized or normalized in seen:
+                continue
+            tail.append(candidate)
+            seen.add(normalized)
+            if len(reported) + len(tail) >= limit:
+                break
+
+        reported.extend(reversed(tail))
+        return reported[:limit]
 
     @staticmethod
     def _max_low_marginal_yield_streak(
@@ -1503,37 +1667,63 @@ class ResearchRetrievalMixin:
             from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
         except ImportError:
             return None
+        # Persistent context support: when AGENTOS_BROWSER_USER_DATA_DIR is
+        # set, we reuse a single Chromium profile across all research runs.
+        # This preserves cookies/sessions for sites that require login
+        # (Bloomberg, WSJ, FT, Seeking Alpha) and dramatically reduces
+        # cold-start latency on subsequent fetches.
+        user_data_dir = os.environ.get(
+            "AGENTOS_BROWSER_USER_DATA_DIR", ""
+        ).strip()
+        launch_args = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-extensions",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1280,900",
+        ]
+        context_kwargs: dict[str, Any] = {
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "viewport": {"width": 1280, "height": 900},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "extra_http_headers": {
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+            },
+        }
         try:
             playwright = sync_playwright().start()
+            if user_data_dir:
+                # Persistent context: browser+context fused.  Cookies and
+                # localStorage are persisted to disk under user_data_dir.
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
+                    args=launch_args,
+                    **context_kwargs,
+                )
+                return {
+                    "playwright": playwright,
+                    "browser": None,
+                    "context": context,
+                    "persistent": True,
+                }
             browser = playwright.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-extensions",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--window-size=1280,900",
-                ],
+                args=launch_args,
             )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="America/New_York",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                },
-            )
+            context = browser.new_context(**context_kwargs)
             return {
                 "playwright": playwright,
                 "browser": browser,
                 "context": context,
+                "persistent": False,
             }
         except Exception:
             return None
@@ -1606,6 +1796,25 @@ class ResearchRetrievalMixin:
         safe_urls = self._persistent_unique_urls(urls)
         if not safe_urls:
             return {}
+        prefetch_plan = self._headless_browser_prefetch_plan(
+            len(safe_urls),
+            max_chars,
+        )
+        effective_url_limit = int(prefetch_plan.get("url_limit") or 0)
+        if effective_url_limit <= 0:
+            return {}
+        effective_max_chars = int(prefetch_plan.get("max_chars") or max_chars)
+        if len(safe_urls) > effective_url_limit:
+            self._record_provider_diagnostic(
+                "browser-prefetch-budget",
+                "capped",
+                (
+                    f"limited browser prefetch from {len(safe_urls)} to "
+                    f"{effective_url_limit} urls at {effective_max_chars} "
+                    f"chars per url to bound transient RAM."
+                ),
+            )
+        safe_urls = safe_urls[:effective_url_limit]
         worker_count = self._headless_browser_pool_size(len(safe_urls))
         if worker_count <= 0:
             return {}
@@ -1615,7 +1824,52 @@ class ResearchRetrievalMixin:
             render_with_context=self._render_browser_page_with_context,
             bundle_cleanup=self._close_headless_browser_bundle,
         )
-        return pool.render_many(safe_urls, max_chars, timeout_ms)
+        return pool.render_many(safe_urls, effective_max_chars, timeout_ms)
+
+    def _headless_browser_prefetch_plan(
+        self,
+        url_count: int,
+        max_chars: int,
+    ) -> dict[str, int]:
+        if url_count <= 0:
+            return {
+                "url_limit": 0,
+                "max_chars": 0,
+                "total_chars": 0,
+            }
+        caps = self._local_browser_pressure_caps()
+        requested_max_chars = max(1_000, int(max_chars or 1_000))
+        per_url_cap = max(
+            1_000,
+            int(caps.get("headless_prefetch_per_url_chars") or requested_max_chars),
+        )
+        effective_max_chars = min(requested_max_chars, per_url_cap)
+        configured_url_limit = max(
+            1,
+            int(caps.get("headless_prefetch_url_limit") or url_count),
+        )
+        total_chars_cap = max(
+            0,
+            int(
+                caps.get("headless_prefetch_total_chars")
+                or effective_max_chars * configured_url_limit
+            ),
+        )
+        budget_url_limit = configured_url_limit
+        if total_chars_cap > 0:
+            budget_url_limit = max(
+                1,
+                total_chars_cap // max(effective_max_chars, 1),
+            )
+        effective_url_limit = min(url_count, configured_url_limit, budget_url_limit)
+        effective_total_chars = effective_url_limit * effective_max_chars
+        if total_chars_cap > 0:
+            effective_total_chars = min(total_chars_cap, effective_total_chars)
+        return {
+            "url_limit": effective_url_limit,
+            "max_chars": effective_max_chars,
+            "total_chars": effective_total_chars,
+        }
 
     def _get_text_browser(
         self,
@@ -1968,13 +2222,13 @@ class ResearchRetrievalMixin:
 
         deterministic = self._passes_deterministic_semantic_gate(sample, query)
         if deterministic:
-            self._semantic_gate_cache[cache_key] = True
+            self._remember_semantic_gate_result(cache_key, True)
             return True
         anchors = self._objective_anchor_terms(query)
         words = set(re.findall(r"\b[a-z][a-z0-9-]{2,}\b", sample.lower()))
         overlap = len(anchors & words) if anchors else 0
         if anchors and overlap == 0:
-            self._semantic_gate_cache[cache_key] = False
+            self._remember_semantic_gate_result(cache_key, False)
             return False
 
         # Optional LLM arbitration for ambiguous edge cases.
@@ -1993,11 +2247,11 @@ class ResearchRetrievalMixin:
                 .upper()
             )
             allowed = decision.startswith("TRUE")
-            self._semantic_gate_cache[cache_key] = allowed
+            self._remember_semantic_gate_result(cache_key, allowed)
             return allowed
 
         allowed = overlap >= 1 and not self._has_dom_noise_pattern(sample)
-        self._semantic_gate_cache[cache_key] = allowed
+        self._remember_semantic_gate_result(cache_key, allowed)
         return allowed
 
     @classmethod
@@ -2452,6 +2706,8 @@ class ResearchRetrievalMixin:
         url: str,
         client: Any | None = None,
     ) -> dict[str, Any]:
+        if type(self)._get_json is not ResearchRetrievalMixin._get_json:
+            return await asyncio.to_thread(self._get_json, url)
         try:
             import httpx  # type: ignore[import-not-found]
         except ImportError:

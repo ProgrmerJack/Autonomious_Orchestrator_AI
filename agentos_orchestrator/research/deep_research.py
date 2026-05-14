@@ -65,6 +65,7 @@ class DeepResearchEngine(
         self._crawl_broker_url_override = crawl_broker_url
         self._crawl_broker_token_override = crawl_broker_token
         self.provider_diagnostics: list[dict[str, Any]] = []
+        self._provider_diagnostic_overflow = 0
         self._durable_note_urls: set[str] = set()
         self._durable_note_passes: set[int] = set()
         self._dotenv_loaded = False
@@ -83,6 +84,7 @@ class DeepResearchEngine(
         evidence_targets: dict[str, Any] | None = None,
     ) -> ResearchBrief:
         self.provider_diagnostics = []
+        self._provider_diagnostic_overflow = 0
         self._durable_note_urls = set()
         self._durable_note_passes = set()
         self._semantic_gate_cache = {}
@@ -157,11 +159,18 @@ class DeepResearchEngine(
             planning_context,
             pc_context,
         )
+        is_market_objective = self._looks_like_market_query(
+            " ".join(part for part in (research_objective, query) if part).strip()
+        )
         discovery_seed_urls = self._live_discovery_seed_urls(
             research_objective,
             query,
             list(plan.get("query_plan") or []),
-            limit=min(24, max(8, settings.max_sources // 3)),
+            limit=self._discovery_url_limit(
+                research_objective,
+                max(24, min(256, max(8, settings.max_sources // 3))),
+                is_market=is_market_objective,
+            ),
         )
         if discovery_seed_urls:
             seed_urls = self._persistent_unique_urls(seed_urls + discovery_seed_urls)
@@ -216,7 +225,16 @@ class DeepResearchEngine(
             settings.depth,
             durable_notes,
         )
-        synthesis_packet = self._build_synthesis_packet(
+        frontier_schedule_payload, frontier_shard_payload, frontier_shard_markdown = (
+            self._detached_frontier_schedule(
+                research_objective,
+                query,
+                list(query_variants or []),
+                plan,
+                retrieval,
+            )
+        )
+        shard_synthesis_packets = self._build_shard_synthesis_packets(
             research_objective,
             query,
             selected,
@@ -224,15 +242,33 @@ class DeepResearchEngine(
             plan,
             durable_notes,
             synthesis_mode,
+            shard_count=int(
+                (frontier_schedule_payload or {}).get("shard_count")
+                or len(frontier_shard_payload or [])
+                or 1
+            ),
+            frontier_shards=frontier_shard_payload,
         )
+        synthesis_packet, merge_coordinator = self._merge_shard_synthesis_packets(
+            research_objective,
+            query,
+            settings.depth,
+            plan,
+            durable_notes,
+            synthesis_mode,
+            shard_synthesis_packets,
+        )
+        synthesis_packet["retrieval_stop_reason"] = retrieval["stop_reason"]
+        summary_sources = self._synthesis_packet_sources(synthesis_packet) or selected
         summary = self._summarize(
             research_objective,
-            selected,
+            summary_sources,
             settings.depth,
             plan,
             query,
             durable_notes,
             synthesis_mode,
+            coverage=coverage,
             synthesis_packet=synthesis_packet,
         )
         artifacts = self._write_artifacts(
@@ -249,6 +285,11 @@ class DeepResearchEngine(
             run_id,
             synthesis_mode,
             synthesis_packet,
+            frontier_schedule_payload,
+            frontier_shard_payload,
+            frontier_shard_markdown,
+            shard_synthesis_packets,
+            merge_coordinator,
         )
         confidence = self._confidence(selected)
         return ResearchBrief(
@@ -266,6 +307,31 @@ class DeepResearchEngine(
                     "targets": merged_targets,
                 },
             },
+        )
+
+    @staticmethod
+    def _coverage_failure_summary(
+        objective: str,
+        coverage: dict[str, Any],
+        *,
+        stop_reason: str = "",
+    ) -> str:
+        provider_count = int(coverage.get("provider_count") or 0)
+        source_count = int(coverage.get("source_count") or 0)
+        strong_count = int(coverage.get("strong_or_moderate") or 0)
+        weak_ratio = float(coverage.get("weak_ratio") or 1.0)
+        missing = ", ".join(coverage.get("missing_perspectives") or []) or "unknown"
+        on_topic = float(coverage.get("on_topic_ratio") or 0.0)
+        reason = stop_reason or "coverage_failure"
+        return (
+            "Research run ended in a source-starved state and should not be treated "
+            f"as a completed analyst-grade answer for: {objective}. "
+            f"Coverage snapshot: sources={source_count}, providers={provider_count}, "
+            f"strong_or_moderate={strong_count}, on_topic_ratio={on_topic:.2f}, "
+            f"weak_ratio={weak_ratio:.2f}, missing_perspectives={missing}. "
+            f"Stop reason: {reason}. The correct next action is to expand provider "
+            "breadth, repair failing providers, and rerun retrieval instead of "
+            "writing a polished conclusion from insufficient evidence."
         )
 
     def _write_progress_checkpoint(self, run_id: str, payload: dict[str, Any]) -> None:
@@ -458,6 +524,11 @@ class DeepResearchEngine(
                 continue
             if cls._is_low_signal_seed_url(cleaned):
                 continue
+            if (
+                cls._looks_like_market_query(objective)
+                and cls._is_unstable_market_portal_article_url(cleaned)
+            ):
+                continue
             if cls._is_search_result_url(cleaned):
                 continue
             if cleaned in seen:
@@ -501,6 +572,11 @@ class DeepResearchEngine(
                 continue
             if cls._is_low_signal_seed_url(cleaned) or cls._is_search_result_url(cleaned):
                 continue
+            if (
+                cls._looks_like_market_query(objective)
+                and cls._is_unstable_market_portal_article_url(cleaned)
+            ):
+                continue
             host = urllib.parse.urlparse(cleaned).netloc.lower().lstrip("www.")
             if any(
                 host == blocked or host.endswith(f".{blocked}")
@@ -521,7 +597,13 @@ class DeepResearchEngine(
         limit: int = 6,
     ) -> list[str]:
         market_context = " ".join(part for part in (objective, query) if part).strip()
+        is_market = self._looks_like_market_query(market_context)
         candidates: list[str] = list(plan_queries or [])
+        if self._looks_like_software_agent_diagnostic_objective(market_context):
+            candidates = [
+                *self._software_agent_diagnostic_queries(objective),
+                *candidates,
+            ]
         candidates.extend(self._entity_queries(query, objective))
         core = self._query_core_terms(objective)
         if core:
@@ -529,7 +611,7 @@ class DeepResearchEngine(
         if query:
             candidates.insert(0, query)
 
-        if self._looks_like_market_query(market_context):
+        if is_market:
             original_entity_binding = self._extract_company_binding(query or objective)
             # Add evidence-axis expansions for broad market discovery without hard-coding tickers.
             reference_query = query or objective
@@ -575,7 +657,12 @@ class DeepResearchEngine(
                     or self._normalize_title(candidate) == self._normalize_title(reference_query)
                 ]
 
-        return self._sanitize_query_variants(candidates, query or objective)[:limit]
+        effective_limit = self._discovery_query_limit(
+            market_context,
+            limit,
+            is_market=is_market,
+        )
+        return self._sanitize_query_variants(candidates, query or objective)[:effective_limit]
 
     @classmethod
     def _seed_discovery_providers(
@@ -600,18 +687,31 @@ class DeepResearchEngine(
     ) -> list[str]:
         market_context = " ".join(part for part in (objective, query) if part).strip()
         is_market = self._looks_like_market_query(market_context)
+        effective_query_limit = self._discovery_query_limit(
+            market_context,
+            limit,
+            is_market=is_market,
+        )
+        effective_url_limit = self._discovery_url_limit(
+            market_context,
+            limit,
+            is_market=is_market,
+        )
         discovery_queries = self._seed_discovery_queries(
             objective,
             query,
             plan_queries,
-            limit=max(3, min(limit, 10 if is_market else 6)),
+            limit=effective_query_limit,
         )
         if not discovery_queries:
             return []
         allowed_providers = self._seed_discovery_providers(objective, query)
-        per_provider_limit = max(2, min(self.limit_per_provider, 8 if is_market else 4))
+        per_provider_limit = self._discovery_per_provider_limit(
+            market_context,
+            is_market=is_market,
+        )
         discovered_sources: list[ResearchSource] = []
-        for discovery_query in discovery_queries[: (8 if is_market else 4)]:
+        for discovery_query in discovery_queries[:effective_query_limit]:
             discovered_sources.extend(
                 self._search_query_across_providers(
                     discovery_query,
@@ -619,7 +719,10 @@ class DeepResearchEngine(
                     per_provider_limit,
                 )
             )
-            if len(discovered_sources) >= limit * 4:
+            if len(discovered_sources) >= effective_url_limit * max(
+                4,
+                min(per_provider_limit, 8),
+            ):
                 break
         ranked_sources = self._rank_sources(
             self._dedupe_sources(discovered_sources),
@@ -655,7 +758,7 @@ class DeepResearchEngine(
             seen.add(cleaned)
             host_counts[host] = count + 1
             urls.append(cleaned)
-            if len(urls) >= limit:
+            if len(urls) >= effective_url_limit:
                 break
         return urls
 
@@ -882,6 +985,13 @@ class DeepResearchEngine(
                 "site.webmanifest",
             )
         )
+
+    @staticmethod
+    def _is_unstable_market_portal_article_url(url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower().lstrip("www.")
+        path = parsed.path.lower()
+        return host == "finance.yahoo.com" and "/articles/" in path
 
     def _seed_sources(self, seed_urls: list[str]) -> list[ResearchSource]:
         if not seed_urls:
@@ -2630,6 +2740,56 @@ class DeepResearchEngine(
                     ["counterexample", "edge case", "negative result"],
                 ),
             ]
+        elif DeepResearchEngine._looks_like_public_security_query(query):
+            axis_specs = [
+                (
+                    "filings",
+                    "Collect primary-company filings and investor disclosures.",
+                    ["sec filings", "10-k 10-q 8-k", "investor presentation"],
+                ),
+                (
+                    "fundamentals",
+                    "Collect earnings, guidance, cash flow, and growth evidence.",
+                    ["earnings guidance", "revenue growth", "free cash flow"],
+                ),
+                (
+                    "valuation",
+                    "Compare valuation against peers and implied upside frameworks.",
+                    ["valuation multiples", "ev ebitda pe", "peer comps"],
+                ),
+                (
+                    "analyst-coverage",
+                    "Track analyst revisions, price targets, and estimate changes.",
+                    ["analyst price targets", "estimate revisions", "consensus eps"],
+                ),
+                (
+                    "catalysts",
+                    "Identify near-term catalysts that could re-rate the stock.",
+                    ["upcoming catalysts", "product launch", "contract win"],
+                ),
+                (
+                    "risk",
+                    "Capture bear-case evidence, short interest, and balance-sheet risk.",
+                    ["short interest", "insider selling", "balance sheet risk"],
+                ),
+            ]
+            if DeepResearchEngine._looks_like_current_evidence_query(query):
+                axis_specs.insert(
+                    0,
+                    (
+                        "current-signals",
+                        "Track what changed most recently across filings, analyst revisions, and near-term catalysts.",
+                        ["latest filings", "current analyst revisions", "near-term timeline"],
+                    ),
+                )
+                axis_specs.insert(
+                    1,
+                    (
+                        "drivers",
+                        "Identify the strongest near-term business and market drivers.",
+                        ["drivers", "demand signals", "near-term catalysts"],
+                    ),
+                )
         elif DeepResearchEngine._looks_like_current_evidence_query(query):
             axis_specs = [
                 (
@@ -2780,6 +2940,81 @@ class DeepResearchEngine(
         return _settings_policy.settings_for_current_web(settings)
 
     @staticmethod
+    def _env_override_int(
+        *names: str,
+        default: int,
+        minimum: int = 1,
+    ) -> int:
+        for name in names:
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                continue
+            try:
+                return max(minimum, int(raw))
+            except ValueError:
+                continue
+        return default
+
+    def _discovery_query_limit(
+        self,
+        objective: str,
+        requested_limit: int,
+        *,
+        is_market: bool,
+    ) -> int:
+        depth = self.research_depth_for_objective(self._active_objective or objective)
+        default = 24 if is_market and depth == "multi-hour" else 12 if is_market else 6
+        return max(
+            3,
+            min(
+                requested_limit,
+                self._env_override_int(
+                    "AGENTOS_MARKET_DISCOVERY_QUERY_LIMIT",
+                    "AGENTOS_DISCOVERY_QUERY_LIMIT",
+                    default=default,
+                ),
+            ),
+        )
+
+    def _discovery_url_limit(
+        self,
+        objective: str,
+        requested_limit: int,
+        *,
+        is_market: bool,
+    ) -> int:
+        depth = self.research_depth_for_objective(self._active_objective or objective)
+        default = 128 if is_market and depth == "multi-hour" else 48 if is_market else 24
+        return max(
+            8,
+            min(
+                requested_limit,
+                self._env_override_int(
+                    "AGENTOS_MARKET_DISCOVERY_URL_LIMIT",
+                    "AGENTOS_DISCOVERY_URL_LIMIT",
+                    default=default,
+                ),
+            ),
+        )
+
+    def _discovery_per_provider_limit(
+        self,
+        objective: str,
+        *,
+        is_market: bool,
+    ) -> int:
+        depth = self.research_depth_for_objective(self._active_objective or objective)
+        default = 32 if is_market and depth == "multi-hour" else 12 if is_market else 6
+        return max(
+            2,
+            self._env_override_int(
+                "AGENTOS_MARKET_DISCOVERY_PER_PROVIDER_LIMIT",
+                "AGENTOS_DISCOVERY_PER_PROVIDER_LIMIT",
+                default=max(self.limit_per_provider, default),
+            ),
+        )
+
+    @staticmethod
     def _local_browser_pressure_caps() -> dict[str, int]:
         caps = {
             "pc_navigation_limit": 24,
@@ -2787,6 +3022,9 @@ class DeepResearchEngine(
             "pc_parallel_workers": 4,
             "pc_batch_limit": 12,
             "headless_browser_workers": 6,
+            "headless_prefetch_url_limit": 12,
+            "headless_prefetch_per_url_chars": 40_000,
+            "headless_prefetch_total_chars": 320_000,
         }
         if os.name == "nt":
             # Windows desktops are more prone to local instability when deep
@@ -2798,6 +3036,9 @@ class DeepResearchEngine(
                     "pc_parallel_workers": 2,
                     "pc_batch_limit": 5,
                     "headless_browser_workers": 2,
+                    "headless_prefetch_url_limit": 5,
+                    "headless_prefetch_per_url_chars": 24_000,
+                    "headless_prefetch_total_chars": 120_000,
                 }
             )
 
@@ -2806,6 +3047,15 @@ class DeepResearchEngine(
             "pc_cycle_count": "AGENTOS_PC_BROWSER_CYCLES",
             "pc_parallel_workers": "AGENTOS_PC_BROWSER_WORKERS",
             "pc_batch_limit": "AGENTOS_PC_BROWSER_BATCH_LIMIT",
+            "headless_prefetch_url_limit": (
+                "AGENTOS_HEADLESS_BROWSER_PREFETCH_URL_LIMIT"
+            ),
+            "headless_prefetch_per_url_chars": (
+                "AGENTOS_HEADLESS_BROWSER_PREFETCH_PER_URL_CHARS"
+            ),
+            "headless_prefetch_total_chars": (
+                "AGENTOS_HEADLESS_BROWSER_PREFETCH_TOTAL_CHARS"
+            ),
         }
         for key, env_name in env_map.items():
             raw_value = os.environ.get(env_name, "").strip()
@@ -3067,7 +3317,6 @@ class DeepResearchEngine(
                 "height",
                 "width",
                 "padding",
-                "margin",
                 "overflow",
                 # JS analytics / error page tokens
                 "nreum",
