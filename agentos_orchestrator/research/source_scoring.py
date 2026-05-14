@@ -61,6 +61,7 @@ class ResearchSourceScoringMixin:
                 "market",
             )
         )
+
     @staticmethod
     def _looks_like_academic_query(query: str) -> bool:
         lower = query.lower()
@@ -79,6 +80,7 @@ class ResearchSourceScoringMixin:
                 "openalex",
             )
         )
+
     @staticmethod
     def _openalex_abstract(inverted_index: dict[str, list[int]]) -> str:
         if not inverted_index:
@@ -266,7 +268,9 @@ class ResearchSourceScoringMixin:
             words = re.findall(r"\b[A-Za-z][A-Za-z&.\-]{1,}\b", normalized)
             if not words:
                 return False
-            blocked_hits = sum(1 for word in words if word.lower() in blocked_binding_terms)
+            blocked_hits = sum(
+                1 for word in words if word.lower() in blocked_binding_terms
+            )
             if blocked_hits >= max(1, len(words) // 2):
                 return False
             if len(words) >= 3 and blocked_hits > 0:
@@ -457,7 +461,9 @@ class ResearchSourceScoringMixin:
         combined = cls._strip_dom_noise_tokens(f"{source.title} {source.abstract}")
         lower = combined.lower()
         host = cls._source_host(source.url)
-        entity_binding = cls._extract_company_binding(f"{source.title} {source.abstract}")
+        entity_binding = cls._extract_company_binding(
+            f"{source.title} {source.abstract}"
+        )
         evidence_kind = "unknown"
         subject_kind = "unknown"
         document_kind = "unknown"
@@ -508,7 +514,10 @@ class ResearchSourceScoringMixin:
             "investing.com",
         }
 
-        if source.provider == "github-repositories" or host in {"github.com", "gitlab.com"}:
+        if source.provider == "github-repositories" or host in {
+            "github.com",
+            "gitlab.com",
+        }:
             evidence_kind = "repository"
             subject_kind = "software-project"
             document_kind = "repository"
@@ -525,8 +534,12 @@ class ResearchSourceScoringMixin:
             evidence_kind = "app-listing"
             subject_kind = "software-product"
             document_kind = "app-store-listing"
-        elif "storymaps" in host or host.endswith("arcgis.com") or any(
-            marker in lower for marker in ("storymaps", "story map", "arcgis story")
+        elif (
+            "storymaps" in host
+            or host.endswith("arcgis.com")
+            or any(
+                marker in lower for marker in ("storymaps", "story map", "arcgis story")
+            )
         ):
             evidence_kind = "map-story"
             subject_kind = "place-location"
@@ -682,15 +695,19 @@ class ResearchSourceScoringMixin:
             else:
                 evidence_kind = "market-analysis"
                 document_kind = "analysis"
-            if entity_binding or cls._has_market_identifiers(combined) or any(
-                marker in lower
-                for marker in (
-                    "public company",
-                    "public companies",
-                    "publicly traded",
-                    "listed company",
-                    "listed companies",
-                    "shares of",
+            if (
+                entity_binding
+                or cls._has_market_identifiers(combined)
+                or any(
+                    marker in lower
+                    for marker in (
+                        "public company",
+                        "public companies",
+                        "publicly traded",
+                        "listed company",
+                        "listed companies",
+                        "shares of",
+                    )
                 )
             ):
                 subject_kind = "public-company"
@@ -740,7 +757,9 @@ class ResearchSourceScoringMixin:
             and source.subject_kind not in spec.accepted_subject_kinds
         ):
             return False
-        combined = cls._strip_dom_noise_tokens(f"{source.title} {source.abstract}").lower()
+        combined = cls._strip_dom_noise_tokens(
+            f"{source.title} {source.abstract}"
+        ).lower()
         has_required_terms = any(
             term in combined for term in spec.required_context_terms
         )
@@ -832,6 +851,7 @@ class ResearchSourceScoringMixin:
             # requiring full source-semantic classification is over-strict here.
             return True
         return cls._text_matches_intent_spec(variant, query)
+
     @classmethod
     def _dedupe_sources(cls, sources: list[ResearchSource]) -> list[ResearchSource]:
         by_identity: dict[str, ResearchSource] = {}
@@ -854,8 +874,11 @@ class ResearchSourceScoringMixin:
             for key in cls._source_identity_keys(existing):
                 by_identity[key] = existing
         return deduped
+
     @classmethod
-    def _merge_source_records(cls, existing: ResearchSource, source: ResearchSource) -> None:
+    def _merge_source_records(
+        cls, existing: ResearchSource, source: ResearchSource
+    ) -> None:
         source_wins = source.score > existing.score
         if source_wins:
             existing.provider = source.provider
@@ -870,14 +893,15 @@ class ResearchSourceScoringMixin:
         elif existing.year is None and source.year is not None:
             existing.year = source.year
 
-        if cls._abstract_quality(
-            source.abstract
-        ) > cls._abstract_quality(existing.abstract):
+        if cls._abstract_quality(source.abstract) > cls._abstract_quality(
+            existing.abstract
+        ):
             existing.abstract = source.abstract
         existing.citation_count = max(existing.citation_count, source.citation_count)
         existing.score = max(existing.score, source.score)
         if {existing.provider, source.provider} == {"seed-url", "web-search"}:
             existing.provider = "web-search"
+
     @classmethod
     def _source_identity_keys(cls, source: ResearchSource) -> list[str]:
         keys: list[str] = []
@@ -898,6 +922,7 @@ class ResearchSourceScoringMixin:
         if title_key:
             keys.append(f"title:{title_key}")
         return keys
+
     @staticmethod
     def _abstract_quality(text: str) -> tuple[int, int]:
         cleaned = (text or "").strip()
@@ -905,12 +930,14 @@ class ResearchSourceScoringMixin:
             return (0, 0)
         generic = cleaned.lower().startswith("generic web result for ")
         return (0 if generic else 1, len(cleaned))
+
     _MAX_PROVIDER_FRACTION = 0.5
     _SCORE_W_RELEVANCE: float = 54.0
     _SCORE_W_CITATION: float = 26.0
     _SCORE_W_RECENCY: float = 8.0
     _SCORE_W_CREDIBILITY: float = 18.0
     _SCORE_W_CONTRADICTION: float = 6.0
+
     @classmethod
     def _rank_sources(
         cls,
@@ -965,6 +992,7 @@ class ResearchSourceScoringMixin:
             and cls._source_is_on_topic(source, query)
         ]
         return cls._enforce_provider_diversity(filtered)
+
     @classmethod
     def _score_source(
         cls,
@@ -1223,6 +1251,7 @@ class ResearchSourceScoringMixin:
             base = max(base - 12.0, 0.0)
         source.score = base
         return base
+
     @classmethod
     def _source_credibility(
         cls,
@@ -1425,6 +1454,7 @@ class ResearchSourceScoringMixin:
 
         credibility = max(0.0, min(credibility, 1.0))
         return credibility, penalty, flags
+
     @classmethod
     def _enforce_provider_diversity(
         cls,
@@ -1448,6 +1478,7 @@ class ResearchSourceScoringMixin:
                 overflow.append(source)
         result.extend(overflow)
         return result
+
     @classmethod
     def _select_balanced_top(
         cls,
@@ -1460,9 +1491,7 @@ class ResearchSourceScoringMixin:
         capped_limit = max(max_sources * 3, max_sources)
         capped = ranked[:capped_limit]
         capped_identity_keys = {
-            key
-            for source in capped
-            for key in cls._source_identity_keys(source)
+            key for source in capped for key in cls._source_identity_keys(source)
         }
         capped_urls = {source.url for source in capped if source.url}
         preserved_browser_sources = 0
@@ -1545,9 +1574,7 @@ class ResearchSourceScoringMixin:
         weak_domain_cap = max(2, domain_cap // 2) if is_market_query else domain_cap
 
         def _domain_of(source: ResearchSource) -> str:
-            return urllib.parse.urlparse(source.url or "").netloc.lower().lstrip(
-                "www."
-            )
+            return urllib.parse.urlparse(source.url or "").netloc.lower().lstrip("www.")
 
         domain_counts: dict[str, int] = {}
         weak_domain_counts: dict[str, int] = {}
@@ -1725,6 +1752,7 @@ class ResearchSourceScoringMixin:
             _track_add(source)
             selected_urls.add(source.url)
         return selected[:max_sources]
+
     @classmethod
     def _entity_terms_from_query(cls, query: str) -> set[str]:
         raw_query = query or ""
@@ -1786,6 +1814,7 @@ class ResearchSourceScoringMixin:
             if len(candidate) >= 3:
                 matched.add(candidate)
         return matched
+
     @staticmethod
     def _quality_summary(sources: list[ResearchSource]) -> str:
         if not sources:
@@ -1808,6 +1837,7 @@ class ResearchSourceScoringMixin:
             f"{average_credibility:.2f}; maximum contradiction risk is "
             f"{risk:.2f}."
         )
+
     @staticmethod
     def _market_signal_snapshot(sources: list[ResearchSource]) -> list[str]:
         by_ticker: dict[str, dict[str, Any]] = {}
@@ -1846,6 +1876,7 @@ class ResearchSourceScoringMixin:
                 f"- {ticker}: seen in {payload['count']} sources across {providers}; example source: {title}"
             )
         return lines
+
     @classmethod
     def _claim_trace(
         cls,
@@ -1878,14 +1909,13 @@ class ResearchSourceScoringMixin:
             "source_count": len(unique_sources),
             "minimum_confidence": min(
                 (
-                    cls._finding_confidence_rank(
-                        str(finding.get("confidence") or "")
-                    )
+                    cls._finding_confidence_rank(str(finding.get("confidence") or ""))
                     for finding in findings
                 ),
                 default=0,
             ),
         }
+
     @staticmethod
     def _recency_score(year: int | None) -> float:
         if year is None:
@@ -1893,6 +1923,7 @@ class ResearchSourceScoringMixin:
         current_year = datetime.now(UTC).year
         age = max(current_year - int(year), 0)
         return max(0.1, 1.0 - min(age, 20) / 20)
+
     @staticmethod
     def _contradiction_risk(text: str) -> float:
         lower = text.lower()
@@ -1906,6 +1937,7 @@ class ResearchSourceScoringMixin:
         )
         matches = sum(1 for marker in markers if marker in lower)
         return min(matches / 4, 1.0)
+
     @staticmethod
     def _evidence_grade(source: ResearchSource) -> str:
         if source.provider == "gemini-flash":
@@ -1970,6 +2002,7 @@ class ResearchSourceScoringMixin:
         ):
             return "moderate"
         return "weak"
+
     @staticmethod
     def _generic_query_terms() -> set[str]:
         return _generic_query_terms_policy()
@@ -2050,8 +2083,9 @@ class ResearchSourceScoringMixin:
                         and token not in cls._generic_market_comparison_terms()
                     ):
                         anchors.add(token)
-            if spec.mode == "public-company-market" and not cls._extract_company_binding(
-                query
+            if (
+                spec.mode == "public-company-market"
+                and not cls._extract_company_binding(query)
             ):
                 anchors.update(
                     {
@@ -2081,9 +2115,7 @@ class ResearchSourceScoringMixin:
             1 for term in anchors if cls._anchor_present(term, lower_text, words)
         )
         overlap += sum(
-            1
-            for term in entity_terms
-            if cls._anchor_present(term, lower_text, words)
+            1 for term in entity_terms if cls._anchor_present(term, lower_text, words)
         )
         denominator = len(anchors) + len(entity_terms)
         if denominator <= 0:

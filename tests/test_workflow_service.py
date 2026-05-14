@@ -473,8 +473,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
         del fmt, args
 
 
-def _start_local_api_server(
-) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+def _start_local_api_server() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _LocalApiHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -732,9 +731,7 @@ class WorkflowServiceTests(unittest.TestCase):
 
     def test_planner_emits_research_tool_for_presentation_objective(self) -> None:
         planner = DesktopWorkflowPlanner()
-        plan = planner.plan(
-            "create a presentation about universal OS control agents"
-        )
+        plan = planner.plan("create a presentation about universal OS control agents")
 
         self.assertTrue(plan.steps)
         self.assertEqual(plan.steps[0].selector, "tool_executor:workflow_research")
@@ -742,16 +739,12 @@ class WorkflowServiceTests(unittest.TestCase):
             any(artifact.kind == "research-brief" for artifact in plan.artifacts)
         )
         self.assertTrue(
-            any(
-                artifact.kind == "presentation-outline"
-                for artifact in plan.artifacts
-            )
+            any(artifact.kind == "presentation-outline" for artifact in plan.artifacts)
         )
         presentation_steps = [
             step
             for step in plan.steps
-            if step.action_type == "type"
-            and step.selector == "presentation-canvas"
+            if step.action_type == "type" and step.selector == "presentation-canvas"
         ]
         self.assertTrue(presentation_steps)
         self.assertIn("presentation_outline.md", presentation_steps[0].value or "")
@@ -865,7 +858,13 @@ class WorkflowServiceTests(unittest.TestCase):
                 result["receipts"][0]["selector"],
                 "tool_executor:workflow_research",
             )
-            brief_path = root / "artifacts" / "workflows" / "find-tesla-stock-and-analyze-it" / "research_brief.md"
+            brief_path = (
+                root
+                / "artifacts"
+                / "workflows"
+                / "find-tesla-stock-and-analyze-it"
+                / "research_brief.md"
+            )
             self.assertTrue(brief_path.exists())
             self.assertIn("Tesla", brief_path.read_text(encoding="utf-8"))
 
@@ -1053,12 +1052,9 @@ class WorkflowServiceTests(unittest.TestCase):
                             "verification_contract": {
                                 "kind": "field_contains",
                                 "expected": (
-                                    "The focused field contains the "
-                                    "typed value."
+                                    "The focused field contains the typed value."
                                 ),
-                                "target": (
-                                    "automation_id=1001&&class_name=Edit"
-                                ),
+                                "target": ("automation_id=1001&&class_name=Edit"),
                                 "value": "fail verification",
                                 "required": True,
                             }
@@ -1099,9 +1095,7 @@ class WorkflowServiceTests(unittest.TestCase):
                         metadata={
                             "verification_contract": {
                                 "kind": "field_contains",
-                                "expected": (
-                                    "The field contains the value."
-                                ),
+                                "expected": ("The field contains the value."),
                                 "target": "name=Document Canvas",
                                 "value": "ledger-backed value",
                                 "required": True,
@@ -1139,9 +1133,7 @@ class WorkflowServiceTests(unittest.TestCase):
             stages = [event["stage"] for event in events]
             self.assertIn("proposal", stages)
             self.assertIn("completion", stages)
-            proposal = next(
-                event for event in events if event["stage"] == "proposal"
-            )
+            proposal = next(event for event in events if event["stage"] == "proposal")
             self.assertEqual(
                 proposal["payload"]["candidate_route"],
                 "structured_ui",
@@ -1217,10 +1209,7 @@ class WorkflowServiceTests(unittest.TestCase):
                 steps=[],
                 artifacts=[
                     WorkflowArtifact(
-                        path=(
-                            "artifacts/workflows/benchmark-report/"
-                            "research_brief.md"
-                        ),
+                        path=("artifacts/workflows/benchmark-report/research_brief.md"),
                         kind="research-brief",
                         description="Evidence-backed brief",
                     ),
@@ -1239,16 +1228,16 @@ class WorkflowServiceTests(unittest.TestCase):
             )
 
             report_path = (
-                root
-                / "artifacts"
-                / "workflows"
-                / "benchmark-report"
-                / "report.md"
+                root / "artifacts" / "workflows" / "benchmark-report" / "report.md"
             )
-            self.assertEqual(result["receipts"][0]["selector"], "tool_executor:workflow_programmer")
+            self.assertEqual(
+                result["receipts"][0]["selector"], "tool_executor:workflow_programmer"
+            )
             self.assertTrue(report_path.exists())
             report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn("synthesized directly from the workflow research brief", report_text)
+            self.assertIn(
+                "synthesized directly from the workflow research brief", report_text
+            )
             self.assertIn("OSWorld-Verified benchmark audit", report_text)
             self.assertIn("OpenCUA capability update", report_text)
 
@@ -1277,17 +1266,13 @@ class WorkflowServiceTests(unittest.TestCase):
                 steps=[],
                 artifacts=[
                     WorkflowArtifact(
-                        path=(
-                            "artifacts/workflows/benchmark-deck/"
-                            "research_brief.md"
-                        ),
+                        path=("artifacts/workflows/benchmark-deck/research_brief.md"),
                         kind="research-brief",
                         description="Evidence-backed brief",
                     ),
                     WorkflowArtifact(
                         path=(
-                            "artifacts/workflows/benchmark-deck/"
-                            "presentation_outline.md"
+                            "artifacts/workflows/benchmark-deck/presentation_outline.md"
                         ),
                         kind="presentation-outline",
                         description="Slide outline",
@@ -1308,7 +1293,9 @@ class WorkflowServiceTests(unittest.TestCase):
                 / "benchmark-deck"
                 / "presentation_outline.md"
             )
-            self.assertEqual(result["receipts"][0]["selector"], "tool_executor:workflow_programmer")
+            self.assertEqual(
+                result["receipts"][0]["selector"], "tool_executor:workflow_programmer"
+            )
             self.assertTrue(outline_path.exists())
             outline_text = outline_path.read_text(encoding="utf-8")
             self.assertIn("## Slide 3: Key Evidence", outline_text)
@@ -1544,7 +1531,9 @@ class WorkflowServiceTests(unittest.TestCase):
             self.assertTrue(receipt["success"])
             self.assertEqual(receipt["kind"], "http_probe")
 
-    def test_explicit_api_call_plan_materializes_direct_endpoint_without_backend(self) -> None:
+    def test_explicit_api_call_plan_materializes_direct_endpoint_without_backend(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             service = DesktopWorkflowService(root)

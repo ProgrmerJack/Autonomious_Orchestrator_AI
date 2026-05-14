@@ -151,9 +151,7 @@ def promote(
         }
         import datetime as _dt
 
-        manifest["promoted_at_utc"] = (
-            _dt.datetime.now(_dt.UTC).isoformat()
-        )
+        manifest["promoted_at_utc"] = _dt.datetime.now(_dt.UTC).isoformat()
         for cand in selected:
             dst = golden_root / cand.run_id
             _copy_run(cand.run_path, dst)
@@ -197,10 +195,7 @@ def main() -> None:
         top=args.top,
         dry_run=args.dry_run,
     )
-    print(
-        f"{'[dry-run] ' if args.dry_run else ''}"
-        f"selected {len(selected)} runs"
-    )
+    print(f"{'[dry-run] ' if args.dry_run else ''}selected {len(selected)} runs")
     for cand in selected:
         print(
             f"  {cand.run_id:48s} "

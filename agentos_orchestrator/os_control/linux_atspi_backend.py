@@ -62,18 +62,20 @@ class LinuxAtSpiBackend:
                 role_name = accessible.getRoleName() or ""
                 name = accessible.name or ""
                 states = accessible.getState()
-                enabled = bool(
-                    states.contains(self._pyatspi.STATE_ENABLED)
-                ) if states else True
-                focused = bool(
-                    states.contains(self._pyatspi.STATE_FOCUSED)
-                ) if states else False
+                enabled = (
+                    bool(states.contains(self._pyatspi.STATE_ENABLED))
+                    if states
+                    else True
+                )
+                focused = (
+                    bool(states.contains(self._pyatspi.STATE_FOCUSED))
+                    if states
+                    else False
+                )
                 bounds_tuple: tuple[int, int, int, int] | None = None
                 try:
                     component = accessible.queryComponent()
-                    extents = component.getExtents(
-                        self._pyatspi.DESKTOP_COORDS
-                    )
+                    extents = component.getExtents(self._pyatspi.DESKTOP_COORDS)
                     bounds_tuple = (
                         int(extents.x),
                         int(extents.y),

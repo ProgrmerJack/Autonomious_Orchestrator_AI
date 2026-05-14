@@ -133,12 +133,12 @@ function App() {
             : null;
     const selectedMergePacketCount =
         selectedDetachedMerge
-        && typeof selectedDetachedMerge.merge_ready_packet_count === 'number'
+            && typeof selectedDetachedMerge.merge_ready_packet_count === 'number'
             ? selectedDetachedMerge.merge_ready_packet_count
             : null;
     const selectedReplayManifestPath =
         selectedDetachedMerge
-        && typeof selectedDetachedMerge.replay_manifest_path === 'string'
+            && typeof selectedDetachedMerge.replay_manifest_path === 'string'
             ? selectedDetachedMerge.replay_manifest_path
             : '';
 
@@ -764,20 +764,20 @@ function App() {
                             const progress = job.run_id ? runProgress[job.run_id] || null : null;
                             const activeQuery = runProgressQuery(progress);
                             return (
-                            <article className="row" key={job.job_id}>
-                                <div>
-                                    <strong>{job.status}</strong>
-                                    <p>{job.objective}</p>
-                                    {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
-                                    {activeQuery && <p className="muted">{activeQuery}</p>}
-                                    {job.error && <p className="danger">{job.error}</p>}
-                                </div>
-                                {job.run_id && job.status === 'completed' && (
-                                    <button onClick={() => openRun(job.run_id!)} title="Open research brief">
-                                        <FileText size={16} />
-                                    </button>
-                                )}
-                            </article>
+                                <article className="row" key={job.job_id}>
+                                    <div>
+                                        <strong>{job.status}</strong>
+                                        <p>{job.objective}</p>
+                                        {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
+                                        {activeQuery && <p className="muted">{activeQuery}</p>}
+                                        {job.error && <p className="danger">{job.error}</p>}
+                                    </div>
+                                    {job.run_id && job.status === 'completed' && (
+                                        <button onClick={() => openRun(job.run_id!)} title="Open research brief">
+                                            <FileText size={16} />
+                                        </button>
+                                    )}
+                                </article>
                             );
                         })}
                     </div>
@@ -905,39 +905,39 @@ function App() {
                             const progress = runProgress[run.run_id] || null;
                             const activeQuery = runProgressQuery(progress);
                             return (
-                            <article className="row" key={run.run_id}>
-                                <div>
-                                    <strong>{run.status}</strong>
-                                    <p>{run.objective}</p>
-                                    {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
-                                    {activeQuery && <p className="muted">{activeQuery}</p>}
-                                    <span>{run.run_id}</span>
-                                </div>
-                                <div className="actions">
-                                    <button type="button" onClick={() => openRun(run.run_id)} title="Open artifacts">
-                                        <FileText size={16} />
-                                    </button>
-                                    <button type="button" className="secondary" onClick={() => inspectRun(run.run_id)} title="Inspect checkpoint">
-                                        <Eye size={16} />
-                                    </button>
-                                    {(run.status !== 'completed' || progress?.detached_merge) && (
-                                        <button
-                                            type="button"
-                                            className="secondary"
-                                            onClick={() => void replayMergeRun(run.run_id)}
-                                            title="Replay detached merge from persisted shard packets"
-                                            disabled={replayingRunId === run.run_id}
-                                        >
-                                            <Database size={16} />
+                                <article className="row" key={run.run_id}>
+                                    <div>
+                                        <strong>{run.status}</strong>
+                                        <p>{run.objective}</p>
+                                        {progress && <p className="muted">{progress.stage || 'progress'} · {runProgressSummary(progress)}</p>}
+                                        {activeQuery && <p className="muted">{activeQuery}</p>}
+                                        <span>{run.run_id}</span>
+                                    </div>
+                                    <div className="actions">
+                                        <button type="button" onClick={() => openRun(run.run_id)} title="Open artifacts">
+                                            <FileText size={16} />
                                         </button>
-                                    )}
-                                    {run.status !== 'completed' && (
-                                        <button type="button" className="secondary" onClick={() => recoverRun(run.run_id)} title="Recover run">
-                                            <RefreshCw size={16} />
+                                        <button type="button" className="secondary" onClick={() => inspectRun(run.run_id)} title="Inspect checkpoint">
+                                            <Eye size={16} />
                                         </button>
-                                    )}
-                                </div>
-                            </article>
+                                        {(run.status !== 'completed' || progress?.detached_merge) && (
+                                            <button
+                                                type="button"
+                                                className="secondary"
+                                                onClick={() => void replayMergeRun(run.run_id)}
+                                                title="Replay detached merge from persisted shard packets"
+                                                disabled={replayingRunId === run.run_id}
+                                            >
+                                                <Database size={16} />
+                                            </button>
+                                        )}
+                                        {run.status !== 'completed' && (
+                                            <button type="button" className="secondary" onClick={() => recoverRun(run.run_id)} title="Recover run">
+                                                <RefreshCw size={16} />
+                                            </button>
+                                        )}
+                                    </div>
+                                </article>
                             );
                         })}
                     </div>
@@ -966,11 +966,11 @@ function App() {
                                 </p>
                                 {(selectedMergePacketCount !== null
                                     || selectedMergeShardCount !== null) && (
-                                    <p className="muted">
-                                        {selectedMergePacketCount ?? 0} merge-ready packets
-                                        across {selectedMergeShardCount ?? 0} shards
-                                    </p>
-                                )}
+                                        <p className="muted">
+                                            {selectedMergePacketCount ?? 0} merge-ready packets
+                                            across {selectedMergeShardCount ?? 0} shards
+                                        </p>
+                                    )}
                                 {selectedReplayManifestPath && (
                                     <span>{selectedReplayManifestPath}</span>
                                 )}

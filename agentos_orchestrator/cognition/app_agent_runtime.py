@@ -92,8 +92,7 @@ class AppAgentSession:
 
 
 class AppAgentRuntime:
-    """Resolve durable per-app skill packs from capability and policy memory.
-    """
+    """Resolve durable per-app skill packs from capability and policy memory."""
 
     def __init__(
         self,
@@ -221,9 +220,12 @@ class AppAgentRuntime:
             or verification_result.get("reason")
             or ""
         )
-        action_for_memory = _action_from_metadata(
-            action.metadata.get("policy_anchor_action"),
-        ) or action
+        action_for_memory = (
+            _action_from_metadata(
+                action.metadata.get("policy_anchor_action"),
+            )
+            or action
+        )
         evidence = {
             "verification": dict(verification_result),
             "receipt": receipt,

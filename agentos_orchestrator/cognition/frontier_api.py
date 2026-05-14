@@ -440,9 +440,7 @@ class HTTPFrontierClient:
             and len(static_text) >= 16_000
             and os.environ.get("AGENTOS_GEMINI_CONTEXT_CACHE", "1") != "0"
         ):
-            cached_content_name = self._gemini_get_or_create_cache(
-                api_key, static_text
-            )
+            cached_content_name = self._gemini_get_or_create_cache(api_key, static_text)
         body: dict[str, Any] = {
             "generationConfig": {
                 "temperature": 0,
@@ -461,9 +459,7 @@ class HTTPFrontierClient:
         if cached_content_name:
             body["cachedContent"] = cached_content_name
         else:
-            body["systemInstruction"] = {
-                "parts": [{"text": static_text}]
-            }
+            body["systemInstruction"] = {"parts": [{"text": static_text}]}
         data = self._post_json(endpoint, body, {"Content-Type": "application/json"})
         self.last_usage = _usage_payload(
             "gemini",
@@ -509,9 +505,7 @@ class HTTPFrontierClient:
         ttl = os.environ.get("AGENTOS_GEMINI_CONTEXT_CACHE_TTL", "3600s")
         body = {
             "model": f"models/{self.config.model}",
-            "contents": [
-                {"role": "user", "parts": [{"text": static_text}]}
-            ],
+            "contents": [{"role": "user", "parts": [{"text": static_text}]}],
             "ttl": ttl,
         }
         try:

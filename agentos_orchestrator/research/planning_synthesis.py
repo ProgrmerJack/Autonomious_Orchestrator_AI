@@ -220,7 +220,13 @@ class ResearchPlanningSynthesisMixin:
         if not matched_lines:
             return ""
         payload = "\n".join(
-            ["# Durable Research Report", "", "## Incremental Findings", "", *matched_lines]
+            [
+                "# Durable Research Report",
+                "",
+                "## Incremental Findings",
+                "",
+                *matched_lines,
+            ]
         )
         return payload[:limit_chars].rstrip()
 
@@ -326,7 +332,9 @@ class ResearchPlanningSynthesisMixin:
             covered.extend(str(item) for item in (coverage.get("covered") or []))
             missing.extend(str(item) for item in (coverage.get("missing") or []))
         covered = self._ordered_unique_text(covered)
-        missing = [item for item in self._ordered_unique_text(missing) if item not in covered]
+        missing = [
+            item for item in self._ordered_unique_text(missing) if item not in covered
+        ]
         total = max(total, len(covered) + len(missing))
         return {
             "count": len(covered),
@@ -433,7 +441,9 @@ class ResearchPlanningSynthesisMixin:
                 )
                 candidate_rank = (
                     float(candidate.get("score") or 0.0),
-                    self._evidence_grade_rank(str(candidate.get("evidence_grade") or "")),
+                    self._evidence_grade_rank(
+                        str(candidate.get("evidence_grade") or "")
+                    ),
                     int(candidate.get("year") or 0),
                     len(str(candidate.get("abstract") or "")),
                 )
@@ -494,9 +504,9 @@ class ResearchPlanningSynthesisMixin:
         for packet in packets:
             for provider, count in dict(packet.get("provider_counts") or {}).items():
                 provider_key = str(provider or "unknown").strip() or "unknown"
-                provider_counts[provider_key] = provider_counts.get(provider_key, 0) + int(
-                    count or 0
-                )
+                provider_counts[provider_key] = provider_counts.get(
+                    provider_key, 0
+                ) + int(count or 0)
         merged_top_sources = self._merge_shard_top_sources(
             objective,
             depth,
@@ -533,7 +543,11 @@ class ResearchPlanningSynthesisMixin:
                     ((packet.get("frontier_summary") or {}).get("queue_total")) or 0
                 ),
                 "assigned_query_variants": list(
-                    ((packet.get("frontier_summary") or {}).get("assigned_query_variants"))
+                    (
+                        (packet.get("frontier_summary") or {}).get(
+                            "assigned_query_variants"
+                        )
+                    )
                     or []
                 ),
                 "sample_urls": list(
@@ -556,7 +570,11 @@ class ResearchPlanningSynthesisMixin:
             "non_empty_shards": sum(
                 1
                 for packet in packets
-                if int(packet.get("source_count_in_shard") or packet.get("total_ranked_sources") or 0)
+                if int(
+                    packet.get("source_count_in_shard")
+                    or packet.get("total_ranked_sources")
+                    or 0
+                )
                 > 0
             ),
             "total_ranked_sources": sum(
@@ -1997,9 +2015,7 @@ class ResearchPlanningSynthesisMixin:
         best_score = float("-inf")
         for clause in clauses:
             lower = clause.lower()
-            token_count = len(
-                re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b", lower)
-            )
+            token_count = len(re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b", lower))
             score = min(token_count, 24) / 12.0
             if cls._looks_like_public_security_query(clause):
                 score += 10.0

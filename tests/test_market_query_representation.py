@@ -41,7 +41,9 @@ def test_market_query_alignment_rejects_lexical_false_positive() -> None:
         "highest potential probability-adjusted upside among publicly traded "
         "companies over the next 12 months"
     )
-    story_text = "ArcGIS StoryMaps travel upside guide for public art in listed buildings"
+    story_text = (
+        "ArcGIS StoryMaps travel upside guide for public art in listed buildings"
+    )
     market_text = (
         "Analyst price target revisions and earnings guidance for publicly "
         "traded semiconductor stocks"

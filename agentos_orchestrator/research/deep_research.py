@@ -524,10 +524,9 @@ class DeepResearchEngine(
                 continue
             if cls._is_low_signal_seed_url(cleaned):
                 continue
-            if (
-                cls._looks_like_market_query(objective)
-                and cls._is_unstable_market_portal_article_url(cleaned)
-            ):
+            if cls._looks_like_market_query(
+                objective
+            ) and cls._is_unstable_market_portal_article_url(cleaned):
                 continue
             if cls._is_search_result_url(cleaned):
                 continue
@@ -570,12 +569,13 @@ class DeepResearchEngine(
                 cleaned = f"https://{cleaned.lstrip('/')}"
             if not cls._is_safe_public_url(cleaned):
                 continue
-            if cls._is_low_signal_seed_url(cleaned) or cls._is_search_result_url(cleaned):
-                continue
-            if (
-                cls._looks_like_market_query(objective)
-                and cls._is_unstable_market_portal_article_url(cleaned)
+            if cls._is_low_signal_seed_url(cleaned) or cls._is_search_result_url(
+                cleaned
             ):
+                continue
+            if cls._looks_like_market_query(
+                objective
+            ) and cls._is_unstable_market_portal_article_url(cleaned):
                 continue
             host = urllib.parse.urlparse(cleaned).netloc.lower().lstrip("www.")
             if any(
@@ -654,7 +654,8 @@ class DeepResearchEngine(
                     candidate
                     for candidate in candidates
                     if not self._extract_company_binding(candidate)
-                    or self._normalize_title(candidate) == self._normalize_title(reference_query)
+                    or self._normalize_title(candidate)
+                    == self._normalize_title(reference_query)
                 ]
 
         effective_limit = self._discovery_query_limit(
@@ -662,7 +663,9 @@ class DeepResearchEngine(
             limit,
             is_market=is_market,
         )
-        return self._sanitize_query_variants(candidates, query or objective)[:effective_limit]
+        return self._sanitize_query_variants(candidates, query or objective)[
+            :effective_limit
+        ]
 
     @classmethod
     def _seed_discovery_providers(
@@ -735,14 +738,18 @@ class DeepResearchEngine(
         seen: set[str] = set()
         host_counts: dict[str, int] = {}
         per_host_cap = 4 if is_market else 3
-        sec_host_cap = 2 if self._looks_like_public_security_query(market_context) else 3
+        sec_host_cap = (
+            2 if self._looks_like_public_security_query(market_context) else 3
+        )
         for source in ranked_sources:
             cleaned = str(source.url or "").strip().rstrip(").,;]}>\"'")
             if not cleaned or cleaned in seen:
                 continue
             if not self._is_safe_public_url(cleaned):
                 continue
-            if self._is_low_signal_seed_url(cleaned) or self._is_search_result_url(cleaned):
+            if self._is_low_signal_seed_url(cleaned) or self._is_search_result_url(
+                cleaned
+            ):
                 continue
             host = urllib.parse.urlparse(cleaned).netloc.lower().lstrip("www.")
             if any(
@@ -802,7 +809,9 @@ class DeepResearchEngine(
         discovered_domains: list[str] = []
         kept_urls: list[str] = []
         if not search_queries:
-            search_queries = self._software_agent_diagnostic_queries(objective) or [query]
+            search_queries = self._software_agent_diagnostic_queries(objective) or [
+                query
+            ]
 
         for url in direct_urls:
             rendered = self._strip_dom_noise_tokens(str(rendered_pages.get(url) or ""))
@@ -1718,18 +1727,26 @@ class DeepResearchEngine(
             if cls._looks_like_public_security_query(query):
                 if source.subject_kind not in {"public-company", "market-basket"}:
                     return False
-                if source.subject_kind == "market-basket" and source.evidence_kind not in {
-                    "analyst-coverage",
-                    "market-analysis",
-                    "market-data",
-                    "current-news",
-                    "earnings-news",
-                    "company-profile",
-                }:
+                if (
+                    source.subject_kind == "market-basket"
+                    and source.evidence_kind
+                    not in {
+                        "analyst-coverage",
+                        "market-analysis",
+                        "market-data",
+                        "current-news",
+                        "earnings-news",
+                        "company-profile",
+                    }
+                ):
                     return False
                 # Reject lexical collisions that only share a thin word like
                 # "upside" without broader market evidence context.
-                if signal_strength < 2 and not actionable_market_signal and alignment < 0.24:
+                if (
+                    signal_strength < 2
+                    and not actionable_market_signal
+                    and alignment < 0.24
+                ):
                     return False
                 if not actionable_market_signal and alignment < 0.32:
                     return False
@@ -2779,7 +2796,11 @@ class DeepResearchEngine(
                     (
                         "current-signals",
                         "Track what changed most recently across filings, analyst revisions, and near-term catalysts.",
-                        ["latest filings", "current analyst revisions", "near-term timeline"],
+                        [
+                            "latest filings",
+                            "current analyst revisions",
+                            "near-term timeline",
+                        ],
                     ),
                 )
                 axis_specs.insert(
@@ -2984,7 +3005,9 @@ class DeepResearchEngine(
         is_market: bool,
     ) -> int:
         depth = self.research_depth_for_objective(self._active_objective or objective)
-        default = 128 if is_market and depth == "multi-hour" else 48 if is_market else 24
+        default = (
+            128 if is_market and depth == "multi-hour" else 48 if is_market else 24
+        )
         return max(
             8,
             min(

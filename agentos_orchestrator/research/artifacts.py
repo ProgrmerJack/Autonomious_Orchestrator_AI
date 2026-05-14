@@ -290,9 +290,7 @@ class ResearchArtifactsMixin:
                     },
                 )
                 entry["observation_count"] = int(row["observation_count"] or 0)
-                entry["browser_observations"] = int(
-                    row["browser_observations"] or 0
-                )
+                entry["browser_observations"] = int(row["browser_observations"] or 0)
                 entry["last_observed_at"] = str(row["last_observed_at"] or "")
 
         worker_items = sorted(
@@ -310,9 +308,7 @@ class ResearchArtifactsMixin:
             "shard_index": 0,
             "queue_db_path": str(self._research_state_path()),
             "queue_total": int(totals_row["queue_total"] or 0) if totals_row else 0,
-            "domain_total": int(totals_row["domain_total"] or 0)
-            if totals_row
-            else 0,
+            "domain_total": int(totals_row["domain_total"] or 0) if totals_row else 0,
             "status_counts": status_counts,
             "js_required_counts": {
                 "total": int(totals_row["js_total"] or 0) if totals_row else 0,
@@ -437,7 +433,9 @@ class ResearchArtifactsMixin:
         }
 
     @staticmethod
-    def _frontier_top_domains(queue_items: list[dict[str, Any]], limit: int = 4) -> list[str]:
+    def _frontier_top_domains(
+        queue_items: list[dict[str, Any]], limit: int = 4
+    ) -> list[str]:
         counts: dict[str, int] = {}
         for item in queue_items:
             domain = str(item.get("domain") or "").strip()
@@ -734,7 +732,9 @@ class ResearchArtifactsMixin:
             "max_sources": settings.max_sources,
             "per_provider": settings.per_provider,
             "max_query_variants": settings.max_query_variants,
-            "query_variants": list(query_variants or retrieval.get("query_variants") or []),
+            "query_variants": list(
+                query_variants or retrieval.get("query_variants") or []
+            ),
             "plan": dict(plan),
             "pc_context_info": dict(pc_context_info),
             "retrieval": {
@@ -745,7 +745,9 @@ class ResearchArtifactsMixin:
                     if isinstance(item, dict)
                 ],
                 "stop_reason": stop_reason,
-                "query_variants": list(retrieval.get("query_variants") or query_variants),
+                "query_variants": list(
+                    retrieval.get("query_variants") or query_variants
+                ),
             },
             "synthesis_mode": synthesis_mode,
             "detached_frontier": dict(frontier_schedule_payload or {}),
@@ -876,7 +878,9 @@ class ResearchArtifactsMixin:
         shard_packets = json.loads(synthesis_shards_path.read_text(encoding="utf-8"))
         persisted_merge: dict[str, Any] = {}
         if synthesis_merge_path.exists():
-            persisted_merge = json.loads(synthesis_merge_path.read_text(encoding="utf-8"))
+            persisted_merge = json.loads(
+                synthesis_merge_path.read_text(encoding="utf-8")
+            )
         objective = str(manifest.get("objective") or run_id)
         query = str(manifest.get("query") or objective)
         depth = str(manifest.get("depth") or "standard")
@@ -886,17 +890,25 @@ class ResearchArtifactsMixin:
                 1,
                 int(manifest.get("max_sources") or len(shard_packets) or 1),
             ),
-            per_provider=max(1, int(manifest.get("per_provider") or self.limit_per_provider)),
+            per_provider=max(
+                1, int(manifest.get("per_provider") or self.limit_per_provider)
+            ),
             max_query_variants=max(
                 1,
-                int(manifest.get("max_query_variants") or len(manifest.get("query_variants") or []) or 1),
+                int(
+                    manifest.get("max_query_variants")
+                    or len(manifest.get("query_variants") or [])
+                    or 1
+                ),
             ),
         )
         plan = dict(manifest.get("plan") or {})
         retrieval = dict(manifest.get("retrieval") or {})
         query_variants = [
             str(item)
-            for item in (manifest.get("query_variants") or retrieval.get("query_variants") or [])
+            for item in (
+                manifest.get("query_variants") or retrieval.get("query_variants") or []
+            )
             if str(item).strip()
         ]
         frontier_schedule_payload = dict(manifest.get("detached_frontier") or {})
@@ -924,11 +936,17 @@ class ResearchArtifactsMixin:
                 **merge_coordinator,
                 **persisted_merge,
                 "shards": list(
-                    persisted_merge.get("shards") or merge_coordinator.get("shards") or []
+                    persisted_merge.get("shards")
+                    or merge_coordinator.get("shards")
+                    or []
                 ),
             }
         synthesis_packet["merge_coordinator"] = merge_coordinator
-        stop_reason = str(retrieval.get("stop_reason") or persisted_merge.get("stop_reason") or "checkpoint-replay")
+        stop_reason = str(
+            retrieval.get("stop_reason")
+            or persisted_merge.get("stop_reason")
+            or "checkpoint-replay"
+        )
         synthesis_packet["retrieval_stop_reason"] = stop_reason
         summary_sources = self._synthesis_packet_sources(synthesis_packet)
         summary = self._summarize(

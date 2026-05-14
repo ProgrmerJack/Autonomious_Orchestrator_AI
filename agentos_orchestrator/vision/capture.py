@@ -197,8 +197,7 @@ def capture_screen(
     backends = list_capture_backends()
     if not backends:
         raise CaptureUnavailable(
-            "No screenshot backend available; install one of: "
-            "mss, Pillow, pyscreeze."
+            "No screenshot backend available; install one of: mss, Pillow, pyscreeze."
         )
     if preferred_backend:
         backends.sort(key=lambda b: 0 if b.name == preferred_backend else 1)
@@ -209,6 +208,4 @@ def capture_screen(
         except Exception as exc:
             last_error = exc
             continue
-    raise CaptureUnavailable(
-        f"All capture backends failed; last error: {last_error!r}"
-    )
+    raise CaptureUnavailable(f"All capture backends failed; last error: {last_error!r}")

@@ -1945,7 +1945,9 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(merged_packet["provider_counts"]["openalex"], 1)
         self.assertEqual(merged_packet["perspective_coverage"]["count"], 2)
         self.assertEqual(merged_packet["synthesis_source_count"], 2)
-        self.assertEqual(merged_packet["top_sources"][0]["title"], "Higher Score Source")
+        self.assertEqual(
+            merged_packet["top_sources"][0]["title"], "Higher Score Source"
+        )
         architecture_finding = next(
             finding
             for finding in merged_packet["findings"]
@@ -2892,8 +2894,7 @@ class ResearchTests(unittest.TestCase):
                 / "runs/run_synthesis_packet/research/synthesis_merge_coordinator.json"
             )
             report_path = (
-                Path(temp_dir)
-                / "runs/run_synthesis_packet/research/analysis_report.md"
+                Path(temp_dir) / "runs/run_synthesis_packet/research/analysis_report.md"
             )
             self.assertTrue(shard_packet_path.exists())
             self.assertTrue(merge_path.exists())
@@ -3278,18 +3279,21 @@ class ResearchTests(unittest.TestCase):
                 return {url: ("X" * max_chars) for url in urls}
 
         urls = [f"https://example.com/page-{index}" for index in range(8)]
-        with patch.object(
-            DeepResearchEngine,
-            "_local_browser_pressure_caps",
-            return_value={
-                "headless_browser_workers": 4,
-                "headless_prefetch_url_limit": 6,
-                "headless_prefetch_per_url_chars": 20_000,
-                "headless_prefetch_total_chars": 60_000,
-            },
-        ), patch(
-            "agentos_orchestrator.research.retrieval._HeadlessBrowserWorkerPool",
-            FakePool,
+        with (
+            patch.object(
+                DeepResearchEngine,
+                "_local_browser_pressure_caps",
+                return_value={
+                    "headless_browser_workers": 4,
+                    "headless_prefetch_url_limit": 6,
+                    "headless_prefetch_per_url_chars": 20_000,
+                    "headless_prefetch_total_chars": 60_000,
+                },
+            ),
+            patch(
+                "agentos_orchestrator.research.retrieval._HeadlessBrowserWorkerPool",
+                FakePool,
+            ),
         ):
             results = engine._headless_browser_pool_fetch(
                 urls,
@@ -3365,7 +3369,9 @@ class ResearchTests(unittest.TestCase):
 
     def test_software_agent_text_probe_accepts_academic_language(self) -> None:
         query = "accessibility tree desktop agents"
-        text = "Accessibility Tree Agents accessibility agents control desktop interfaces."
+        text = (
+            "Accessibility Tree Agents accessibility agents control desktop interfaces."
+        )
 
         self.assertTrue(DeepResearchEngine._text_matches_intent_spec(text, query))
 
@@ -3463,7 +3469,9 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(DeepResearchEngine._matches_intent_spec(sec_nav, query))
         self.assertTrue(DeepResearchEngine._matches_intent_spec(sec_filing, query))
 
-    def test_public_security_rejects_single_word_upside_lexical_collisions(self) -> None:
+    def test_public_security_rejects_single_word_upside_lexical_collisions(
+        self,
+    ) -> None:
         query = (
             "which publicly traded companies have the highest probability-adjusted "
             "upside potential over the next 12 to 24 months"
@@ -3516,7 +3524,9 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("consensus price target upside", joined)
         self.assertIn("earnings estimate revision", joined)
 
-    def test_seed_discovery_queries_keep_broad_market_objective_basket_level(self) -> None:
+    def test_seed_discovery_queries_keep_broad_market_objective_basket_level(
+        self,
+    ) -> None:
         engine = DeepResearchEngine()
         objective = (
             "As of right now, research which publicly traded companies have the "

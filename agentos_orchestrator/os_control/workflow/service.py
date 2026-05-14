@@ -76,9 +76,7 @@ class WorkflowVerificationError(RuntimeError):
         self.receipt = receipt
         self.verification = verification
         self.recovery = recovery
-        reason = str(
-            verification.get("reason") or "workflow verification failed"
-        )
+        reason = str(verification.get("reason") or "workflow verification failed")
         super().__init__(reason)
 
     def asdict(self) -> dict[str, Any]:
@@ -260,13 +258,9 @@ class DesktopWorkflowService:
                 if hasattr(run, "avg_latency_ms"):
                     universal_receipt["avg_latency_ms"] = run.avg_latency_ms
                 if hasattr(run, "model_used_ratio"):
-                    universal_receipt["model_used_ratio"] = (
-                        run.model_used_ratio
-                    )
+                    universal_receipt["model_used_ratio"] = run.model_used_ratio
                 if hasattr(run, "adaptive_steps_used"):
-                    universal_receipt["adaptive_steps_used"] = (
-                        run.adaptive_steps_used
-                    )
+                    universal_receipt["adaptive_steps_used"] = run.adaptive_steps_used
                 receipts.append(
                     {
                         "action_type": "universal_agent_run",
@@ -289,9 +283,7 @@ class DesktopWorkflowService:
                     {
                         "action_type": "universal_agent_run",
                         "selector": "cognitive-orchestrator",
-                        "description": (
-                            "Cognitive architecture execution failed"
-                        ),
+                        "description": ("Cognitive architecture execution failed"),
                         "receipt": {
                             "error": str(exc),
                             "adaptation_readiness": adaptation_readiness,
@@ -638,9 +630,11 @@ class DesktopWorkflowService:
         objective: str,
         app_agent: AppAgentSession | None,
     ) -> UiAction:
-        route = str(
-            action.metadata.get("control_route") or proposal.route or ""
-        ).strip().lower()
+        route = (
+            str(action.metadata.get("control_route") or proposal.route or "")
+            .strip()
+            .lower()
+        )
         replacement: UiAction | None = None
         if route == "code_tool":
             replacement = self._code_tool_replacement(action)
@@ -682,8 +676,7 @@ class DesktopWorkflowService:
                 "tool_request": request,
                 "control_channel": "code",
                 "expected_observation": (
-                    "The workspace file operation completes through the "
-                    "code tool lane."
+                    "The workspace file operation completes through the code tool lane."
                 ),
                 "verification_contract": verification_contract,
                 "policy_anchor_action": {
@@ -729,32 +722,24 @@ class DesktopWorkflowService:
         )
         if request is None:
             return None
-        selector = str(
-            request.get("selector") or "tool_executor:workflow_api"
-        )
+        selector = str(request.get("selector") or "tool_executor:workflow_api")
         return UiAction(
             action_type="tool",
             selector=selector,
             metadata={
                 "tool_request": request,
                 "control_channel": "api",
-                "expected_observation": str(
-                    request.get("expected_observation") or ""
-                ),
+                "expected_observation": str(request.get("expected_observation") or ""),
                 "verification_contract": {
                     "kind": "receipt_success",
-                    "expected": str(
-                        request.get("expected_observation") or ""
-                    ),
+                    "expected": str(request.get("expected_observation") or ""),
                     "target": selector,
                     "required": True,
                 },
                 "policy_anchor_action": {
                     "action_type": "http_request",
                     "selector": str(
-                        request.get("endpoint")
-                        or request.get("selector")
-                        or ""
+                        request.get("endpoint") or request.get("selector") or ""
                     ),
                     "metadata": {"control_channel": "api"},
                 },
@@ -905,21 +890,16 @@ class DesktopWorkflowService:
                     "auth_env_keys": auth_env_keys,
                     "objective": objective,
                     "expected_observation": (
-                        "The synthesized API workflow returns structured "
-                        "HTTP results."
+                        "The synthesized API workflow returns structured HTTP results."
                     ),
                 }
             endpoint = str(
-                surface.get("endpoint")
-                or surface_metadata.get("endpoint")
-                or ""
+                surface.get("endpoint") or surface_metadata.get("endpoint") or ""
             ).strip()
             if endpoint:
                 return {
                     "kind": "http_probe",
-                    "selector": (
-                        f"tool_executor:control_surface_probe:{endpoint}"
-                    ),
+                    "selector": (f"tool_executor:control_surface_probe:{endpoint}"),
                     "endpoint": endpoint,
                     "methods": ["OPTIONS", "GET"],
                     "objective": objective,
@@ -930,14 +910,10 @@ class DesktopWorkflowService:
         if app_agent is None:
             return None
         policy_action = dict(app_agent.skill_pack.policy_action or {})
-        action_type = str(
-            policy_action.get("action_type") or ""
-        ).strip().lower()
+        action_type = str(policy_action.get("action_type") or "").strip().lower()
         selector = str(policy_action.get("selector") or "").strip()
         policy_metadata = dict(policy_action.get("metadata") or {})
-        endpoint = selector or str(
-            policy_metadata.get("endpoint") or ""
-        ).strip()
+        endpoint = selector or str(policy_metadata.get("endpoint") or "").strip()
         if action_type in {
             "api_call",
             "mcp_call",
@@ -951,8 +927,7 @@ class DesktopWorkflowService:
                 "methods": ["OPTIONS", "GET"],
                 "objective": objective,
                 "expected_observation": (
-                    "The remembered API affordance returns a structured "
-                    "HTTP result."
+                    "The remembered API affordance returns a structured HTTP result."
                 ),
             }
         return None
@@ -972,9 +947,7 @@ class DesktopWorkflowService:
             return None
         metadata = dict(action.metadata or {})
         auth_env_keys = [
-            str(item)
-            for item in metadata.get("auth_env_keys", [])
-            if str(item)
+            str(item) for item in metadata.get("auth_env_keys", []) if str(item)
         ]
         expected_observation = str(
             metadata.get("expected_observation")
@@ -1002,9 +975,7 @@ class DesktopWorkflowService:
                 "expected_observation": expected_observation,
             }
 
-        endpoint = str(
-            metadata.get("endpoint") or action.selector or ""
-        ).strip()
+        endpoint = str(metadata.get("endpoint") or action.selector or "").strip()
         if not endpoint.startswith(("http://", "https://")):
             return None
         method = str(metadata.get("method") or "GET").strip().upper() or "GET"
@@ -1012,11 +983,7 @@ class DesktopWorkflowService:
         json_body = metadata.get("json_body")
         if json_body is None and "body" in metadata:
             json_body = metadata.get("body")
-        if (
-            json_body is not None
-            or method not in {"GET", "OPTIONS"}
-            or headers
-        ):
+        if json_body is not None or method not in {"GET", "OPTIONS"} or headers:
             return {
                 "kind": "api_workflow",
                 "selector": f"tool_executor:workflow_api:{endpoint}",
@@ -1115,18 +1082,14 @@ class DesktopWorkflowService:
         if action_type == "cell_edit":
             return VerificationContract(
                 kind="receipt_success",
-                expected=(
-                    "The backend receipt reports successful action execution."
-                ),
+                expected=("The backend receipt reports successful action execution."),
                 target=selector,
                 required=True,
             )
         if action_type == "draw_path":
             return VerificationContract(
                 kind="receipt_success",
-                expected=(
-                    "The backend receipt reports successful action execution."
-                ),
+                expected=("The backend receipt reports successful action execution."),
                 target=selector,
                 required=False,
             )
@@ -1293,10 +1256,7 @@ class DesktopWorkflowService:
         app_agent: AppAgentSession,
     ) -> bool:
         lower = str(objective or "").lower()
-        if any(
-            keyword in lower
-            for keyword in ("localhost", "port", "graphql")
-        ):
+        if any(keyword in lower for keyword in ("localhost", "port", "graphql")):
             return True
         policy_action = dict(app_agent.skill_pack.policy_action or {})
         selector = str(policy_action.get("selector") or "")
@@ -1481,9 +1441,7 @@ class DesktopWorkflowService:
                 else:
                     source.unlink()
             else:
-                raise ValueError(
-                    f"Unsupported workspace file operation '{operation}'."
-                )
+                raise ValueError(f"Unsupported workspace file operation '{operation}'.")
         except (OSError, ValueError) as exc:
             return json.dumps(
                 {
@@ -1627,9 +1585,7 @@ class DesktopWorkflowService:
         kind = str(request.get("kind") or "").strip().lower()
         objective = str(request.get("objective") or "")
         auth_env_keys = [
-            str(item)
-            for item in request.get("auth_env_keys", [])
-            if str(item)
+            str(item) for item in request.get("auth_env_keys", []) if str(item)
         ]
         if kind == "api_workflow":
             code = self.tool_executor.build_api_workflow_code(
@@ -1638,11 +1594,7 @@ class DesktopWorkflowService:
         elif kind == "http_probe":
             code = self.tool_executor.build_http_probe_code(
                 [str(request.get("endpoint") or "")],
-                methods=[
-                    str(item)
-                    for item in request.get("methods", [])
-                    if str(item)
-                ],
+                methods=[str(item) for item in request.get("methods", []) if str(item)],
             )
         else:
             return json.dumps(
@@ -1689,11 +1641,7 @@ class DesktopWorkflowService:
         if kind == "api_workflow":
             payload = parsed_results.get("api_workflow")
             if isinstance(payload, list) and payload:
-                if any(
-                    item.get("error")
-                    for item in payload
-                    if isinstance(item, dict)
-                ):
+                if any(item.get("error") for item in payload if isinstance(item, dict)):
                     return None
                 return payload
             return None
@@ -1704,8 +1652,7 @@ class DesktopWorkflowService:
             if not isinstance(endpoint_result, dict):
                 continue
             if any(
-                not isinstance(method_result, dict)
-                or method_result.get("error")
+                not isinstance(method_result, dict) or method_result.get("error")
                 for method_result in endpoint_result.values()
             ):
                 continue
@@ -1787,7 +1734,9 @@ class DesktopWorkflowService:
             "## Sources",
         ]
         for index, source in enumerate(sources, start=1):
-            title = str(getattr(source, "title", "") or getattr(source, "url", "source"))
+            title = str(
+                getattr(source, "title", "") or getattr(source, "url", "source")
+            )
             url = str(getattr(source, "url", "") or "")
             provider = str(getattr(source, "provider", "unknown") or "unknown")
             year = getattr(source, "year", None)
@@ -1823,7 +1772,9 @@ class DesktopWorkflowService:
         return str(getattr(source, "url", "") or "source snippet unavailable")
 
     def _workspace_relative_path(self, path: Path) -> str:
-        return path.resolve().relative_to(self.writer.workspace_root.resolve()).as_posix()
+        return (
+            path.resolve().relative_to(self.writer.workspace_root.resolve()).as_posix()
+        )
 
     @staticmethod
     def _annotate_action_runtime(
@@ -1922,8 +1873,7 @@ class DesktopWorkflowService:
     ) -> dict[str, Any]:
         provider = "dry-run"
         if app_agent is not None and (
-            app_agent.skill_pack.visual_heavy
-            or not app_agent.skill_pack.safe_windows
+            app_agent.skill_pack.visual_heavy or not app_agent.skill_pack.safe_windows
         ):
             provider = "agent-body"
         spec = SandboxSpec(
@@ -1982,10 +1932,7 @@ class DesktopWorkflowService:
         recovery: dict[str, Any],
     ) -> str:
         control = dict(action.metadata.get("control") or {})
-        trace_id = str(
-            control.get("ledger_entry_id")
-            or f"workflow_{int(time.time())}"
-        )
+        trace_id = str(control.get("ledger_entry_id") or f"workflow_{int(time.time())}")
         failure_dir = (
             self.writer.workspace_root
             / "artifacts"
@@ -2014,9 +1961,7 @@ class DesktopWorkflowService:
             json.dumps(payload, indent=2),
             encoding="utf-8",
         )
-        golden_dir = (
-            self.writer.workspace_root / "benchmarks" / "golden_traces"
-        )
+        golden_dir = self.writer.workspace_root / "benchmarks" / "golden_traces"
         golden_dir.mkdir(parents=True, exist_ok=True)
         golden_path = golden_dir / f"workflow_{trace_id}.json"
         if not golden_path.exists():

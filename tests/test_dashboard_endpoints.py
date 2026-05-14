@@ -507,10 +507,14 @@ class DashboardEndpointsTests(unittest.TestCase):
 
                 self.assertEqual(research.status_code, 200)
                 self.assertEqual(progress.status_code, 200)
-                self.assertEqual(research.json()["brief"], "checkpointed research brief")
+                self.assertEqual(
+                    research.json()["brief"], "checkpointed research brief"
+                )
                 self.assertEqual(progress.json()["stage"], "retrieval-running")
 
-    def test_dashboard_replay_merge_endpoint_dispatches_to_research_engine(self) -> None:
+    def test_dashboard_replay_merge_endpoint_dispatches_to_research_engine(
+        self,
+    ) -> None:
         try:
             from fastapi.testclient import TestClient
         except ImportError:

@@ -76,10 +76,7 @@ class PerceptionFrame:
                     role=elem.role,
                     source=elem.source,
                     confidence=elem.confidence,
-                    metadata={
-                        k: str(v)
-                        for k, v in elem.metadata.items()
-                    },
+                    metadata={k: str(v) for k, v in elem.metadata.items()},
                 )
             )
         return out
@@ -103,7 +100,9 @@ def _load_adaptive_engine() -> Any | None:
         return None
 
 
-def _ocr_with_rapidocr(png_bytes: bytes) -> list[tuple[tuple[int, int, int, int], str, float]]:
+def _ocr_with_rapidocr(
+    png_bytes: bytes,
+) -> list[tuple[tuple[int, int, int, int], str, float]]:
     try:
         from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
         import numpy as np  # type: ignore[import-not-found]
@@ -135,7 +134,9 @@ def _ocr_with_rapidocr(png_bytes: bytes) -> list[tuple[tuple[int, int, int, int]
         return []
 
 
-def _ocr_with_tesseract(png_bytes: bytes) -> list[tuple[tuple[int, int, int, int], str, float]]:
+def _ocr_with_tesseract(
+    png_bytes: bytes,
+) -> list[tuple[tuple[int, int, int, int], str, float]]:
     try:
         import pytesseract  # type: ignore[import-not-found]
         from PIL import Image  # type: ignore[import-not-found]
@@ -197,10 +198,7 @@ def _a11y_collect(
             if w <= 0 or h <= 0:
                 continue
             label = str(
-                entry.get("name")
-                or entry.get("label")
-                or entry.get("text")
-                or ""
+                entry.get("name") or entry.get("label") or entry.get("text") or ""
             )
             role = str(entry.get("role") or entry.get("control_type") or "")
             out.append(
@@ -262,7 +260,7 @@ def _merge_elements(
             continue
         fused.append(c)
     # Attach OCR
-    for (box, text, conf) in ocr_hits:
+    for box, text, conf in ocr_hits:
         attached = False
         for idx, e in enumerate(fused):
             ebox = (e.x, e.y, e.width, e.height)
@@ -303,7 +301,8 @@ def _merge_elements(
             _box_iou(
                 (e.x, e.y, e.width, e.height),
                 (f.x, f.y, f.width, f.height),
-            ) >= 0.85
+            )
+            >= 0.85
             for f in deduped
         ):
             continue

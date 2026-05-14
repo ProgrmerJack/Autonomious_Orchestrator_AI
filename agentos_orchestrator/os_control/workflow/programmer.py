@@ -64,9 +64,7 @@ class ProgrammerTask:
         return cls(
             objective=str(raw.get("objective") or ""),
             mode=str(raw.get("mode") or "app-task"),
-            selector=str(
-                raw.get("selector") or "tool_executor:workflow_programmer"
-            ),
+            selector=str(raw.get("selector") or "tool_executor:workflow_programmer"),
             description=str(raw.get("description") or ""),
             code=str(raw.get("code") or ""),
             outputs=outputs,
@@ -76,12 +74,8 @@ class ProgrammerTask:
                 if str(key) and str(value)
             },
             allow_network=bool(raw.get("allow_network", False)),
-            allowed_packages=[
-                str(item) for item in raw.get("allowed_packages", [])
-            ],
-            expose_env_keys=[
-                str(item) for item in raw.get("expose_env_keys", [])
-            ],
+            allowed_packages=[str(item) for item in raw.get("allowed_packages", [])],
+            expose_env_keys=[str(item) for item in raw.get("expose_env_keys", [])],
             timeout_seconds=int(raw.get("timeout_seconds", 45)),
         )
 
@@ -109,10 +103,7 @@ def build_programmer_task(plan: DesktopWorkflowPlan) -> ProgrammerTask | None:
         objective=plan.objective,
         mode=plan.mode,
         selector="tool_executor:workflow_programmer",
-        description=(
-            "Generate workflow artefacts in the sandboxed programmer "
-            "lane."
-        ),
+        description=("Generate workflow artefacts in the sandboxed programmer lane."),
         code=code,
         outputs=outputs,
         input_paths=input_paths,
@@ -185,10 +176,7 @@ def _programmer_code(
             "    path.write_text(text, encoding='utf-8')",
             "    manifest['files'].append(name)",
             "    manifest['bytes'][name] = len(text.encode('utf-8'))",
-            (
-                "print('RESULT: generated=' + json.dumps(manifest, "
-                "sort_keys=True))"
-            ),
+            ("print('RESULT: generated=' + json.dumps(manifest, sort_keys=True))"),
             "",
         ]
     )
@@ -413,10 +401,7 @@ def _default_report_content(objective: str) -> str:
         "",
         "## Operating Plan",
         "1. Validate the requested outcome and artefacts.",
-        (
-            "2. Use the safest available control route for the current app "
-            "family."
-        ),
+        ("2. Use the safest available control route for the current app family."),
         "3. Re-observe after each committed step before continuing.",
         "",
     ]
@@ -439,10 +424,7 @@ def _default_report_content(objective: str) -> str:
             "## Guardrails",
             "- Approval remains required for destructive or external actions.",
             "- Outputs should be reproducible from the sandbox recipe.",
-            (
-                "- GUI work should only start once the generated artefacts "
-                "verify."
-            ),
+            ("- GUI work should only start once the generated artefacts verify."),
             "",
         ]
     )
@@ -711,8 +693,7 @@ def _tickers(objective: str) -> list[str]:
 def _looks_like_market_work(objective: str) -> bool:
     lower = objective.lower()
     return any(
-        token in lower
-        for token in ("stock", "market", "portfolio", "ticker", "price")
+        token in lower for token in ("stock", "market", "portfolio", "ticker", "price")
     )
 
 

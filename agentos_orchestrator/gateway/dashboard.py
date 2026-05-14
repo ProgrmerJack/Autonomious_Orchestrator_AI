@@ -646,7 +646,13 @@ def create_dashboard_app(
             Returns the most recently written progress.json if available,
             or a 404 if the research phase has not yet started.
             """
-            progress_path = research_workspace_root() / "runs" / run_id / "research" / "progress.json"
+            progress_path = (
+                research_workspace_root()
+                / "runs"
+                / run_id
+                / "research"
+                / "progress.json"
+            )
             if not progress_path.exists():
                 raise fastapi.HTTPException(
                     status_code=404,

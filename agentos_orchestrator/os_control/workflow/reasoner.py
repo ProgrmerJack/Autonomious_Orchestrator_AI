@@ -348,7 +348,9 @@ class DesktopWorkflowReasoner:
         plan: DesktopWorkflowPlan,
         receipts: list[dict[str, Any]],
     ) -> DesktopWorkflowStep | None:
-        if cls._has_tool_selector(receipts, "tool_executor:workflow_programmer") or cls._has_semantic_surface_write(receipts):
+        if cls._has_tool_selector(
+            receipts, "tool_executor:workflow_programmer"
+        ) or cls._has_semantic_surface_write(receipts):
             return None
         for step in plan.steps:
             if (
@@ -357,7 +359,8 @@ class DesktopWorkflowReasoner:
             ):
                 return step
         if any(
-            step.action_type == "tool" and step.selector == "tool_executor:workflow_research"
+            step.action_type == "tool"
+            and step.selector == "tool_executor:workflow_research"
             for step in plan.steps
         ):
             return None
@@ -386,7 +389,9 @@ class DesktopWorkflowReasoner:
                 continue
             score = 100 if node.focused else 0
             score += 40 if metadata.get("workflow") else 0
-            score += 25 if metadata.get("endpoint") or metadata.get("api_endpoint") else 0
+            score += (
+                25 if metadata.get("endpoint") or metadata.get("api_endpoint") else 0
+            )
             score += 20 if node.role in {"Pane", "Document", "Table"} else 0
             score += 10 if "dashboard" in name_lower or "api" in name_lower else 0
             candidates.append((score, node, endpoint))
@@ -438,7 +443,10 @@ class DesktopWorkflowReasoner:
                 return True
             selector = str(item.get("selector") or "")
             receipt = item.get("receipt")
-            if "tool_executor:workflow_api" in selector or "control_surface_probe" in selector:
+            if (
+                "tool_executor:workflow_api" in selector
+                or "control_surface_probe" in selector
+            ):
                 return True
             if isinstance(receipt, dict) and str(receipt.get("kind") or "") in {
                 "api_workflow",
@@ -456,7 +464,10 @@ class DesktopWorkflowReasoner:
             ):
                 return True
             receipt = item.get("receipt")
-            if isinstance(receipt, dict) and str(receipt.get("kind") or "") == "workflow_research_brief":
+            if (
+                isinstance(receipt, dict)
+                and str(receipt.get("kind") or "") == "workflow_research_brief"
+            ):
                 return True
         return False
 
@@ -509,7 +520,9 @@ class DesktopWorkflowReasoner:
             return "PATCH"
         if " put " in lower:
             return "PUT"
-        if any(token in lower for token in (" post ", " create ", " submit ", " send ")):
+        if any(
+            token in lower for token in (" post ", " create ", " submit ", " send ")
+        ):
             return "POST"
         return "GET"
 

@@ -68,9 +68,7 @@ def register_run_heartbeat_route(app: Any, auth: Any) -> None:
     async def heartbeat(websocket: Any, run_id: str) -> None:
         try:
             auth.require_session(
-                session_token=str(
-                    websocket.query_params.get("session_token") or ""
-                ),
+                session_token=str(websocket.query_params.get("session_token") or ""),
                 client_host=_client_host(websocket),
                 origin=_request_origin(websocket),
                 csrf_token=str(websocket.query_params.get("csrf_token") or ""),

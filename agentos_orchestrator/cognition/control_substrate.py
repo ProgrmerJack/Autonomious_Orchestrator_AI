@@ -642,7 +642,7 @@ class AdaptiveControlLedger:
             return []
         lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
         events: list[dict[str, Any]] = []
-        for line in lines[-max(1, limit):]:
+        for line in lines[-max(1, limit) :]:
             try:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
@@ -953,9 +953,7 @@ def _select_route(
 ) -> str:
     best_score = max(route_scores.values(), default=0.0)
     candidates = [
-        route
-        for route, score in route_scores.items()
-        if abs(score - best_score) < 1e-6
+        route for route, score in route_scores.items() if abs(score - best_score) < 1e-6
     ]
     if len(candidates) == 1:
         return candidates[0]
@@ -1049,11 +1047,15 @@ def _apply_skill_pack_route_bias(
     if isinstance(policy_action, dict):
         policy_metadata = policy_action.get("metadata") or {}
         if isinstance(policy_metadata, dict):
-            memory_channel = str(
-                policy_metadata.get("control_channel")
-                or policy_metadata.get("control_route")
-                or ""
-            ).strip().lower()
+            memory_channel = (
+                str(
+                    policy_metadata.get("control_channel")
+                    or policy_metadata.get("control_route")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
             memory_route = channel_route.get(memory_channel, memory_channel)
             if memory_route in compatible_routes:
                 route_scores[memory_route] += 0.08
@@ -1081,11 +1083,15 @@ def _has_api_route_candidate(
     policy_metadata = policy_action.get("metadata") or {}
     if not isinstance(policy_metadata, dict):
         policy_metadata = {}
-    control_channel = str(
-        policy_metadata.get("control_channel")
-        or policy_metadata.get("control_route")
-        or ""
-    ).strip().lower()
+    control_channel = (
+        str(
+            policy_metadata.get("control_channel")
+            or policy_metadata.get("control_route")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     endpoint = str(policy_metadata.get("endpoint") or "").strip().lower()
     return control_channel == "api" and bool(selector or endpoint)
 
@@ -1268,8 +1274,7 @@ def _family_policy_decision(
             allowed=False,
             decision="confirm",
             reason=(
-                f"{family} policy requires approval for this action: "
-                f"{approval_match}."
+                f"{family} policy requires approval for this action: {approval_match}."
             ),
             risk_score=max(proposal.risk_score, 0.78),
             required_approval=True,
@@ -1310,11 +1315,7 @@ def _policy_terms(policy: dict[str, Any], key: str) -> list[str]:
         raw = [raw]
     elif not isinstance(raw, list):
         raw = list(raw) if isinstance(raw, tuple) else []
-    return [
-        str(item or "").strip().lower()
-        for item in raw
-        if str(item or "").strip()
-    ]
+    return [str(item or "").strip().lower() for item in raw if str(item or "").strip()]
 
 
 def _goal_lock_conflict(

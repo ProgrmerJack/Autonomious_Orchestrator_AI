@@ -45,7 +45,10 @@ class ResearchRetrievalMixin:
         cache = self._semantic_gate_cache
         if cache_key in cache:
             cache.pop(cache_key, None)
-        elif _SEMANTIC_GATE_CACHE_RAM_CAP > 0 and len(cache) >= _SEMANTIC_GATE_CACHE_RAM_CAP:
+        elif (
+            _SEMANTIC_GATE_CACHE_RAM_CAP > 0
+            and len(cache) >= _SEMANTIC_GATE_CACHE_RAM_CAP
+        ):
             oldest = next(iter(cache), None)
             if oldest is not None:
                 cache.pop(oldest, None)
@@ -707,10 +710,7 @@ class ResearchRetrievalMixin:
             if (
                 low_marginal_yield_pass
                 and depth_met
-                and (
-                    not source_starved
-                    or starvation_persisted
-                )
+                and (not source_starved or starvation_persisted)
                 and low_marginal_yield_streak >= max_low_marginal_yield_streak
             ):
                 stop_reason = "marginal_yield_exhausted"
@@ -1672,9 +1672,7 @@ class ResearchRetrievalMixin:
         # This preserves cookies/sessions for sites that require login
         # (Bloomberg, WSJ, FT, Seeking Alpha) and dramatically reduces
         # cold-start latency on subsequent fetches.
-        user_data_dir = os.environ.get(
-            "AGENTOS_BROWSER_USER_DATA_DIR", ""
-        ).strip()
+        user_data_dir = os.environ.get("AGENTOS_BROWSER_USER_DATA_DIR", "").strip()
         launch_args = [
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
@@ -2334,7 +2332,11 @@ class ResearchRetrievalMixin:
         content = cls._strip_dom_noise_tokens(content)
         source_title = cls._strip_dom_noise_tokens(source_title)
         source_host = cls._source_host(source_url)
-        if source_host == "sec.gov" and source_url and not cls._is_sec_filing_url(source_url):
+        if (
+            source_host == "sec.gov"
+            and source_url
+            and not cls._is_sec_filing_url(source_url)
+        ):
             return []
         _content_lower = content.lower()[:2000]
         if any(sig in _content_lower for sig in _js_block_signals):

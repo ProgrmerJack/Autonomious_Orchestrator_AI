@@ -161,8 +161,7 @@ class DesktopWorkflowPlanner:
             while (
                 insert_at < len(plan.steps)
                 and plan.steps[insert_at].action_type == "tool"
-                and plan.steps[insert_at].selector
-                == "tool_executor:workflow_research"
+                and plan.steps[insert_at].selector == "tool_executor:workflow_research"
             ):
                 insert_at += 1
             plan.steps = [
@@ -613,7 +612,9 @@ class DesktopWorkflowPlanner:
         ]
         parts: list[str] = []
         for item in raw_parts:
-            if parts and DesktopWorkflowPlanner._should_merge_continuation(parts[-1], item):
+            if parts and DesktopWorkflowPlanner._should_merge_continuation(
+                parts[-1], item
+            ):
                 parts[-1] = f"{parts[-1]} and {item}"
                 continue
             parts.append(item)

@@ -73,16 +73,16 @@ class SetOfMarkResult:
 # even for users with deuteranopia (validated against the IBM Colorblind
 # Accessibility palette).
 _COLOR_CYCLE: tuple[tuple[int, int, int], ...] = (
-    (220, 20, 60),    # crimson
-    (30, 144, 255),   # dodger blue
-    (255, 140, 0),    # dark orange
-    (50, 205, 50),    # lime
-    (148, 0, 211),    # dark violet
-    (0, 191, 255),    # deep sky blue
-    (255, 215, 0),    # gold
-    (255, 20, 147),   # deep pink
-    (46, 139, 87),    # sea green
-    (139, 69, 19),    # saddle brown
+    (220, 20, 60),  # crimson
+    (30, 144, 255),  # dodger blue
+    (255, 140, 0),  # dark orange
+    (50, 205, 50),  # lime
+    (148, 0, 211),  # dark violet
+    (0, 191, 255),  # deep sky blue
+    (255, 215, 0),  # gold
+    (255, 20, 147),  # deep pink
+    (46, 139, 87),  # sea green
+    (139, 69, 19),  # saddle brown
 )
 
 

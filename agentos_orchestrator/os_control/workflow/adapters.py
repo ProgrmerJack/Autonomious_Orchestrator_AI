@@ -66,9 +66,7 @@ def workflow_prefers_research_tool(lower: str, mode: str) -> bool:
         compact,
     ):
         return True
-    search_like = any(
-        cue in compact for cue in ("search for", "look up", "find ")
-    )
+    search_like = any(cue in compact for cue in ("search for", "look up", "find "))
     if not search_like:
         return False
     return any(
@@ -479,7 +477,9 @@ class ApiIntentWorkflowAdapter:
             return "PATCH"
         if " put " in lower:
             return "PUT"
-        if any(token in lower for token in (" post ", " create ", " submit ", " send ")):
+        if any(
+            token in lower for token in (" post ", " create ", " submit ", " send ")
+        ):
             return "POST"
         return "GET"
 
