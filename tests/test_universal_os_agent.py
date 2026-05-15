@@ -53,6 +53,9 @@ from agentos_orchestrator.cognition.local_vla import (
 from agentos_orchestrator.cognition.mode_arbitration import ModeArbiter, ModeContext
 from agentos_orchestrator.cognition.os_eval_packs import (
     SURFACE_FAMILIES,
+    build_combined_live_fire_eval_pack,
+    build_everyday_family_eval_pack,
+    build_real_user_handoff_eval_pack,
     build_universal_app_eval_pack,
 )
 from agentos_orchestrator.cognition.replay_debug import load_replay_debug
@@ -461,6 +464,18 @@ class SafetyGateTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("Dangerous shell", decision.reason)
 
+    def test_allows_action_source_metadata_without_path_violation(self) -> None:
+        tmpdir = Path(tempfile.mkdtemp())
+        verifier = FormalSafetyVerifier(SafetyPolicy(allowed_roots=[tmpdir]))
+        decision = verifier.verify_action(
+            UiAction(
+                "click",
+                "name=Search",
+                metadata={"source": "adaptive_perception"},
+            )
+        )
+        self.assertTrue(decision.allowed)
+
 
 class RuntimeStateTests(unittest.TestCase):
     def test_temporal_trace_actions_and_reflections_enter_prompt_context(self) -> None:
@@ -858,6 +873,32 @@ class VerificationContractTests(unittest.TestCase):
         self.assertTrue(result.matched)
         self.assertEqual(result.kind, "state_changed")
 
+    def test_state_changed_rejects_explicit_failure_receipt_even_with_diff(self) -> None:
+        action = UiAction(
+            "click",
+            "name=Missing",
+            metadata={
+                "verification_contract": VerificationContract(
+                    kind="state_changed",
+                    expected="The UI should change after the click.",
+                ).asdict()
+            },
+        )
+        result = verify_action_contract(
+            action,
+            AbstractUIState(app_context="browser"),
+            AbstractUIState(app_context="editor"),
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "No UI element matched selector 'name=Missing'",
+                }
+            ),
+        )
+
+        self.assertFalse(result.matched)
+        self.assertEqual(result.kind, "state_changed")
+
     def test_field_contains_accepts_edit_receipt_when_snapshot_is_stale(self) -> None:
         action = UiAction(
             "set_text",
@@ -1073,6 +1114,38 @@ class BenchmarkScenarioTests(unittest.TestCase):
         self.assertIn("trading_terminal", summary["surface_counts"])
         self.assertIn("enterprise_grid", summary["surface_counts"])
         self.assertTrue(summary["ready_for_live_fire"])
+
+    def test_real_user_handoff_pack_covers_cross_app_desktop_flows(self) -> None:
+        pack = build_real_user_handoff_eval_pack()
+        summary = pack.summary()
+
+        self.assertEqual(pack.name, "real_user_handoff_v1")
+        self.assertEqual(summary["task_count"], 4)
+        self.assertEqual(summary["cross_app_task_count"], 2)
+        self.assertEqual(
+            {task.surface for task in pack.tasks},
+            {"browser", "file_explorer", "chat_app", "pdf_viewer"},
+        )
+
+    def test_everyday_pack_covers_email_calendar_and_settings(self) -> None:
+        pack = build_everyday_family_eval_pack()
+        summary = pack.summary()
+
+        self.assertEqual(pack.name, "everyday_family_realism_v1")
+        self.assertEqual(summary["task_count"], 3)
+        self.assertEqual(summary["cross_app_task_count"], 2)
+        self.assertEqual(
+            {task.surface for task in pack.tasks},
+            {"email", "calendar", "settings"},
+        )
+
+    def test_combined_pack_includes_everyday_realism_tasks(self) -> None:
+        pack = build_combined_live_fire_eval_pack()
+        intents = {task.intent for task in pack.tasks}
+
+        self.assertIn("email_send_attachment", intents)
+        self.assertIn("calendar_invite_from_email", intents)
+        self.assertIn("settings_toggle_night_light", intents)
 
 
 class UniversalAgentFrontierIntegrationTests(unittest.TestCase):

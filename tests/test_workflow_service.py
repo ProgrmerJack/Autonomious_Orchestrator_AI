@@ -501,6 +501,80 @@ class GoalLockBlockingBackend:
         return json.dumps({"status": "executed"})
 
 
+class ClipboardHandoffBackend:
+    def __init__(self) -> None:
+        self.field_value = "Document Canvas"
+        self.clipboard = ""
+        self.actions: list[tuple[str, str, str | None]] = []
+        self.action_metadata: list[dict[str, Any]] = []
+
+    def snapshot(self) -> list[UiNode]:
+        return [
+            UiNode(
+                node_id="doc-canvas",
+                role="Document",
+                name=self.field_value,
+                focused=True,
+            )
+        ]
+
+    def perform(self, action) -> str:
+        self.actions.append((action.action_type, action.selector, action.value))
+        self.action_metadata.append(dict(action.metadata or {}))
+        if action.action_type in {"set_clipboard", "clipboard_copy"}:
+            self.clipboard = str(action.value or "")
+            return json.dumps(
+                {"status": "clipboard-updated", "clipboard": self.clipboard}
+            )
+        if action.action_type in {"type", "set_text", "set_value"}:
+            self.field_value = str(action.value or "")
+            return json.dumps(
+                {
+                    "status": "value-set",
+                    "selector": action.selector,
+                    "value": action.value,
+                }
+            )
+        return json.dumps(
+            {
+                "status": "executed",
+                "action": action.action_type,
+                "selector": action.selector,
+                "value": action.value,
+            }
+        )
+
+
+class _StubUniversalRun:
+    def __init__(self) -> None:
+        self.run_id = "stub-universal-run"
+        self.success = True
+        self.steps: list[Any] = []
+        self.exploration_probes_used = 0
+        self.mcts_simulations_run = 0
+        self.final_state = {"status": "stubbed"}
+
+
+class RepairingUniversalAgentStub:
+    def repair_bootstrap_plan(
+        self,
+        objective: str,
+        plan: DesktopWorkflowPlan,
+        *,
+        backend: Any | None = None,
+    ) -> DesktopWorkflowPlan:
+        del plan, backend
+        return DesktopWorkflowPlanner().plan(objective)
+
+    def run_with_planned_bootstrap(
+        self,
+        objective: str,
+        plan: DesktopWorkflowPlan,
+    ) -> _StubUniversalRun:
+        del objective, plan
+        return _StubUniversalRun()
+
+
 class StaticDesktopWorkflowPlanner:
     def __init__(self, plan: DesktopWorkflowPlan) -> None:
         self._plan = plan
@@ -700,6 +774,75 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertIn(plan.app_target, {"explorer.exe", None})
         self.assertTrue(any(step.action_type == "rename_file" for step in plan.steps))
 
+    def test_planner_routes_local_file_search_to_explorer_not_browser(self) -> None:
+        planner = DesktopWorkflowPlanner()
+
+        plan = planner.plan(
+            "find the latest invoice PDF in Downloads and rename it to april-invoice.pdf"
+        )
+
+        self.assertEqual(plan.intent.get("search_scope"), "local_files")
+        self.assertEqual(plan.intent.get("source_surface"), "file_explorer")
+        self.assertEqual(plan.app_target, "explorer.exe")
+        self.assertTrue(any(step.action_type == "rename_file" for step in plan.steps))
+        self.assertFalse(any(step.action_type == "open_url" for step in plan.steps))
+
+    def test_planner_distinguishes_clipboard_copy_from_file_copy(self) -> None:
+        planner = DesktopWorkflowPlanner()
+
+        plan = planner.plan(
+            "search Chrome for the nearest UPS store and copy the address into Notepad"
+        )
+
+        self.assertEqual(plan.intent.get("copy_semantics"), "text")
+        self.assertTrue(plan.intent.get("cross_app"))
+        self.assertEqual(plan.intent.get("source_surface"), "browser")
+        self.assertEqual(plan.intent.get("destination_surface"), "editor")
+        self.assertTrue(any(step.action_type == "set_clipboard" for step in plan.steps))
+        self.assertTrue(any(step.selector == "document-canvas" for step in plan.steps))
+        self.assertFalse(any(step.action_type == "copy_file" for step in plan.steps))
+
+    def test_planner_routes_settings_toggle_to_settings_surface(self) -> None:
+        planner = DesktopWorkflowPlanner()
+
+        plan = planner.plan("Open Settings and turn on Night Light.")
+
+        self.assertEqual(plan.intent.get("source_surface"), "settings")
+        self.assertEqual(plan.app_target, "settings.exe")
+        self.assertIn("search_settings", plan.intent.get("operations") or [])
+        self.assertIn("toggle_setting", plan.intent.get("operations") or [])
+        self.assertTrue(any(step.selector == "settings-search-box" for step in plan.steps))
+        self.assertTrue(any(step.selector == "settings-toggle" for step in plan.steps))
+        self.assertFalse(any(step.selector == "app-workspace" for step in plan.steps))
+
+    def test_planner_routes_attachment_workflow_into_email_family(self) -> None:
+        planner = DesktopWorkflowPlanner()
+
+        plan = planner.plan("Attach the PDF from Downloads to an email draft for Alex.")
+
+        self.assertTrue(plan.intent.get("cross_app"))
+        self.assertEqual(plan.intent.get("source_surface"), "file_explorer")
+        self.assertEqual(plan.intent.get("destination_surface"), "email")
+        self.assertIn("attach_file", plan.intent.get("operations") or [])
+        self.assertTrue(any(step.selector == "email-to-field" for step in plan.steps))
+        self.assertTrue(any(step.selector == "email-attachment-field" for step in plan.steps))
+        self.assertFalse(any(step.selector == "app-workspace" for step in plan.steps))
+
+    def test_planner_routes_email_invite_into_calendar_family(self) -> None:
+        planner = DesktopWorkflowPlanner()
+
+        plan = planner.plan(
+            "Find the Zoom invite in my email and put it on my calendar."
+        )
+
+        self.assertTrue(plan.intent.get("cross_app"))
+        self.assertEqual(plan.intent.get("source_surface"), "email")
+        self.assertEqual(plan.intent.get("destination_surface"), "calendar")
+        self.assertIn("search_email", plan.intent.get("operations") or [])
+        self.assertIn("create_calendar_event", plan.intent.get("operations") or [])
+        self.assertTrue(any(step.selector == "email-search-box" for step in plan.steps))
+        self.assertTrue(any(step.selector == "calendar-event-editor" for step in plan.steps))
+
     def test_planner_emits_explicit_programmer_tool_step(self) -> None:
         planner = DesktopWorkflowPlanner()
         plan = planner.plan("write a workflow handoff report from current receipts")
@@ -824,6 +967,30 @@ class WorkflowServiceTests(unittest.TestCase):
                     if isinstance(item.get("receipt"), dict)
                 )
             )
+
+    def test_settings_task_executes_without_generic_save_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            from agentos_orchestrator.os_control import (
+                VirtualDesktopSandboxBackend,
+            )
+
+            service = DesktopWorkflowService(root)
+            backend = VirtualDesktopSandboxBackend(root / "sandbox_state_settings.json")
+            result = service.execute("Open Settings and turn on Night Light.", backend)
+
+            launches = [
+                item["receipt"].get("launched")
+                for item in result["receipts"]
+                if isinstance(item.get("receipt"), dict)
+                and item["receipt"].get("launched")
+            ]
+            selectors = [item["selector"] for item in result["receipts"]]
+
+            self.assertIn("settings.exe", launches)
+            self.assertIn("settings-search-box", selectors)
+            self.assertIn("settings-toggle", selectors)
+            self.assertFalse(any(item["action_type"] == "hotkey" for item in result["receipts"]))
 
     def test_find_stock_and_analyze_prefers_research_tool_lane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -960,6 +1127,28 @@ class WorkflowServiceTests(unittest.TestCase):
         assert decision.step is not None
         self.assertEqual(decision.step.action_type, "api_call")
         self.assertEqual(decision.step.selector, endpoint)
+
+    def test_reasoner_prefers_editor_surface_for_clipboard_handoff(self) -> None:
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan(
+            "search Chrome for the nearest UPS store and copy the address into Notepad"
+        )
+        reasoner = DesktopWorkflowReasoner()
+
+        decision = reasoner.next_decision(
+            "search Chrome for the nearest UPS store and copy the address into Notepad",
+            plan,
+            [
+                UiNode("address", "Edit", "Address and search bar"),
+                UiNode("doc", "Document", "Document Canvas", focused=True),
+            ],
+            [],
+        )
+
+        self.assertIsNotNone(decision.step)
+        assert decision.step is not None
+        self.assertEqual(decision.step.selector, "name=Document Canvas")
+        self.assertIn("Address result for:", decision.step.value or "")
 
     def test_perform_with_recovery_records_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1385,6 +1574,127 @@ class WorkflowServiceTests(unittest.TestCase):
             failure = caught.exception.asdict()
             self.assertEqual(backend.perform_calls, 0)
             self.assertIn("goal lock", failure["verification"]["reason"].lower())
+
+    def test_goal_lock_blocks_file_copy_when_intent_requires_clipboard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = GoalLockBlockingBackend()
+            intent = DesktopWorkflowPlanner().plan(
+                "search Chrome for the nearest UPS store and copy the address into Notepad"
+            ).intent
+            plan = DesktopWorkflowPlan(
+                objective="",
+                mode="app-task",
+                app_target=None,
+                summary="clipboard safety plan",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="copy_file",
+                        selector="explorer-file-list",
+                        value="ups.txt -> notes.txt",
+                        description="Misrouted file copy",
+                        metadata={
+                            "operation": "copy",
+                            "source": "ups.txt",
+                            "destination": "notes.txt",
+                        },
+                    )
+                ],
+                artifacts=[],
+                intent=intent,
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(plan))
+
+            with self.assertRaises(WorkflowVerificationError) as caught:
+                service.execute(
+                    "search Chrome for the nearest UPS store and copy the address into Notepad",
+                    backend,
+                )
+
+            failure = caught.exception.asdict()
+            self.assertEqual(backend.perform_calls, 0)
+            self.assertIn(
+                "clipboard transfer",
+                failure["verification"]["reason"],
+            )
+
+    def test_execute_resolves_cross_app_handoff_blackboard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DesktopWorkflowService(Path(temp_dir))
+            backend = ClipboardHandoffBackend()
+            service._execute_adaptive_steps = cast(
+                Any,
+                lambda *args, **kwargs: None,
+            )
+
+            result = service.execute(
+                "search Chrome for the nearest UPS store and copy the address into Notepad",
+                backend,
+            )
+
+            self.assertTrue(
+                any(item[0] == "set_clipboard" for item in backend.actions)
+            )
+            self.assertEqual(backend.field_value, backend.clipboard)
+            self.assertTrue(
+                any(
+                    meta.get("workflow_handoff", {}).get("copied_text")
+                    for meta in backend.action_metadata
+                )
+            )
+            self.assertFalse(
+                any(item["action_type"] == "copy_file" for item in result["receipts"])
+            )
+
+    def test_universal_agent_repairs_bootstrap_plan_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            from agentos_orchestrator.os_control import (
+                VirtualDesktopSandboxBackend,
+            )
+
+            service = DesktopWorkflowService(root)
+            backend = VirtualDesktopSandboxBackend(root / "sandbox_state_repair.json")
+            stale_plan = DesktopWorkflowPlan(
+                objective="",
+                mode="app-task",
+                app_target="msedge.exe",
+                summary="stale browser bootstrap",
+                steps=[
+                    DesktopWorkflowStep(
+                        action_type="launch_app",
+                        selector="msedge.exe",
+                        value="msedge.exe",
+                        description="Launch a stale browser route",
+                    ),
+                    DesktopWorkflowStep(
+                        action_type="open_url",
+                        selector="browser-address-bar",
+                        value="https://www.bing.com/search?q=invoice+pdf",
+                        description="Navigate to a stale browser search",
+                    ),
+                ],
+                artifacts=[],
+            )
+            service.planner = cast(Any, StaticDesktopWorkflowPlanner(stale_plan))
+            service._universal_agent = RepairingUniversalAgentStub()
+            service._universal_backend_id = id(backend)
+            service._execute_adaptive_steps = cast(
+                Any,
+                lambda *args, **kwargs: None,
+            )
+
+            result = service.execute(
+                "find the latest invoice PDF in Downloads and rename it to april-invoice.pdf",
+                backend,
+            )
+
+            self.assertFalse(
+                any(item["action_type"] == "open_url" for item in result["receipts"])
+            )
+            self.assertTrue(
+                any(item["action_type"] == "rename_file" for item in result["receipts"])
+            )
 
     def test_pre_action_verifier_blocks_delete_before_backend(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

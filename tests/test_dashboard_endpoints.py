@@ -141,7 +141,14 @@ class DashboardEndpointsTests(unittest.TestCase):
                 self.assertEqual(workflow_plan["plan"]["mode"], "report")
                 self.assertTrue(
                     any(
-                        step["action_type"] == "open_url"
+                        step["action_type"] == "tool"
+                        and step["selector"] == "tool_executor:workflow_research"
+                        for step in workflow_plan["plan"]["steps"]
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        step["action_type"] == "launch_app"
                         for step in workflow_plan["plan"]["steps"]
                     )
                 )
@@ -165,13 +172,15 @@ class DashboardEndpointsTests(unittest.TestCase):
 
                 eval_pack = api.get("/benchmarks/eval-pack", headers=headers).json()
                 self.assertEqual(eval_pack["task_count"], 100)
+                self.assertEqual(eval_pack["pack"], "combined")
+                self.assertIn("everyday", eval_pack["available_packs"])
 
                 live_fire = api.post(
                     "/benchmarks/live-fire-eval",
                     json={
                         "backend": "virtual-desktop-sandbox",
+                        "pack": "everyday",
                         "max_tasks": 2,
-                        "windows_safe_pack": True,
                         "repeat": 2,
                         "promote_failures": False,
                     },

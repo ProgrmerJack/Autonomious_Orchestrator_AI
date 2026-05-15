@@ -11,6 +11,7 @@ from typing import Any
 
 from agentos_orchestrator.config import gemini_workflow_model
 from agentos_orchestrator.os_control.base import UiNode
+from agentos_orchestrator.os_control.workflow.intent_parser import StructuredIntent
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
     DesktopWorkflowStep,
@@ -55,6 +56,9 @@ class DesktopWorkflowReasoner:
         )
         if direct_decision is not None:
             return direct_decision
+        semantic_decision = self._semantic_intent_decision(plan, nodes, receipts)
+        if semantic_decision is not None:
+            return semantic_decision
         model_decision = self._model_decision(objective, plan, nodes, receipts)
         if model_decision is not None:
             return model_decision
@@ -145,6 +149,10 @@ class DesktopWorkflowReasoner:
         if not nodes:
             return ActionDecision(None, done=True, rationale="No UI nodes available.")
 
+        semantic_decision = self._semantic_intent_decision(plan, nodes, receipts)
+        if semantic_decision is not None:
+            return semantic_decision
+
         if self._is_browser_plan(plan) and self._browser_navigation_complete(
             objective,
             receipts,
@@ -181,7 +189,7 @@ class DesktopWorkflowReasoner:
                 ),
             )
 
-        if plan.app_target and not self._has_action(receipts, "hotkey"):
+        if self._should_auto_save(plan) and not self._has_action(receipts, "hotkey"):
             return ActionDecision(
                 DesktopWorkflowStep(
                     action_type="hotkey",
@@ -195,6 +203,67 @@ class DesktopWorkflowReasoner:
         return ActionDecision(
             None, done=True, rationale="No further adaptive action needed."
         )
+
+    @classmethod
+    def _semantic_intent_decision(
+        cls,
+        plan: DesktopWorkflowPlan,
+        nodes: list[UiNode],
+        receipts: list[dict[str, Any]],
+    ) -> ActionDecision | None:
+        intent = StructuredIntent.from_dict(getattr(plan, "intent", {}) or {})
+        if not intent.operations or cls._has_semantic_surface_write(receipts):
+            return None
+        if intent.destination_surface == "editor" and intent.is_clipboard_copy():
+            target = cls._match_surface_node(
+                nodes,
+                names=("document", "editor", "notepad"),
+                roles={"Document", "Edit"},
+            )
+            if target is not None:
+                payload = (
+                    intent.entities.get("editor_text")
+                    or intent.entities.get("clipboard_text")
+                    or intent.object_hint
+                )
+                return ActionDecision(
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector=cls._selector_for_node(target),
+                        value=payload,
+                        description=(
+                            "Materialize the transferred semantic entity in the editor."
+                        ),
+                    ),
+                    rationale=(
+                        "Structured intent expects a clipboard-to-editor handoff, "
+                        "so prefer the destination editor surface over a generic prompt."
+                    ),
+                )
+        if intent.source_surface == "chat_app" and "draft_reply" in intent.operations:
+            target = cls._match_surface_node(
+                nodes,
+                names=("composer", "reply", "message"),
+                roles={"Edit", "Document"},
+            )
+            if target is not None:
+                payload = (
+                    intent.entities.get("clipboard_text")
+                    or f"Draft summary for: {intent.object_hint}".strip()
+                )
+                return ActionDecision(
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector=cls._selector_for_node(target),
+                        value=payload,
+                        description="Draft the reply in the active chat composer.",
+                    ),
+                    rationale=(
+                        "Structured intent expects a chat reply draft, so prefer the "
+                        "chat composer instead of a generic workspace handoff."
+                    ),
+                )
+        return None
 
     def _model_decision(
         self,
@@ -534,6 +603,15 @@ class DesktopWorkflowReasoner:
     def _has_action(receipts: list[dict[str, Any]], action_type: str) -> bool:
         return any(item.get("action_type") == action_type for item in receipts)
 
+    @staticmethod
+    def _should_auto_save(plan: DesktopWorkflowPlan) -> bool:
+        if not plan.app_target:
+            return False
+        if plan.mode in {"presentation", "drawing", "report", "script", "spreadsheet"}:
+            return True
+        intent = StructuredIntent.from_dict(getattr(plan, "intent", {}) or {})
+        return intent.destination_surface == "editor" or intent.source_surface == "editor"
+
     @classmethod
     def _browser_navigation_complete(
         cls,
@@ -660,6 +738,22 @@ class DesktopWorkflowReasoner:
         if node.name:
             return f"name={node.name}"
         return node.node_id
+
+    @staticmethod
+    def _match_surface_node(
+        nodes: list[UiNode],
+        *,
+        names: tuple[str, ...],
+        roles: set[str],
+    ) -> UiNode | None:
+        ranked = sorted(nodes, key=lambda item: (item.focused, item.enabled), reverse=True)
+        for node in ranked:
+            if roles and node.role not in roles:
+                continue
+            lower = node.name.lower()
+            if any(token in lower for token in names):
+                return node
+        return None
 
     @staticmethod
     def _intent_prompt(objective: str) -> str:

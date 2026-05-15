@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from agentos_orchestrator.os_control.base import UiAction, UiNode
+from agentos_orchestrator.os_control.workflow.intent_parser import (
+    StructuredIntent,
+    parse_structured_intent,
+)
 
 from .abstract_world_model import AbstractUIState
 from .safety_gates import FormalSafetyVerifier, SafetyDecision, SafetyPolicy
@@ -148,6 +152,8 @@ class GoalLock:
     external_navigation_intent: bool
     file_op_intent: bool
     required_surface: str = ""
+    intent_profile: dict[str, Any] = field(default_factory=dict)
+    required_verifications: list[str] = field(default_factory=list)
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
@@ -710,8 +716,14 @@ def build_goal_lock(
     *,
     objective: str,
     observation: ObservationFrame | None = None,
+    intent_profile: dict[str, Any] | None = None,
 ) -> GoalLock:
     lower = str(objective or "").lower()
+    parsed_intent = (
+        StructuredIntent.from_dict(intent_profile)
+        if isinstance(intent_profile, dict) and intent_profile
+        else parse_structured_intent(objective)
+    )
     domain_tokens = {
         "browser": ("browser", "web", "url", "search", "site", "page"),
         "file": ("file", "folder", "copy", "move", "rename", "delete"),
@@ -731,6 +743,15 @@ def build_goal_lock(
             or observation.app_context
             or ""
         )
+    if not required_surface:
+        required_surface = (
+            parsed_intent.source_surface or parsed_intent.destination_surface or ""
+        )
+    if parsed_intent.primary_domain and parsed_intent.primary_domain not in allowed_domains:
+        allowed_domains.append(parsed_intent.primary_domain)
+    for surface in (parsed_intent.source_surface, parsed_intent.destination_surface):
+        if surface and surface not in allowed_domains:
+            allowed_domains.append(surface)
     return GoalLock(
         objective=objective,
         objective_terms=re.findall(r"[a-z0-9_]{3,}", lower)[:12],
@@ -740,28 +761,18 @@ def build_goal_lock(
             and "sheet" not in allowed_domains
             else allowed_domains
         ),
-        destructive_intent=any(
-            token in lower for token in ("delete", "remove", "format")
-        ),
-        external_navigation_intent=any(
-            token in lower
-            for token in (
-                "browser",
-                "web",
-                "search",
-                "url",
-                "site",
-                "find",
-                "research",
-                "lookup",
-                "stock",
+        destructive_intent=bool(
+            any(token in lower for token in ("delete", "remove", "format"))
+            or any(
+                verb in {"delete", "remove"}
+                for verb in parsed_intent.irreversible_verbs
             )
         ),
-        file_op_intent=any(
-            token in lower
-            for token in ("copy", "move", "rename", "delete", "folder", "file")
-        ),
+        external_navigation_intent=parsed_intent.prefers_web_search(),
+        file_op_intent=bool(parsed_intent.is_file_workflow() or parsed_intent.is_file_copy()),
         required_surface=required_surface,
+        intent_profile=parsed_intent.asdict(),
+        required_verifications=list(parsed_intent.expected_verification),
     )
 
 
@@ -1331,6 +1342,7 @@ def _goal_lock_conflict(
         objective=objective,
         observation=observation,
     )
+    parsed_intent = StructuredIntent.from_dict(lock.intent_profile)
     haystack = _action_haystack(action, "")
     if "delete" in haystack and not lock.destructive_intent:
         return "Action drifts outside the declared workflow objective."
@@ -1338,6 +1350,11 @@ def _goal_lock_conflict(
         term in lower_goal for term in ("send", "message")
     ):
         return "Action drifts outside the declared workflow objective."
+    if action.action_type == "open_url" and parsed_intent.prefers_local_file_search():
+        return (
+            "Goal lock blocked browser navigation because the parsed intent "
+            "requires a local file surface."
+        )
     app_family = ""
     if observation is not None:
         app_family = str(
@@ -1361,6 +1378,22 @@ def _goal_lock_conflict(
         "sheet" in lock.allowed_domains or app_family == "office_form"
     ):
         return "Goal lock blocked spreadsheet edits outside a sheet objective."
+    if (
+        action.action_type in {"copy_file", "move_file", "rename_file", "delete_file"}
+        and parsed_intent.is_clipboard_copy()
+    ):
+        return (
+            "Goal lock blocked file mutation because the parsed intent expects "
+            "clipboard transfer, not a file operation."
+        )
+    if (
+        action.action_type in {"set_clipboard", "clipboard_copy"}
+        and parsed_intent.is_file_copy()
+    ):
+        return (
+            "Goal lock blocked clipboard transfer because the parsed intent "
+            "expects a file operation."
+        )
     if (
         action.action_type
         in {
@@ -1459,6 +1492,9 @@ _STRUCTURED_UI_ACTIONS = {
     "type",
     "set_text",
     "set_value",
+    "set_clipboard",
+    "get_clipboard",
+    "clipboard_copy",
     "hotkey",
     "launch_app",
     "open_url",

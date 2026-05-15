@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime
 
+from agentos_orchestrator.os_control.workflow.intent_parser import StructuredIntent
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowStep,
 )
@@ -17,6 +18,9 @@ class WorkflowContext:
     app_target: str | None
     artifact_path: str | None
     research_artifact_path: str | None = None
+    intent: StructuredIntent = field(
+        default_factory=lambda: StructuredIntent(raw_objective="")
+    )
 
 
 def workflow_prefers_research_tool(lower: str, mode: str) -> bool:
@@ -94,6 +98,12 @@ class GenericAppWorkflowAdapter:
             return []
         if context.app_target is None:
             return []
+        if context.app_target in {"calc.exe"}:
+            return []
+        if context.intent.cross_app or context.intent.operations:
+            return []
+        if context.app_target in {"notepad.exe", "wordpad.exe"}:
+            return self._editor_write_steps(context)
         intent = context.objective.strip().rstrip(".")
         return [
             DesktopWorkflowStep(
@@ -114,6 +124,132 @@ class GenericAppWorkflowAdapter:
                 description="Save work in the active application.",
             ),
         ]
+
+    @staticmethod
+    def _editor_write_steps(
+        context: WorkflowContext,
+    ) -> list[DesktopWorkflowStep]:
+        if context.app_target not in {"notepad.exe", "wordpad.exe"}:
+            return []
+        text = GenericAppWorkflowAdapter._editor_text(context.objective)
+        if not text:
+            return []
+        return [
+            DesktopWorkflowStep(
+                action_type="type",
+                selector="document-canvas",
+                value=text,
+                description="Write the requested text into the active editor.",
+                metadata={
+                    "verification_contract": {
+                        "kind": "field_contains",
+                        "expected": "The editor contains the requested text.",
+                        "target": "document-canvas",
+                        "value": text,
+                        "required": True,
+                    }
+                },
+            )
+        ]
+
+    @staticmethod
+    def _editor_text(objective: str) -> str:
+        match = re.search(
+            r"\b(?:type|write|enter)\s+(?P<text>.+)$",
+            objective.strip(),
+            flags=re.I,
+        )
+        if match is None:
+            return ""
+        return match.group("text").strip().strip('"')
+
+
+class CalculatorWorkflowAdapter:
+    _DIGIT_NAMES = {
+        "0": "Zero",
+        "1": "One",
+        "2": "Two",
+        "3": "Three",
+        "4": "Four",
+        "5": "Five",
+        "6": "Six",
+        "7": "Seven",
+        "8": "Eight",
+        "9": "Nine",
+    }
+    _OPERATOR_SELECTORS = {
+        "+": "name=Plus",
+        "-": "name=Minus",
+        "*": "name=Multiply by",
+        "/": "name=Divide by",
+    }
+
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.mode != "app-task" or context.app_target != "calc.exe":
+            return []
+        tokens = self._expression_tokens(context.lower)
+        if not tokens:
+            return []
+        steps: list[DesktopWorkflowStep] = []
+        for token in tokens:
+            if token.isdigit():
+                for digit in token:
+                    selector = f"name={self._DIGIT_NAMES[digit]}"
+                    steps.append(
+                        DesktopWorkflowStep(
+                            action_type="click",
+                            selector=selector,
+                            description=(
+                                f"Press Calculator button {self._DIGIT_NAMES[digit]}."
+                            ),
+                        )
+                    )
+                continue
+            selector = self._OPERATOR_SELECTORS.get(token)
+            if selector is None:
+                return []
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="click",
+                    selector=selector,
+                    description=(
+                        f"Press Calculator operator {selector.split('=', 1)[1]}."
+                    ),
+                )
+            )
+        steps.append(
+            DesktopWorkflowStep(
+                action_type="click",
+                selector="name=Equals",
+                description="Evaluate the requested Calculator expression.",
+            )
+        )
+        return steps
+
+    @classmethod
+    def _expression_tokens(cls, lower: str) -> list[str]:
+        normalized = str(lower or "")
+        replacements = (
+            (r"multiplied by", " * "),
+            (r"multiply by", " * "),
+            (r"times", " * "),
+            (r"divided by", " / "),
+            (r"divide by", " / "),
+            (r"plus", " + "),
+            (r"minus", " - "),
+        )
+        for pattern, replacement in replacements:
+            normalized = re.sub(pattern, replacement, normalized, flags=re.I)
+        tokens = re.findall(r"\d+|[+\-*/]", normalized)
+        if len(tokens) < 3:
+            return []
+        if not tokens[0].isdigit() or not tokens[-1].isdigit():
+            return []
+        for index, token in enumerate(tokens):
+            expects_number = index % 2 == 0
+            if expects_number != token.isdigit():
+                return []
+        return tokens
 
 
 class SpreadsheetWorkflowAdapter:
@@ -167,12 +303,6 @@ class ExplorerFileOpsWorkflowAdapter:
             return []
         value, metadata = self._payload(operation, context.objective)
         return [
-            DesktopWorkflowStep(
-                action_type="type",
-                selector="explorer-file-list",
-                value="Select source items for file operation.",
-                description="Focus explorer file list before file operations.",
-            ),
             DesktopWorkflowStep(
                 action_type=f"{operation}_file",
                 selector="explorer-file-list",
@@ -270,16 +400,17 @@ class FileManagerWorkflowAdapter:
 
 class BrowserWorkflowAdapter:
     def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
-        if not self._needs_browser(context.lower):
+        if not self._needs_browser(context):
             return []
-        target = self._browser_target(context.lower)
+        launch_target = context.intent.source_app_target or context.app_target or "msedge.exe"
+        target = self._browser_target(context)
         if target is None:
             return []
         return [
             DesktopWorkflowStep(
                 action_type="launch_app",
-                selector="msedge.exe",
-                value="msedge.exe",
+                selector=launch_target,
+                value=launch_target,
                 description="Launch a browser for research or navigation.",
             ),
             DesktopWorkflowStep(
@@ -287,11 +418,22 @@ class BrowserWorkflowAdapter:
                 selector="browser-address-bar",
                 value=target,
                 description="Navigate to the requested URL or search query.",
+                metadata={
+                    "handoff_write": {
+                        "active_url": target,
+                        "search_query": context.intent.entities.get("query", ""),
+                    }
+                },
             ),
         ]
 
     @staticmethod
-    def _needs_browser(lower: str) -> bool:
+    def _needs_browser(context: WorkflowContext) -> bool:
+        if context.intent.prefers_local_file_search() or context.intent.prefers_chat_search():
+            return False
+        if context.intent.prefers_web_search():
+            return True
+        lower = context.lower
         cues = (
             "search for",
             "look up",
@@ -310,11 +452,12 @@ class BrowserWorkflowAdapter:
         )
         return any(cue in lower for cue in cues)
 
-    def _browser_target(self, lower: str) -> str | None:
+    def _browser_target(self, context: WorkflowContext) -> str | None:
+        lower = context.lower
         match = re.search(r"https?://\S+", lower)
         if match is not None:
             return match.group(0).rstrip(".,)")
-        query = self._search_query(lower)
+        query = context.intent.entities.get("query") or self._search_query(lower)
         if not query:
             return None
         encoded = query.replace(" ", "+")
@@ -348,7 +491,10 @@ class ResearchWorkflowAdapter:
             return []
         if not workflow_prefers_research_tool(context.lower, context.mode):
             return []
-        query = BrowserWorkflowAdapter._search_query(context.lower)
+        query = (
+            context.intent.entities.get("query")
+            or BrowserWorkflowAdapter._search_query(context.lower)
+        )
         request = {
             "kind": "workflow_research_brief",
             "objective": context.objective,
@@ -709,6 +855,8 @@ class FileOpsIntentAdapter:
         if context.app_target == "explorer.exe":
             # ExplorerFileOpsWorkflowAdapter already handles explorer targets.
             return []
+        if context.intent.copy_semantics not in {"none", "file"}:
+            return []
         operation = self._operation(context.lower)
         if operation is None:
             return []
@@ -793,3 +941,407 @@ class FileOpsIntentAdapter:
         if match is not None:
             return match.group("src").strip(), match.group("name").strip()
         return "source-item", "renamed-item"
+
+
+class CrossAppHandoffWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if not context.intent.cross_app:
+            return []
+        if not context.intent.is_clipboard_copy():
+            return []
+        if context.intent.destination_surface != "editor":
+            return []
+        query = context.intent.entities.get("query") or context.intent.object_hint
+        clipboard_text = self._clipboard_text(context)
+        steps: list[DesktopWorkflowStep] = []
+        if context.intent.source_surface == "browser":
+            browser_target = context.intent.source_app_target or "msedge.exe"
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="launch_app",
+                    selector=browser_target,
+                    value=browser_target,
+                    description="Launch the browser source surface.",
+                )
+            )
+            if context.intent.prefers_web_search() and query:
+                encoded = query.replace(" ", "+")
+                target = f"https://www.bing.com/search?q={encoded}"
+                steps.append(
+                    DesktopWorkflowStep(
+                        action_type="open_url",
+                        selector="browser-address-bar",
+                        value=target,
+                        description="Open the browser search result before handoff.",
+                        metadata={
+                            "handoff_write": {
+                                "active_url": target,
+                                "search_query": query,
+                            }
+                        },
+                    )
+                )
+        steps.append(
+            DesktopWorkflowStep(
+                action_type="set_clipboard",
+                selector="workflow-clipboard",
+                value=clipboard_text,
+                description="Transfer the semantic result into the clipboard channel.",
+                metadata={
+                    "control_channel": "clipboard",
+                    "handoff_write": {"copied_text": clipboard_text},
+                    "verification_contract": {
+                        "kind": "clipboard_contains",
+                        "expected": "Clipboard contains the transferred semantic entity.",
+                        "value": clipboard_text,
+                        "required": True,
+                    },
+                },
+            )
+        )
+        editor_target = context.intent.destination_app_target or "notepad.exe"
+        steps.append(
+            DesktopWorkflowStep(
+                action_type="launch_app",
+                selector=editor_target,
+                value=editor_target,
+                description="Launch the destination editor surface.",
+            )
+        )
+        steps.append(
+            DesktopWorkflowStep(
+                action_type="type",
+                selector="document-canvas",
+                value="{{copied_text}}",
+                description="Write the transferred entity into the destination editor.",
+                metadata={
+                    "handoff_read": ["copied_text"],
+                    "control_channel": "clipboard",
+                    "verification_contract": {
+                        "kind": "field_contains",
+                        "expected": "Editor contains the transferred clipboard entity.",
+                        "target": "document-canvas",
+                        "value": clipboard_text,
+                        "required": True,
+                    },
+                },
+            )
+        )
+        return steps
+
+    @staticmethod
+    def _clipboard_text(context: WorkflowContext) -> str:
+        objective_lower = context.objective.lower()
+        if any(
+            token in objective_lower
+            for token in (
+                "copy the url",
+                "copy url",
+                "copy the link",
+                "copy link",
+                "paste the url",
+                "paste url",
+                "web address",
+                "address bar",
+            )
+        ):
+            return "{{active_url}}"
+        return (
+            str(context.intent.entities.get("clipboard_text") or "").strip()
+            or str(context.intent.entities.get("editor_text") or "").strip()
+            or context.objective.strip().rstrip(".")
+        )
+
+
+class ChatWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.intent.source_surface != "chat_app":
+            return []
+        query = context.intent.entities.get("query") or context.intent.object_hint
+        reply_text = context.intent.entities.get("clipboard_text") or (
+            f"Draft summary for: {query}".strip()
+        )
+        target = context.intent.source_app_target or context.app_target or "teams.exe"
+        steps = [
+            DesktopWorkflowStep(
+                action_type="launch_app",
+                selector=target,
+                value=target,
+                description="Launch the chat surface.",
+            )
+        ]
+
+        if context.intent.prefers_chat_search() and query:
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="type",
+                    selector="conversation-list",
+                    value=f"Search messages: {query}",
+                    description="Search the current chat history semantically.",
+                    metadata={"handoff_write": {"message_query": query}},
+                )
+            )
+        if "draft_reply" in context.intent.operations:
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="type",
+                    selector="chat-composer",
+                    value=reply_text,
+                    description="Draft the reply in the chat composer without forcing send.",
+                    metadata={
+                        "handoff_write": {"draft_reply": reply_text},
+                        "verification_contract": {
+                            "kind": "field_contains",
+                            "expected": "The draft reply is present in the chat composer.",
+                            "target": "chat-composer",
+                            "value": reply_text,
+                            "required": True,
+                        },
+                    },
+                )
+            )
+        return steps
+
+
+class EmailWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.intent.source_surface != "email" and context.intent.destination_surface != "email":
+            return []
+        steps: list[DesktopWorkflowStep] = []
+        source_target = context.intent.source_app_target or "outlook.exe"
+        destination_target = context.intent.destination_app_target or "outlook.exe"
+        query = context.intent.entities.get("email_query") or context.intent.entities.get("query") or context.intent.object_hint
+        recipient = context.intent.entities.get("recipient") or ""
+        file_source = context.intent.entities.get("file_source") or context.intent.file_source_hint
+        if context.intent.source_surface == "file_explorer" and file_source:
+            steps.extend(
+                [
+                    DesktopWorkflowStep(
+                        action_type="launch_app",
+                        selector="explorer.exe",
+                        value="explorer.exe",
+                        description="Open File Explorer to locate the requested attachment.",
+                    ),
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="explorer-file-list",
+                        value=file_source,
+                        description="Locate the attachment candidate in File Explorer.",
+                        metadata={
+                            "handoff_write": {"file_source": file_source},
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": "Explorer reflects the requested attachment search or selection.",
+                                "target": "explorer-file-list",
+                                "value": file_source,
+                                "required": True,
+                            },
+                        },
+                    ),
+                ]
+            )
+        if context.intent.source_surface == "email":
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="launch_app",
+                    selector=source_target,
+                    value=source_target,
+                    description="Launch the email surface.",
+                )
+            )
+            if "search_email" in context.intent.operations and query:
+                steps.append(
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="email-search-box",
+                        value=query,
+                        description="Search the inbox for the requested message or invite.",
+                        metadata={
+                            "handoff_write": {"email_query": query},
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": "The email search box contains the requested query.",
+                                "target": "email-search-box",
+                                "value": query,
+                                "required": True,
+                            },
+                        },
+                    )
+                )
+        if context.intent.destination_surface == "email":
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="launch_app",
+                    selector=destination_target,
+                    value=destination_target,
+                    description="Launch the destination email draft surface.",
+                )
+            )
+            if recipient:
+                steps.append(
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="email-to-field",
+                        value=recipient,
+                        description="Address the draft to the requested recipient.",
+                        metadata={
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": "The email recipient field contains the requested recipient.",
+                                "target": "email-to-field",
+                                "value": recipient,
+                                "required": True,
+                            },
+                        },
+                    )
+                )
+            if "attach_file" in context.intent.operations and file_source:
+                steps.append(
+                    DesktopWorkflowStep(
+                        action_type="type",
+                        selector="email-attachment-field",
+                        value=file_source,
+                        description="Attach the requested local file to the draft.",
+                        metadata={
+                            "verification_contract": {
+                                "kind": "field_contains",
+                                "expected": "The email attachment field reflects the requested file.",
+                                "target": "email-attachment-field",
+                                "value": file_source,
+                                "required": True,
+                            },
+                        },
+                    )
+                )
+        return steps
+
+
+class CalendarWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.intent.source_surface != "calendar" and context.intent.destination_surface != "calendar":
+            return []
+        target = (
+            context.intent.destination_app_target
+            or context.intent.source_app_target
+            or "outlook.exe /select outlook:calendar"
+        )
+        event_title = context.intent.entities.get("event_title") or context.intent.object_hint or context.objective.strip().rstrip(".")
+        steps = [
+            DesktopWorkflowStep(
+                action_type="launch_app",
+                selector=target,
+                value=target,
+                description="Launch the calendar surface.",
+            )
+        ]
+        if "create_calendar_event" in context.intent.operations and event_title:
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="type",
+                    selector="calendar-event-editor",
+                    value=event_title,
+                    description="Draft the requested calendar event details.",
+                    metadata={
+                        "verification_contract": {
+                            "kind": "field_contains",
+                            "expected": "The calendar event editor contains the drafted event details.",
+                            "target": "calendar-event-editor",
+                            "value": event_title,
+                            "required": True,
+                        },
+                    },
+                )
+            )
+        return steps
+
+
+class SettingsWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.intent.source_surface != "settings" and context.app_target != "settings.exe":
+            return []
+        setting_name = context.intent.entities.get("setting_name") or context.intent.object_hint or context.objective.strip().rstrip(".")
+        setting_value = context.intent.entities.get("setting_value") or ""
+        steps: list[DesktopWorkflowStep] = []
+        if setting_name:
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="type",
+                    selector="settings-search-box",
+                    value=setting_name,
+                    description="Search Settings for the requested control.",
+                    metadata={
+                        "verification_contract": {
+                            "kind": "field_contains",
+                            "expected": "The Settings search box contains the requested control name.",
+                            "target": "settings-search-box",
+                            "value": setting_name,
+                            "required": True,
+                        },
+                    },
+                )
+            )
+        if "toggle_setting" in context.intent.operations and setting_value:
+            steps.append(
+                DesktopWorkflowStep(
+                    action_type="click",
+                    selector="settings-toggle",
+                    value=f"{setting_name}:{setting_value}",
+                    description="Toggle the requested system setting to the desired state.",
+                    metadata={
+                        "verification_contract": {
+                            "kind": "state_changed",
+                            "expected": "The requested Settings control changes state.",
+                            "target": "settings-toggle",
+                            "required": True,
+                        },
+                    },
+                )
+            )
+        return steps
+
+
+class PdfWorkflowAdapter:
+    def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
+        if context.intent.source_surface != "pdf_viewer":
+            return []
+        if context.intent.destination_surface != "editor":
+            return []
+        query = context.intent.entities.get("query") or context.intent.object_hint
+        extracted = f"PDF note: {query}".strip()
+        return [
+            DesktopWorkflowStep(
+                action_type="launch_app",
+                selector=context.intent.source_app_target or "acrobat.exe",
+                value=context.intent.source_app_target or "acrobat.exe",
+                description="Launch the PDF surface.",
+            ),
+            DesktopWorkflowStep(
+                action_type="type",
+                selector="pdf-search-box",
+                value=query,
+                description="Search within the PDF for the requested content.",
+            ),
+            DesktopWorkflowStep(
+                action_type="set_clipboard",
+                selector="workflow-clipboard",
+                value=extracted,
+                description="Store the extracted PDF note on the clipboard.",
+                metadata={
+                    "control_channel": "clipboard",
+                    "handoff_write": {"copied_text": extracted},
+                },
+            ),
+            DesktopWorkflowStep(
+                action_type="launch_app",
+                selector=context.intent.destination_app_target or "notepad.exe",
+                value=context.intent.destination_app_target or "notepad.exe",
+                description="Launch the destination editor.",
+            ),
+            DesktopWorkflowStep(
+                action_type="type",
+                selector="document-canvas",
+                value="{{copied_text}}",
+                description="Write the extracted PDF note into the editor.",
+                metadata={"handoff_read": ["copied_text"]},
+            ),
+        ]

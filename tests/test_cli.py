@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -125,6 +126,46 @@ class ReplayMergeCliTests(unittest.TestCase):
             "run_merge"
         )
         print_mock.assert_called_once()
+
+
+class LiveFireCliTests(unittest.TestCase):
+    def test_pc_live_fire_eval_forwards_pack_selection(self) -> None:
+        fake_orchestrator = mock.Mock()
+        fake_orchestrator.authorization.authorize.return_value = SimpleNamespace(
+            allowed=True
+        )
+        fake_result = mock.Mock()
+        fake_result.success = True
+        fake_result.asdict.return_value = {"success": True, "task_count": 1}
+
+        with (
+            mock.patch.object(
+                cli.ResearchOrchestrator,
+                "from_paths",
+                return_value=fake_orchestrator,
+            ),
+            mock.patch.object(cli, "_pc_backend", return_value=object()),
+            mock.patch.object(cli, "LiveFireEvalRunner") as runner_cls,
+            mock.patch("builtins.print"),
+        ):
+            runner_cls.return_value.run.return_value = fake_result
+
+            exit_code = cli.main(
+                [
+                    "pc-live-fire-eval",
+                    "--backend",
+                    "virtual-desktop-sandbox",
+                    "--pack",
+                    "everyday",
+                    "--max-tasks",
+                    "2",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        config = runner_cls.return_value.run.call_args.args[0]
+        self.assertEqual(config.pack, "everyday")
+        self.assertEqual(config.max_tasks, 2)
 
 
 if __name__ == "__main__":

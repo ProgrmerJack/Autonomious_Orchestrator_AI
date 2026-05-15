@@ -11,6 +11,7 @@ Plus: Async perception loop for real-time responsiveness.
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -21,7 +22,12 @@ from typing import Any
 import numpy as np
 
 from agentos_orchestrator.os_control.base import UiAction, UiNode
+from agentos_orchestrator.os_control.workflow.intent_parser import (
+    StructuredIntent,
+    parse_structured_intent,
+)
 from agentos_orchestrator.os_control.workflow.models import DesktopWorkflowPlan
+from agentos_orchestrator.os_control.workflow.planner import DesktopWorkflowPlanner
 
 from .abstract_world_model import (
     AbstractUIState,
@@ -191,6 +197,7 @@ class UniversalDesktopAgentV2:
         self.adapter_registry = AdapterRegistry()
         self.trajectory_recorder = TrajectoryRecorder(self.workspace_root)
         self.adaptation_readiness = collect_adaptation_readiness(self.workspace_root)
+        self.workflow_planner = DesktopWorkflowPlanner()
 
         # --- Fix 3b: Hierarchical Task Decomposer (long-horizon planning) ---
         self.task_decomposer = HierarchicalTaskDecomposer(memory=self.semantic_memory)
@@ -241,7 +248,7 @@ class UniversalDesktopAgentV2:
         """Background worker: capture screenshot every ~50ms."""
         while not self._shutdown:
             try:
-                self._latest_screenshot = self.backend.capture()
+                self._latest_screenshot = self._safe_capture_bytes()
             except Exception:
                 pass
             time.sleep(0.05)
@@ -254,11 +261,20 @@ class UniversalDesktopAgentV2:
     # Main Execution Loop
     # ------------------------------------------------------------------ #
 
-    def run(self, objective: str) -> UniversalAgentRun:
+    def run(
+        self,
+        objective: str,
+        bootstrap_plan: DesktopWorkflowPlan | None = None,
+    ) -> UniversalAgentRun:
         self._run_id_counter += 1
         run_id = f"ua2_{self._run_id_counter}_{int(time.time())}"
         run = UniversalAgentRun(run_id=run_id, objective=objective)
         self.runtime_state.reset(objective)
+        bootstrap_plan = self.repair_bootstrap_plan(
+            objective,
+            bootstrap_plan or self.workflow_planner.plan(objective),
+            backend=self.backend,
+        )
         self.adaptation_readiness = collect_adaptation_readiness(self.workspace_root)
         self.working_memory.write(
             "Adaptation readiness: "
@@ -276,6 +292,34 @@ class UniversalDesktopAgentV2:
         self.start_perception_loop()
 
         try:
+            self.working_memory.write(
+                f"Bootstrap plan: {bootstrap_plan.summary}",
+                item_type="plan",
+                priority=0.92,
+            )
+            for step in bootstrap_plan.steps:
+                self.working_memory.write(
+                    f"Planned: {step.action_type} on {step.selector}",
+                    item_type="plan",
+                    priority=0.64,
+                )
+
+            bootstrap_summary = self._execute_bootstrap_plan(
+                objective,
+                bootstrap_plan,
+                run,
+            )
+            if self._bootstrap_completed(bootstrap_summary):
+                run.success = True
+                self._finalize_run(
+                    run,
+                    bootstrap_plan,
+                    bootstrap_summary,
+                    latencies=[],
+                    macro_goals=[],
+                )
+                return run
+
             # Phase 0: Macro planning
             macro_goals = self.macro_planner.plan_objective(objective)
             for index, macro_goal in enumerate(macro_goals, start=1):
@@ -369,37 +413,12 @@ class UniversalDesktopAgentV2:
                     [s for s in run.steps if s.phase == "act"]
                 )
 
-            # Final state
-            run.avg_latency_ms = sum(latencies) / max(len(latencies), 1)
-            run.model_used_ratio = self.world_model._model_used_count / max(
-                self.world_model._model_used_count
-                + self.world_model._fallback_used_count,
-                1,
-            )
-
-            if self.pixel_env:
-                run.final_state = self.pixel_env.get_visual_state_summary()
-            else:
-                run.final_state = {
-                    "belief_entropy": self.pomdp.belief.entropy(),
-                    "node_count": len(self.backend.snapshot()),
-                    "steps_taken": len(run.steps),
-                }
-            if run.trajectory_path:
-                run.final_state["trajectory_path"] = run.trajectory_path
-            run.final_state["adaptation_readiness"] = self.adaptation_readiness.asdict()
-            run.success = any(g.completed for g in macro_goals)
-            self.trajectory_recorder.finish_run(run.run_id, run.final_state)
-
-            # Record to semantic memory
-            self.semantic_memory.record(
-                objective=objective,
-                action=UiAction(
-                    action_type="universal_run", selector="agent", value=objective
-                ),
-                observation=json.dumps(run.final_state),
-                outcome="success" if run.success else "partial",
-                reward=1.0 if run.success else 0.3,
+            self._finalize_run(
+                run,
+                bootstrap_plan,
+                bootstrap_summary,
+                latencies=latencies,
+                macro_goals=macro_goals,
             )
 
         finally:
@@ -410,13 +429,469 @@ class UniversalDesktopAgentV2:
     def run_with_planned_bootstrap(
         self, objective: str, plan: DesktopWorkflowPlan
     ) -> UniversalAgentRun:
-        for step in plan.steps:
-            self.working_memory.write(
-                f"Planned: {step.action_type} on {step.selector}",
-                item_type="plan",
-                priority=0.6,
+        return self.run(objective, bootstrap_plan=plan)
+
+    def repair_bootstrap_plan(
+        self,
+        objective: str,
+        plan: DesktopWorkflowPlan,
+        *,
+        backend: Any | None = None,
+    ) -> DesktopWorkflowPlan:
+        del backend
+        repaired = copy.deepcopy(plan)
+        intent = StructuredIntent.from_dict(
+            getattr(repaired, "intent", {}) or parse_structured_intent(objective).asdict()
+        )
+        repaired.intent = intent.asdict()
+        if intent.prefers_local_file_search():
+            repaired.app_target = "explorer.exe"
+            repaired.steps = [
+                step
+                for step in repaired.steps
+                if not (
+                    step.action_type == "open_url"
+                    or (
+                        step.action_type == "launch_app"
+                        and str(step.value or step.selector or "")
+                        in {"msedge.exe", "chrome.exe"}
+                    )
+                )
+            ]
+        if intent.is_clipboard_copy():
+            repaired.steps = [
+                step for step in repaired.steps if step.action_type != "copy_file"
+            ]
+        return repaired
+
+    def _execute_bootstrap_plan(
+        self,
+        objective: str,
+        plan: DesktopWorkflowPlan,
+        run: UniversalAgentRun,
+    ) -> dict[str, Any]:
+        bootstrap_handoff = self._seed_bootstrap_handoff(plan)
+        summary = {
+            "summary": plan.summary,
+            "step_count": len(plan.steps),
+            "executed_steps": 0,
+            "verified_steps": 0,
+            "stopped_reason": "no-steps" if not plan.steps else "completed",
+            "failed_step": "",
+        }
+        for index, step in enumerate(plan.steps, start=1):
+            if run.adaptive_steps_used >= self.max_steps:
+                summary["stopped_reason"] = "max_steps"
+                break
+            action = self._bootstrap_action(step, bootstrap_handoff)
+            before_state = self._build_abstract_state()
+            self.runtime_state.update_observation(
+                before_state,
+                self.get_latest_screenshot(),
             )
-        return self.run(objective)
+            expected_observation = _expected_observation_for_action(action)
+            step_start = time.perf_counter()
+            safety = self.safety_verifier.verify_action(action, objective=objective)
+            if not safety.allowed:
+                receipt = json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": safety.reason,
+                        "solver": safety.solver,
+                    }
+                )
+            else:
+                try:
+                    receipt = self.backend.perform(action)
+                except Exception as exc:
+                    receipt = json.dumps(
+                        {
+                            "status": "error",
+                            "reason": str(exc),
+                        }
+                    )
+            self._settle_bootstrap_launch(action, receipt)
+            after_state = self._build_abstract_state()
+            self.runtime_state.record_action(
+                action,
+                expected_observation=expected_observation,
+                receipt=receipt,
+            )
+            self._update_bootstrap_handoff(
+                bootstrap_handoff,
+                step,
+                action,
+                receipt,
+            )
+            self.runtime_state.update_observation(
+                after_state,
+                self.get_latest_screenshot(),
+            )
+            outcome_evaluation = self.runtime_state.evaluate_outcome(
+                action,
+                before_state,
+                after_state,
+                receipt,
+                expected_observation=expected_observation,
+            )
+            verification_contract = ensure_verification_contract(action)
+            verification_result = verify_action_contract(
+                action,
+                before_state,
+                after_state,
+                receipt,
+            )
+            if verification_result.required and not verification_result.matched:
+                outcome_evaluation.matched = False
+                if not outcome_evaluation.failure_reason:
+                    outcome_evaluation.failure_reason = verification_result.reason
+            step_elapsed = (time.perf_counter() - step_start) * 1000
+            self.trajectory_recorder.record_step(
+                run_id=run.run_id,
+                objective=run.objective,
+                option_name=f"bootstrap_{index}",
+                before=before_state,
+                after=after_state,
+                action=action,
+                expected_observation=expected_observation,
+                receipt=receipt,
+                outcome=outcome_evaluation,
+                mode_decision=None,
+                repair_plan=None,
+                capability_profile={"app_family": "workflow_bootstrap"},
+                adapter_context={"preferred_channels": ["workflow"]},
+                verification_contract=verification_contract.asdict(),
+                verification_result=verification_result.asdict(),
+                latency_ms=step_elapsed,
+            )
+            self._step_counter += 1
+            run.steps.append(
+                CognitiveStep(
+                    step_number=self._step_counter,
+                    phase="act",
+                    action=action,
+                    observation={
+                        "receipt": receipt,
+                        "bootstrap_step": index,
+                        "bootstrap_description": step.description,
+                        "verification_contract": verification_contract.asdict(),
+                        "verification_result": verification_result.asdict(),
+                    },
+                    belief_entropy=self.pixel_env.belief.entropy()
+                    if self.pixel_env
+                    else self.pomdp.belief.entropy(),
+                    mcts_reward=None,
+                    memory_reads=[],
+                    rationale=(
+                        f"Bootstrap step {index}: {step.description or action.selector}"
+                    ),
+                    latency_ms=step_elapsed,
+                )
+            )
+            run.adaptive_steps_used += 1
+            summary["executed_steps"] += 1
+            if verification_result.matched or not verification_result.required:
+                summary["verified_steps"] += 1
+            else:
+                summary["stopped_reason"] = "verification_failed"
+                summary["failed_step"] = step.description or action.selector
+                break
+        return summary
+
+    def _finalize_run(
+        self,
+        run: UniversalAgentRun,
+        bootstrap_plan: DesktopWorkflowPlan,
+        bootstrap_summary: dict[str, Any],
+        *,
+        latencies: list[float],
+        macro_goals: list[MacroGoal],
+    ) -> None:
+        run.avg_latency_ms = sum(latencies) / max(len(latencies), 1)
+        run.model_used_ratio = self.world_model._model_used_count / max(
+            self.world_model._model_used_count
+            + self.world_model._fallback_used_count,
+            1,
+        )
+        if self.pixel_env:
+            run.final_state = self.pixel_env.get_visual_state_summary()
+        else:
+            run.final_state = {
+                "belief_entropy": self.pomdp.belief.entropy(),
+                "node_count": len(self._safe_snapshot_nodes()),
+                "steps_taken": len(run.steps),
+            }
+        run.final_state["bootstrap_plan"] = bootstrap_plan.asdict()
+        run.final_state["bootstrap"] = bootstrap_summary
+        if run.trajectory_path:
+            run.final_state["trajectory_path"] = run.trajectory_path
+        run.final_state["adaptation_readiness"] = self.adaptation_readiness.asdict()
+        run.success = run.success or any(goal.completed for goal in macro_goals)
+        self.trajectory_recorder.finish_run(run.run_id, run.final_state)
+        self.semantic_memory.record(
+            objective=run.objective,
+            action=UiAction(
+                action_type="universal_run",
+                selector="agent",
+                value=run.objective,
+            ),
+            observation=json.dumps(run.final_state),
+            outcome="success" if run.success else "partial",
+            reward=1.0 if run.success else 0.3,
+        )
+
+    @staticmethod
+    def _bootstrap_completed(summary: dict[str, Any]) -> bool:
+        step_count = int(summary.get("step_count") or 0)
+        executed_steps = int(summary.get("executed_steps") or 0)
+        verified_steps = int(summary.get("verified_steps") or 0)
+        return (
+            step_count > 0
+            and executed_steps == step_count
+            and verified_steps == step_count
+            and str(summary.get("stopped_reason") or "") == "completed"
+        )
+
+    def _settle_bootstrap_launch(self, action: UiAction, receipt: str) -> None:
+        if action.action_type != "launch_app":
+            return
+        try:
+            payload = json.loads(str(receipt or ""))
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("status") or "").lower() != "launched":
+            return
+        target_process = payload.get("process_id")
+        target_tokens = self._launch_target_tokens(action)
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            nodes = self._safe_snapshot_nodes()
+            if self._launch_surface_ready(nodes, target_process, target_tokens):
+                return
+            full_nodes = self._full_snapshot_nodes()
+            if self._launch_surface_ready(full_nodes, target_process, target_tokens):
+                selector = self._matching_window_selector(full_nodes, target_tokens)
+                if selector is not None and self._backend_supports_action("focus"):
+                    try:
+                        self.backend.perform(
+                            UiAction(
+                                "focus",
+                                selector,
+                                metadata={
+                                    "source": "workflow_bootstrap",
+                                    "action_source": "workflow_bootstrap",
+                                },
+                            )
+                        )
+                    except Exception:
+                        pass
+                    if self._launch_surface_ready(
+                        self._safe_snapshot_nodes(),
+                        target_process,
+                        target_tokens,
+                    ):
+                        return
+            time.sleep(0.15)
+
+    @staticmethod
+    def _launch_surface_ready(
+        nodes: list[UiNode],
+        target_process: Any,
+        target_tokens: set[str],
+    ) -> bool:
+        if not nodes:
+            return False
+        for node in nodes:
+            process_id = node.metadata.get("process_id")
+            if target_process is not None and process_id == target_process:
+                return True
+            haystack = " ".join(
+                [
+                    str(node.name or ""),
+                    str(node.role or ""),
+                    str(node.metadata.get("automation_id") or ""),
+                    str(node.metadata.get("class_name") or ""),
+                ]
+            ).lower()
+            if target_tokens and any(token in haystack for token in target_tokens):
+                return True
+        return False
+
+    def _full_snapshot_nodes(self) -> list[UiNode]:
+        if not hasattr(self.backend, "snapshot"):
+            return []
+        try:
+            return list(self.backend.snapshot())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _matching_window_selector(
+        nodes: list[UiNode],
+        target_tokens: set[str],
+    ) -> str | None:
+        if not target_tokens:
+            return None
+        for node in nodes:
+            role = str(node.role or "").lower()
+            if role not in {"window", "pane"}:
+                continue
+            name = str(node.name or "").strip()
+            if not name:
+                continue
+            if any(token in name.lower() for token in target_tokens):
+                return f"name={name}"
+        return None
+
+    @staticmethod
+    def _launch_target_tokens(action: UiAction) -> set[str]:
+        raw_parts = [str(action.selector or ""), str(action.value or "")]
+        raw = " ".join(part for part in raw_parts if part).lower()
+        raw = raw.replace("/", " ").replace("\\", " ").replace(":", " ")
+        tokens = {
+            token.strip("\"'")
+            for token in raw.split()
+            if len(token.strip("\"'")) >= 3
+        }
+        aliases = {
+            "calc.exe": {"calc", "calculator"},
+            "notepad.exe": {"notepad"},
+            "explorer.exe": {"explorer", "file", "file explorer"},
+            "settings.exe": {"settings"},
+            "chrome.exe": {"chrome"},
+            "msedge.exe": {"edge", "microsoft edge"},
+            "outlook.exe": {"outlook"},
+            "powerpnt.exe": {"powerpoint"},
+            "winword.exe": {"word"},
+            "excel.exe": {"excel"},
+        }
+        compact = {token.rstrip(".exe") for token in tokens}
+        for token in list(tokens):
+            compact.add(token.replace(".exe", ""))
+            if token in aliases:
+                compact.update(aliases[token])
+        return {token for token in compact if len(token) >= 3}
+
+    @staticmethod
+    def _bootstrap_action(
+        step: Any,
+        handoff: dict[str, Any],
+    ) -> UiAction:
+        metadata = UniversalDesktopAgentV2._render_bootstrap_handoff(
+            dict(getattr(step, "metadata", {}) or {}),
+            handoff,
+        )
+        metadata.setdefault("source", "workflow_bootstrap")
+        metadata.setdefault("action_source", metadata.get("source"))
+        if "verification_contract" not in metadata:
+            if step.action_type == "launch_app":
+                metadata["verification_contract"] = {
+                    "kind": "process_launched",
+                    "expected": "The requested application launches.",
+                    "target": step.selector,
+                    "required": True,
+                }
+            elif step.action_type in {"set_clipboard", "clipboard_copy"}:
+                metadata["verification_contract"] = {
+                    "kind": "clipboard_contains",
+                    "expected": "The clipboard contains the transferred value.",
+                    "target": step.selector,
+                    "required": True,
+                }
+        action = UiAction(
+            action_type=step.action_type,
+            selector=step.selector,
+            value=UniversalDesktopAgentV2._render_bootstrap_handoff(
+                step.value,
+                handoff,
+            ),
+            metadata=metadata,
+        )
+        ensure_verification_contract(action)
+        return action
+
+    @staticmethod
+    def _seed_bootstrap_handoff(plan: DesktopWorkflowPlan) -> dict[str, Any]:
+        handoff = {
+            "workflow_objective": str(plan.objective or ""),
+        }
+        intent = StructuredIntent.from_dict(getattr(plan, "intent", {}) or {})
+        if intent.source_surface:
+            handoff["source_surface"] = intent.source_surface
+        if intent.destination_surface:
+            handoff["destination_surface"] = intent.destination_surface
+        if intent.file_source_hint:
+            handoff["file_source"] = intent.file_source_hint
+        if intent.file_destination_hint:
+            handoff["file_destination"] = intent.file_destination_hint
+        return handoff
+
+    @staticmethod
+    def _render_bootstrap_handoff(value: Any, handoff: dict[str, Any]) -> Any:
+        if isinstance(value, str):
+            import re
+
+            return re.sub(
+                r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}",
+                lambda match: str(handoff.get(match.group(1), match.group(0))),
+                value,
+            )
+        if isinstance(value, dict):
+            return {
+                str(key): UniversalDesktopAgentV2._render_bootstrap_handoff(
+                    item,
+                    handoff,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                UniversalDesktopAgentV2._render_bootstrap_handoff(item, handoff)
+                for item in value
+            ]
+        return value
+
+    def _update_bootstrap_handoff(
+        self,
+        handoff: dict[str, Any],
+        step: Any,
+        action: UiAction,
+        receipt: str,
+    ) -> None:
+        metadata = dict(getattr(step, "metadata", {}) or {})
+        handoff_write = metadata.get("handoff_write")
+        if isinstance(handoff_write, dict):
+            for key, value in handoff_write.items():
+                rendered = self._render_bootstrap_handoff(value, handoff)
+                if str(rendered or "").strip():
+                    handoff[str(key)] = rendered
+        if action.action_type == "open_url" and action.value:
+            handoff["active_url"] = str(action.value)
+        if action.action_type in {"set_clipboard", "clipboard_copy"} and action.value:
+            handoff["copied_text"] = str(action.value)
+        if action.action_type in {"type", "set_text", "set_value"} and action.value:
+            handoff["last_written_text"] = str(action.value)
+        try:
+            receipt_payload = json.loads(str(receipt or ""))
+        except (TypeError, ValueError):
+            return
+        if not isinstance(receipt_payload, dict):
+            return
+        clipboard = str(receipt_payload.get("clipboard") or "").strip()
+        if clipboard:
+            handoff["copied_text"] = clipboard
+        file_op = receipt_payload.get("file_op")
+        if isinstance(file_op, dict):
+            source = str(file_op.get("source") or "").strip()
+            destination = str(
+                file_op.get("destination") or file_op.get("new_name") or ""
+            ).strip()
+            if source:
+                handoff["file_source"] = source
+            if destination:
+                handoff["file_destination"] = destination
 
     # ------------------------------------------------------------------ #
     # Internal: Goal execution with full cognition
@@ -579,6 +1054,7 @@ class UniversalDesktopAgentV2:
                     adapter_context=adapter_context,
                     mode_decision=mode_decision,
                 )
+            action = self._canonicalize_action(action, snapshot_nodes)
             self._warm_world_model_with_action(current_state, run, action)
             action.metadata.setdefault(
                 "mode_decision",
@@ -775,22 +1251,33 @@ class UniversalDesktopAgentV2:
                 if action.action_type == "tool"
                 else not outcome_failed
             )
-            self.affordance_policies.record(
-                capability_profile.app_signature,
-                run.objective,
-                action,
-                success=policy_success,
-                control_channel=str(
-                    action.metadata.get("control_channel")
-                    or adapter_context.preferred_channels[0]
-                ),
-                observed=outcome_evaluation.observed,
-                evidence={
-                    "family": capability_profile.app_family,
-                    "option": option.name,
-                    "source": action.metadata.get("source", ""),
-                },
+            policy_source = str(
+                action.metadata.get("action_source")
+                or action.metadata.get("source", "")
             )
+            should_record_policy = not self._receipt_is_explicit_failure(receipt)
+            if policy_source in {"local_vla", "adaptive_perception"}:
+                should_record_policy = should_record_policy and self._action_is_grounded(
+                    action,
+                    snapshot_nodes,
+                )
+            if should_record_policy:
+                self.affordance_policies.record(
+                    capability_profile.app_signature,
+                    run.objective,
+                    action,
+                    success=policy_success,
+                    control_channel=str(
+                        action.metadata.get("control_channel")
+                        or adapter_context.preferred_channels[0]
+                    ),
+                    observed=outcome_evaluation.observed,
+                    evidence={
+                        "family": capability_profile.app_family,
+                        "option": option.name,
+                        "action_source": policy_source,
+                    },
+                )
 
             # Check option completion
             if option.is_done(current_state):
@@ -1086,6 +1573,11 @@ class UniversalDesktopAgentV2:
             run.objective,
             nodes=snapshot_nodes,
         )
+        if policy_action is not None and not self._action_is_grounded(
+            policy_action,
+            snapshot_nodes,
+        ):
+            policy_action = None
         if (
             policy_action is not None
             and float(policy_action.metadata.get("policy_score", 0.0)) >= 0.72
@@ -1110,6 +1602,27 @@ class UniversalDesktopAgentV2:
             self._warm_world_model_with_action(current_state, run, policy_action)
             return policy_action
 
+        grounded_action = self.explorer.suggest_action(
+            snapshot_nodes,
+            f"{getattr(option, 'description', '')} {run.objective}".strip(),
+            success_patterns=self.semantic_memory.get_success_patterns(
+                run.objective,
+                top_k=3,
+            ),
+        )
+        if grounded_action is not None:
+            grounded_action.metadata.setdefault("source", "active_inference_grounding")
+            grounded_action.metadata.setdefault(
+                "action_source",
+                grounded_action.metadata.get("source", "active_inference_grounding"),
+            )
+            grounded_action.metadata.setdefault(
+                "expected_observation",
+                "The grounded control should expose the next affordance or advance the option.",
+            )
+            self._warm_world_model_with_action(current_state, run, grounded_action)
+            return grounded_action
+
         use_frontier = (
             mode_decision is None
             or mode_decision.should_use_frontier
@@ -1132,7 +1645,12 @@ class UniversalDesktopAgentV2:
                     if best_elem.element_type in {"button", "text_field", "checkbox"}
                     else "click",
                     selector=f"perceived_{best_elem.element_type}_{best_elem.x}_{best_elem.y}",
-                    metadata={"x": cx, "y": cy, "source": "adaptive_perception"},
+                    metadata={
+                        "x": cx,
+                        "y": cy,
+                        "source": "adaptive_perception",
+                        "action_source": "adaptive_perception",
+                    },
                 )
                 self._warm_world_model_with_action(current_state, run, action)
                 return action
@@ -1147,27 +1665,15 @@ class UniversalDesktopAgentV2:
                 action = UiAction(
                     action_type=vla_action.action_type,
                     selector=f"vla_{x}_{y}",
-                    metadata={"x": x, "y": y, "source": "local_vla"},
+                    metadata={
+                        "x": x,
+                        "y": y,
+                        "source": "local_vla",
+                        "action_source": "local_vla",
+                    },
                 )
                 self._warm_world_model_with_action(current_state, run, action)
                 return action
-
-        grounded_action = self.explorer.suggest_action(
-            self._safe_snapshot_nodes(),
-            f"{getattr(option, 'description', '')} {run.objective}".strip(),
-            success_patterns=self.semantic_memory.get_success_patterns(
-                run.objective,
-                top_k=3,
-            ),
-        )
-        if grounded_action is not None:
-            grounded_action.metadata.setdefault("source", "active_inference_grounding")
-            grounded_action.metadata.setdefault(
-                "expected_observation",
-                "The grounded control should expose the next affordance or advance the option.",
-            )
-            self._warm_world_model_with_action(current_state, run, grounded_action)
-            return grounded_action
 
         # 4. MCTS deliberation on abstract state
         root_state = WorldState(
@@ -1192,7 +1698,7 @@ class UniversalDesktopAgentV2:
         return UiAction(
             action_type="explore",
             selector="reground-ui",
-            metadata={"source": "fallback"},
+            metadata={"source": "fallback", "action_source": "fallback"},
         )
 
     def _warm_world_model_with_action(
@@ -1397,7 +1903,23 @@ class UniversalDesktopAgentV2:
 
     def _build_abstract_state(self) -> AbstractUIState:
         """Build compact abstract state from current perception."""
-        screenshot = self.get_latest_screenshot()
+        screenshot = self.get_latest_screenshot() or self._safe_capture_bytes()
+        nodes = self._safe_snapshot_nodes()
+        node_elements = self._elements_from_nodes(nodes)
+        if nodes:
+            node_state = AbstractUIState.from_perceived_elements(node_elements, "unknown")
+            profile = self.capability_profiler.profile(
+                node_state,
+                nodes=nodes,
+                screenshot_available=screenshot is not None,
+            )
+            fused_elements = [*node_elements]
+            if screenshot:
+                fused_elements.extend(self.perception.quick_detect(screenshot))
+            return AbstractUIState.from_perceived_elements(
+                fused_elements,
+                profile.app_family,
+            )
         if screenshot:
             elements = self.perception.quick_detect(screenshot)
             # Infer app context from elements
@@ -1409,34 +1931,6 @@ class UniversalDesktopAgentV2:
                 if e.element_type in {"text_block", "icon", "panel"}:
                     app_context = "other"
             return AbstractUIState.from_perceived_elements(elements, app_context)
-        # Fallback from accessibility tree
-        if hasattr(self.backend, "snapshot"):
-            nodes = self.backend.snapshot()
-            elements = [
-                type(
-                    "FakeElem",
-                    (),
-                    {
-                        "x": 0,
-                        "y": 0,
-                        "width": 100,
-                        "height": 30,
-                        "element_type": _element_type_from_node(n),
-                        "text": getattr(n, "name", "") or "",
-                    },
-                )()
-                for n in nodes
-            ]
-            state = AbstractUIState.from_perceived_elements(elements, "unknown")
-            profile = self.capability_profiler.profile(
-                state,
-                nodes=nodes,
-                screenshot_available=False,
-            )
-            return AbstractUIState.from_perceived_elements(
-                elements,
-                profile.app_family,
-            )
         return AbstractUIState(app_context="unknown")
 
     def _build_state_summary(self, state: AbstractUIState) -> dict[str, Any]:
@@ -1513,13 +2007,168 @@ class UniversalDesktopAgentV2:
             )
         return self.backend.perform(action)
 
+    def _safe_capture_bytes(self) -> bytes | None:
+        if hasattr(self.backend, "capture_active_window"):
+            try:
+                payload = self.backend.capture_active_window()
+            except Exception:
+                payload = None
+            if payload:
+                return payload
+        if not hasattr(self.backend, "capture"):
+            return None
+        try:
+            return self.backend.capture()
+        except Exception:
+            return None
+
     def _safe_snapshot_nodes(self) -> list[UiNode]:
-        if not hasattr(self.backend, "snapshot"):
+        snapshot_fn = None
+        if hasattr(self.backend, "snapshot_active_window"):
+            snapshot_fn = self.backend.snapshot_active_window
+        elif hasattr(self.backend, "snapshot"):
+            snapshot_fn = self.backend.snapshot
+        if snapshot_fn is None:
             return []
         try:
-            return list(self.backend.snapshot())
+            return list(snapshot_fn())
         except Exception:
             return []
+
+    @staticmethod
+    def _elements_from_nodes(nodes: list[UiNode]) -> list[Any]:
+        elements: list[Any] = []
+        for node in nodes:
+            bounds = node.bounds or (0, 0, 100, 30)
+            left, top, width, height = bounds
+            elements.append(
+                type(
+                    "FakeElem",
+                    (),
+                    {
+                        "x": left,
+                        "y": top,
+                        "width": width,
+                        "height": height,
+                        "element_type": _element_type_from_node(node),
+                        "text": getattr(node, "name", "") or "",
+                    },
+                )()
+            )
+        return elements
+
+    @staticmethod
+    def _action_is_grounded(action: UiAction, nodes: list[UiNode]) -> bool:
+        metadata = dict(action.metadata or {})
+        if metadata.get("matched_node_id") or metadata.get("semantic_selector"):
+            return True
+        selector = str(action.selector or "").strip()
+        if not selector:
+            return False
+        selector_lower = selector.lower()
+        if selector_lower.startswith(("vla_", "perceived_", "pixel=")):
+            return False
+        for node in nodes:
+            node_name = str(node.name or "").strip().lower()
+            node_role = str(node.role or "").strip().lower()
+            if selector_lower == str(node.node_id or "").strip().lower():
+                return True
+            if node_name and selector_lower == f"name={node_name}":
+                return True
+            if node_role and selector_lower == f"role={node_role}":
+                return True
+            if selector_lower.startswith("automation_id="):
+                automation_id = str(node.metadata.get("automation_id") or "").lower()
+                if automation_id and selector_lower == f"automation_id={automation_id}":
+                    return True
+        return False
+
+    def _canonicalize_action(
+        self,
+        action: UiAction,
+        nodes: list[UiNode],
+    ) -> UiAction:
+        metadata = dict(action.metadata or {})
+        source = str(metadata.get("action_source") or metadata.get("source") or "")
+        if source:
+            metadata.setdefault("source", source)
+            metadata.setdefault("action_source", source)
+        raw_type = str(action.action_type or "").strip().lower()
+        action_type = raw_type
+        if raw_type in {
+            "button",
+            "checkbox",
+            "radio",
+            "toggle",
+            "menuitem",
+            "menu_item",
+            "tab",
+            "link",
+            "hyperlink",
+        }:
+            action_type = "click"
+        elif raw_type in {"text_field", "edit", "document"}:
+            action_type = "type" if action.value else "click"
+        elif raw_type == "focus" and not self._backend_supports_action("focus"):
+            if (
+                self._action_is_grounded(action, nodes)
+                or (
+                    metadata.get("x") is not None
+                    and metadata.get("y") is not None
+                )
+            ):
+                action_type = "click"
+        if action_type == action.action_type and metadata == dict(action.metadata or {}):
+            return action
+        return UiAction(
+            action_type=action_type,
+            selector=action.selector,
+            value=action.value,
+            metadata=metadata,
+        )
+
+    def _backend_supports_action(self, action_type: str) -> bool:
+        backend_name = str(getattr(self.backend, "name", "")).strip().lower()
+        if action_type == "focus":
+            return backend_name != "rust-native-windows"
+        return True
+
+    @staticmethod
+    def _receipt_is_explicit_failure(receipt: str) -> bool:
+        try:
+            payload = json.loads(str(receipt or ""))
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if payload.get("success") is False:
+            return True
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {
+            "blocked",
+            "denied",
+            "error",
+            "failed",
+            "selector-not-found",
+            "unsupported-action",
+            "unsupported",
+            "unavailable",
+            "timeout",
+            "invalid",
+            "not-found",
+        }:
+            return True
+        receipt_lower = str(receipt or "").lower()
+        return any(
+            token in receipt_lower
+            for token in (
+                "no ui element matched selector",
+                "unsupported action",
+                "unsupported-action",
+                "selector-not-found",
+                "is not supported",
+            )
+        )
 
     def get_cognitive_summary(self, run: UniversalAgentRun) -> dict[str, Any]:
         return {

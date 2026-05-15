@@ -43,8 +43,20 @@ class AgentOSClient:
             {"trace_id": trace_id},
         )
 
-    def eval_pack(self) -> dict[str, Any]:
-        return self._request("GET", "/benchmarks/eval-pack")
+    def eval_pack(
+        self,
+        pack: str = "",
+        max_tasks: int | None = None,
+    ) -> dict[str, Any]:
+        query_items: dict[str, str | int] = {}
+        if pack:
+            query_items["pack"] = pack
+        if max_tasks is not None:
+            query_items["max_tasks"] = max_tasks
+        if not query_items:
+            return self._request("GET", "/benchmarks/eval-pack")
+        query = urllib.parse.urlencode(query_items)
+        return self._request("GET", f"/benchmarks/eval-pack?{query}")
 
     def replay_debug(
         self,
@@ -63,6 +75,7 @@ class AgentOSClient:
         max_tasks: int | None = None,
         surfaces: list[str] | None = None,
         intents: list[str] | None = None,
+        pack: str = "combined",
         run_id: str = "",
         windows_safe_pack: bool = False,
         repeat: int = 1,
@@ -77,6 +90,7 @@ class AgentOSClient:
             "max_tasks": max_tasks,
             "surfaces": surfaces or [],
             "intents": intents or [],
+            "pack": pack,
             "run_id": run_id,
             "windows_safe_pack": windows_safe_pack,
             "repeat": repeat,

@@ -112,6 +112,7 @@ def _live_fire_config(payload: dict[str, Any]) -> LiveFireEvalConfig:
         max_tasks=_optional_int(payload.get("max_tasks")),
         surfaces=tuple(_string_list(payload.get("surfaces"))),
         intents=tuple(_string_list(payload.get("intents"))),
+        pack=str(payload.get("pack") or "combined"),
         windows_safe_pack=bool(payload.get("windows_safe_pack", False)),
         repeat=max(1, int(payload.get("repeat") or 1)),
         promote_failures=bool(payload.get("promote_failures", True)),

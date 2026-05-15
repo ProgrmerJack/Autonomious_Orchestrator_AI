@@ -41,16 +41,19 @@ mod platform {
                         }
                     }),
                 ];
-                let mut uia_status = "disabled";
+                let uia_status;
+                #[cfg(not(feature = "uia-windows"))]
+                {
+                    uia_status = "disabled";
+                }
                 #[cfg(feature = "uia-windows")]
                 {
-                    match collect_uia_nodes(256) {
+                    uia_status = match collect_uia_nodes(256) {
                         Ok(extra) => {
-                            uia_status = "ok";
                             nodes.extend(extra);
+                            "ok"
                         }
                         Err(error) => {
-                            uia_status = "error";
                             nodes.push(json!({
                                 "node_id": "native-uia-error",
                                 "role": "Error",
@@ -63,8 +66,9 @@ mod platform {
                                     "error": error
                                 }
                             }));
+                            "error"
                         }
-                    }
+                    };
                 }
                 json!({
                     "type": "native.snapshot",
@@ -98,7 +102,7 @@ mod platform {
             .create_true_condition()
             .map_err(|e| e.to_string())?;
         let walker = automation
-            .create_tree_walker_with_condition(&condition)
+            .create_tree_walker()
             .map_err(|e| e.to_string())?;
         let mut nodes = Vec::new();
         // Enumerate top-level windows
@@ -292,42 +296,70 @@ mod platform {
                 json!({"error": "launch_app requires a target"}),
             );
         }
-        match Command::new(target).spawn() {
+        match spawn_command_line(target) {
             Ok(process) => decorate_new(
                 "launched",
                 "launch_app",
                 selector,
                 value,
-                json!({"launched": target, "process_id": process.id()}),
+                json!({
+                    "launched": target,
+                    "process_id": process.id(),
+                    "launch_tokens": split_command_line(target),
+                }),
             ),
-            Err(first_error) => match Command::new("cmd")
-                .args(["/C", "start", "", target])
-                .spawn()
-            {
-                Ok(process) => decorate_new(
-                    "launched",
-                    "launch_app",
-                    selector,
-                    value,
-                    json!({
-                        "launched": target,
-                        "process_id": process.id(),
-                        "shell_start": true
-                    }),
-                ),
-                Err(second_error) => decorate_new(
-                    "error",
-                    "launch_app",
-                    selector,
-                    value,
-                    json!({
-                        "error": format!(
-                            "launch failed: {first_error}; shell start failed: {second_error}"
-                        )
-                    }),
-                ),
-            },
+            Err(error) => decorate_new(
+                "error",
+                "launch_app",
+                selector,
+                value,
+                json!({"error": error}),
+            ),
         }
+    }
+
+    fn spawn_command_line(target: &str) -> Result<std::process::Child, String> {
+        let parts = split_command_line(target);
+        let Some(program) = parts.first() else {
+            return Err("launch_app requires a target".to_string());
+        };
+        let args = &parts[1..];
+        match Command::new(program).args(args).spawn() {
+            Ok(process) => Ok(process),
+            Err(first_error) => {
+                let mut shell = Command::new("cmd");
+                shell.args(["/C", "start", "", program]);
+                if !args.is_empty() {
+                    shell.args(args);
+                }
+                shell.spawn().map_err(|second_error| {
+                    format!(
+                        "launch failed: {first_error}; shell start failed: {second_error}"
+                    )
+                })
+            }
+        }
+    }
+
+    fn split_command_line(raw: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        for ch in raw.chars() {
+            match ch {
+                '"' => in_quotes = !in_quotes,
+                ' ' | '\t' if !in_quotes => {
+                    if !current.is_empty() {
+                        parts.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+        parts
     }
 
     fn open_url(selector: &str, value: Option<&str>) -> Value {

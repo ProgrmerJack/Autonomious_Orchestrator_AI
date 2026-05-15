@@ -34,6 +34,7 @@ cognition = [
 ]
 os-control = [
 	"mss>=10.0,<11",
+	"uiautomation>=2.0.29,<3",
 ]
 full = [
 	"fastapi>=0.115,<1",
@@ -46,6 +47,7 @@ full = [
 	"scikit-learn>=1.6,<2",
 	"scipy>=1.15,<2",
 	"transformers>=4.48,<5",
+	"uiautomation>=2.0.29,<3",
 	"uvicorn[standard]>=0.30,<1",
 	"websockets>=14,<16",
 	"yfinance>=0.2.54,<1",

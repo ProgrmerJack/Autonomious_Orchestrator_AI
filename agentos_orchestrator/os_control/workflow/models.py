@@ -28,6 +28,7 @@ class DesktopWorkflowPlan:
     summary: str
     steps: list[DesktopWorkflowStep]
     artifacts: list[WorkflowArtifact]
+    intent: dict[str, Any] = field(default_factory=dict)
     risks: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     sub_tasks: list[str] = field(default_factory=list)

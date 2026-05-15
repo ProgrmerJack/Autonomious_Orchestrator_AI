@@ -45,6 +45,7 @@ from agentos_orchestrator.cognition.universal_agent_v2 import (
     UniversalDesktopAgentV2,
 )
 from agentos_orchestrator.os_control.base import UiAction, UiNode
+from agentos_orchestrator.os_control.workflow.planner import DesktopWorkflowPlanner
 
 
 class FakePixelBackend:
@@ -89,6 +90,69 @@ class FakeHybridBackend:
     def perform(self, action: UiAction) -> str:
         self.actions.append(action)
         return json.dumps({"status": "executed"})
+
+
+class WorkflowBootstrapBackend:
+    name = "windows-uia"
+
+    def __init__(self) -> None:
+        self.actions: list[UiAction] = []
+        self.last_text = ""
+
+    def snapshot(self) -> list[UiNode]:
+        return self.snapshot_active_window()
+
+    def snapshot_active_window(self) -> list[UiNode]:
+        nodes = [
+            UiNode(node_id="address", role="Edit", name="Address bar"),
+            UiNode(node_id="document", role="Document", name="Document"),
+            UiNode(node_id="search", role="Edit", name="Search"),
+            UiNode(node_id="settings", role="Edit", name="Settings Search"),
+            UiNode(node_id="files", role="Document", name="File List"),
+        ]
+        if self.last_text:
+            nodes.append(UiNode(node_id="typed", role="Text", name=self.last_text))
+        return nodes
+
+    def capture(self) -> bytes:
+        return self.capture_active_window()
+
+    def capture_active_window(self) -> bytes:
+        image = Image.new("RGB", (320, 200), color="white")
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def perform(self, action: UiAction) -> str:
+        self.actions.append(action)
+        if action.value:
+            self.last_text = str(action.value)
+        status = {
+            "launch_app": "launched",
+            "type": "typed",
+            "set_text": "typed",
+            "set_value": "value-set",
+            "hotkey": "hotkey-sent",
+            "focus": "focused",
+            "set_clipboard": "clipboard-updated",
+            "clipboard_copy": "clipboard-updated",
+            "rename_file": "file-op-executed",
+            "move_file": "file-op-executed",
+            "copy_file": "file-op-executed",
+        }.get(action.action_type, "executed")
+        payload = {
+            "status": status,
+            "action_type": action.action_type,
+            "selector": action.selector,
+        }
+        if action.action_type == "launch_app":
+            payload["process_id"] = len(self.actions)
+        if action.action_type in {"set_clipboard", "clipboard_copy"}:
+            payload["clipboard"] = str(action.value or "")
+        if action.action_type in {"type", "set_text", "set_value"}:
+            payload["text"] = str(action.value or "")
+            payload["matched_role"] = "Document"
+        return json.dumps(payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -720,6 +784,105 @@ class V2ServiceIntegrationTests(unittest.TestCase):
                 receipt["adaptation_readiness"]["status"],
                 "needs_training_or_eval",
             )
+
+
+class V2WorkflowBootstrapRegressionTests(unittest.TestCase):
+    def _run_objective(self, objective: str):
+        planner = DesktopWorkflowPlanner()
+        plan = planner.plan(objective)
+        self.assertTrue(plan.steps, plan.asdict())
+        backend = WorkflowBootstrapBackend()
+        agent = UniversalDesktopAgentV2(
+            backend,
+            max_steps=max(len(plan.steps), 1),
+            use_frontier_api=False,
+            use_local_vla=False,
+        )
+        run = agent.run(objective)
+        self.assertEqual(run.final_state["bootstrap"]["executed_steps"], len(plan.steps))
+        self.assertEqual(run.final_state["bootstrap"]["verified_steps"], len(plan.steps))
+        self.assertTrue(run.success)
+        return plan, backend, run
+
+    def test_run_bootstrap_handles_calculator_arithmetic(self) -> None:
+        plan, backend, _run = self._run_objective(
+            "In Calculator, compute 56 plus 19."
+        )
+        self.assertEqual(
+            [action.selector for action in backend.actions],
+            [step.selector for step in plan.steps],
+        )
+        self.assertIn("name=Plus", [action.selector for action in backend.actions])
+        self.assertEqual(backend.actions[-1].selector, "name=Equals")
+
+    def test_run_bootstrap_handles_notepad_note_creation(self) -> None:
+        plan, backend, _run = self._run_objective(
+            "Open Notepad and type hello world."
+        )
+        self.assertFalse(
+            any(step.selector == "name=AgentOS" for step in plan.steps)
+        )
+        self.assertEqual(backend.actions[0].selector, "notepad.exe")
+        self.assertFalse(
+            any(action.selector == "app-workspace" for action in backend.actions)
+        )
+        self.assertFalse(
+            any(action.action_type == "hotkey" for action in backend.actions)
+        )
+        self.assertEqual(backend.actions[-1].selector, "document-canvas")
+        self.assertEqual(backend.actions[-1].value, "hello world")
+
+    def test_run_bootstrap_handles_settings_search_without_toggle(self) -> None:
+        plan, backend, _run = self._run_objective(
+            "Open Settings and search for Bluetooth."
+        )
+        self.assertFalse(
+            any(step.selector == "name=AgentOS" for step in plan.steps)
+        )
+        self.assertTrue(
+            any(action.selector == "settings-search-box" for action in backend.actions)
+        )
+        self.assertFalse(any(action.action_type == "open_url" for action in backend.actions))
+
+    def test_run_bootstrap_handles_browser_search_then_notepad_paste(self) -> None:
+        _plan, backend, _run = self._run_objective(
+            "Search Chrome for Microsoft support and copy the URL into Notepad."
+        )
+        action_types = [action.action_type for action in backend.actions]
+        selectors = [action.selector for action in backend.actions]
+        open_url_actions = [
+            action for action in backend.actions if action.action_type == "open_url"
+        ]
+        clipboard_actions = [
+            action
+            for action in backend.actions
+            if action.action_type == "set_clipboard"
+        ]
+        typed_actions = [
+            action
+            for action in backend.actions
+            if action.action_type in {"type", "set_text", "set_value"}
+        ]
+        self.assertEqual(len(open_url_actions), 1)
+        self.assertIn("set_clipboard", action_types)
+        self.assertIn("notepad.exe", selectors)
+        self.assertIn("document-canvas", selectors)
+        self.assertEqual(clipboard_actions[-1].value, open_url_actions[0].value)
+        self.assertEqual(typed_actions[-1].value, open_url_actions[0].value)
+
+    def test_run_bootstrap_handles_file_rename(self) -> None:
+        plan, backend, _run = self._run_objective(
+            "Open File Explorer to rename report.md to report_final.md."
+        )
+        self.assertEqual(
+            [step.action_type for step in plan.steps],
+            ["launch_app", "rename_file"],
+        )
+        rename_actions = [
+            action for action in backend.actions if action.action_type == "rename_file"
+        ]
+        self.assertEqual(len(rename_actions), 1)
+        self.assertIn("report_final.md", str(rename_actions[0].value or ""))
 
 
 if __name__ == "__main__":

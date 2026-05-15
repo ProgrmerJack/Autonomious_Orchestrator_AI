@@ -74,7 +74,6 @@ class FormalSafetyVerifier:
         "path",
         "file",
         "folder",
-        "source",
         "destination",
         "source_path",
         "dest_path",

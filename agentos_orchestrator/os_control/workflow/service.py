@@ -4,6 +4,7 @@ import copy
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Any
@@ -46,6 +47,11 @@ from agentos_orchestrator.os_control.selector_debug import debug_selector
 from agentos_orchestrator.os_control.workflow.artifact_writer import (
     WorkflowArtifactWriter,
 )
+from agentos_orchestrator.os_control.workflow.intent_parser import (
+    StructuredIntent,
+    parse_structured_intent,
+)
+from agentos_orchestrator.os_control.workflow.models import DesktopWorkflowStep
 from agentos_orchestrator.os_control.workflow.programmer import ProgrammerLane
 from agentos_orchestrator.os_control.workflow.planner import (
     DesktopWorkflowPlanner,
@@ -122,6 +128,8 @@ class DesktopWorkflowService:
         self._last_observation_frame: ObservationFrame | None = None
         self._last_capability_profile: Any | None = None
         self._last_app_agent_session: AppAgentSession | None = None
+        self._workflow_blackboard: dict[str, Any] = {}
+        self._current_plan_intent: dict[str, Any] = {}
 
     def enable_universal_mode(
         self,
@@ -188,6 +196,11 @@ class DesktopWorkflowService:
 
     def execute(self, objective: str, backend: Any) -> dict[str, Any]:
         plan = copy.deepcopy(self.plan(objective))
+        plan = self._repair_bootstrap_plan(objective, plan, backend)
+        self._current_plan_intent = dict(
+            getattr(plan, "intent", {}) or parse_structured_intent(objective).asdict()
+        )
+        self._seed_workflow_blackboard(plan)
         if plan.requires_clarification:
             return {
                 "status": "clarification_required",
@@ -196,6 +209,8 @@ class DesktopWorkflowService:
                 "receipts": [],
             }
         plan = self.programmer_lane.augment_plan(plan)
+        if not getattr(plan, "intent", None):
+            plan.intent = dict(self._current_plan_intent)
         written_by_path = {
             item["path"]: item
             for item in self.writer.materialize(
@@ -205,6 +220,7 @@ class DesktopWorkflowService:
         }
         receipts: list[dict[str, Any]] = []
         for index, step in enumerate(plan.steps):
+            materialized_step = self._materialize_handoff_step(step)
             (
                 receipt,
                 final_selector,
@@ -212,18 +228,26 @@ class DesktopWorkflowService:
                 verification,
             ) = self._perform_with_recovery(
                 backend,
-                step,
+                materialized_step,
                 objective=objective,
-                remaining_steps=plan.steps[index:],
+                remaining_steps=[
+                    self._materialize_handoff_step(item)
+                    for item in plan.steps[index:]
+                ],
             )
             receipt_payload = self._json_or_text(receipt)
+            self._update_workflow_blackboard(
+                materialized_step,
+                final_selector,
+                receipt_payload,
+            )
             for artifact in self._generated_artifacts(receipt_payload):
                 written_by_path[artifact["path"]] = artifact
             receipts.append(
                 {
-                    "action_type": step.action_type,
+                    "action_type": materialized_step.action_type,
                     "selector": final_selector,
-                    "description": step.description,
+                    "description": materialized_step.description,
                     "receipt": receipt_payload,
                     "recovery": recovery,
                     "verification": verification,
@@ -300,6 +324,123 @@ class DesktopWorkflowService:
             "receipts": receipts,
         }
 
+    def _repair_bootstrap_plan(
+        self,
+        objective: str,
+        plan: Any,
+        backend: Any,
+    ) -> Any:
+        intent_payload = dict(
+            getattr(plan, "intent", {}) or parse_structured_intent(objective).asdict()
+        )
+        plan.intent = intent_payload
+        if self._universal_agent is None:
+            return plan
+        repair_method = getattr(self._universal_agent, "repair_bootstrap_plan", None)
+        if not callable(repair_method):
+            return plan
+        try:
+            repaired = repair_method(objective, plan, backend=backend)
+        except TypeError:
+            repaired = repair_method(objective, plan)
+        except (RuntimeError, ValueError, OSError):
+            return plan
+        if repaired is None:
+            return plan
+        if not getattr(repaired, "intent", None):
+            repaired.intent = intent_payload
+        return repaired
+
+    def _seed_workflow_blackboard(self, plan: Any) -> None:
+        intent = StructuredIntent.from_dict(getattr(plan, "intent", {}) or {})
+        self._workflow_blackboard = {
+            str(key): value
+            for key, value in intent.entities.items()
+            if str(value or "").strip()
+        }
+        if intent.source_surface:
+            self._workflow_blackboard["source_surface"] = intent.source_surface
+        if intent.destination_surface:
+            self._workflow_blackboard["destination_surface"] = (
+                intent.destination_surface
+            )
+        if intent.file_source_hint:
+            self._workflow_blackboard["file_source"] = intent.file_source_hint
+        if intent.file_destination_hint:
+            self._workflow_blackboard["file_destination"] = (
+                intent.file_destination_hint
+            )
+        self._workflow_blackboard["workflow_objective"] = str(plan.objective or "")
+
+    def _materialize_handoff_step(self, step: Any) -> DesktopWorkflowStep:
+        return DesktopWorkflowStep(
+            action_type=step.action_type,
+            selector=self._render_handoff_value(step.selector),
+            value=self._render_handoff_value(step.value),
+            description=step.description,
+            metadata=self._render_handoff_value(dict(step.metadata or {})),
+        )
+
+    def _render_handoff_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return re.sub(
+                r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}",
+                lambda match: str(
+                    self._workflow_blackboard.get(match.group(1), match.group(0))
+                ),
+                value,
+            )
+        if isinstance(value, dict):
+            return {
+                str(key): self._render_handoff_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._render_handoff_value(item) for item in value]
+        return value
+
+    def _update_workflow_blackboard(
+        self,
+        step: Any,
+        selector: str,
+        receipt_payload: Any,
+    ) -> None:
+        del selector
+        metadata = dict(step.metadata or {})
+        handoff_write = metadata.get("handoff_write")
+        if isinstance(handoff_write, dict):
+            for key, value in handoff_write.items():
+                rendered = self._render_handoff_value(value)
+                if str(rendered or "").strip():
+                    self._workflow_blackboard[str(key)] = rendered
+        if step.action_type in {"open_url"} and step.value:
+            self._workflow_blackboard["active_url"] = str(step.value)
+        if step.action_type in {"set_clipboard", "clipboard_copy"} and step.value:
+            self._workflow_blackboard["copied_text"] = str(step.value)
+        if step.action_type in {"type", "set_text", "set_value"} and step.value:
+            self._workflow_blackboard["last_written_text"] = str(step.value)
+        if not isinstance(receipt_payload, dict):
+            return
+        clipboard = str(receipt_payload.get("clipboard") or "").strip()
+        if clipboard:
+            self._workflow_blackboard["copied_text"] = clipboard
+        file_op = receipt_payload.get("file_op")
+        if isinstance(file_op, dict):
+            source = str(file_op.get("source") or "").strip()
+            destination = str(
+                file_op.get("destination") or file_op.get("new_name") or ""
+            ).strip()
+            if source:
+                self._workflow_blackboard["file_source"] = source
+            if destination:
+                self._workflow_blackboard["file_destination"] = destination
+        parsed_results = receipt_payload.get("parsed_results")
+        if parsed_results:
+            self._workflow_blackboard["extracted_fact"] = json.dumps(
+                parsed_results,
+                sort_keys=True,
+            )[:500]
+
     def _universal_adaptation_readiness(self) -> dict[str, Any]:
         readiness = getattr(
             self._universal_agent,
@@ -341,6 +482,7 @@ class DesktopWorkflowService:
             )
             if decision.done or decision.step is None:
                 return
+            materialized_step = self._materialize_handoff_step(decision.step)
             (
                 receipt,
                 final_selector,
@@ -348,16 +490,22 @@ class DesktopWorkflowService:
                 verification,
             ) = self._perform_with_recovery(
                 backend,
-                decision.step,
+                materialized_step,
                 objective=objective,
-                remaining_steps=[decision.step],
+                remaining_steps=[materialized_step],
+            )
+            receipt_payload = self._json_or_text(receipt)
+            self._update_workflow_blackboard(
+                materialized_step,
+                final_selector,
+                receipt_payload,
             )
             receipts.append(
                 {
-                    "action_type": decision.step.action_type,
+                    "action_type": materialized_step.action_type,
                     "selector": final_selector,
-                    "description": decision.step.description,
-                    "receipt": self._json_or_text(receipt),
+                    "description": materialized_step.description,
+                    "receipt": receipt_payload,
                     "recovery": recovery,
                     "verification": verification,
                     "control": self._control_from_recovery(recovery),
@@ -468,9 +616,11 @@ class DesktopWorkflowService:
                 app_agent,
                 objective,
             )
+        action = self._attach_workflow_handoff(action)
         goal_lock = build_goal_lock(
             objective=objective,
             observation=observation,
+            intent_profile=self._current_plan_intent,
         )
         speculation = self._speculative_preview(
             observation,
@@ -508,6 +658,22 @@ class DesktopWorkflowService:
             objective,
         )
         return receipt, selector, action
+
+    def _attach_workflow_handoff(self, action: UiAction) -> UiAction:
+        if not self._workflow_blackboard:
+            return action
+        metadata = dict(action.metadata or {})
+        metadata["workflow_handoff"] = dict(self._workflow_blackboard)
+        app_agent = dict(metadata.get("app_agent") or {})
+        if app_agent:
+            app_agent["handoff_entities"] = dict(self._workflow_blackboard)
+            metadata["app_agent"] = app_agent
+        return UiAction(
+            action_type=action.action_type,
+            selector=action.selector,
+            value=action.value,
+            metadata=metadata,
+        )
 
     def _prepare_control_action(
         self,
@@ -1079,6 +1245,13 @@ class DesktopWorkflowService:
         action_type: str,
         selector: str,
     ) -> VerificationContract | None:
+        if action_type in {"set_clipboard", "clipboard_copy"}:
+            return VerificationContract(
+                kind="clipboard_contains",
+                expected="The clipboard contains the transferred value.",
+                target=selector,
+                required=True,
+            )
         if action_type == "cell_edit":
             return VerificationContract(
                 kind="receipt_success",

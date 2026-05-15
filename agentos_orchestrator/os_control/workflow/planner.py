@@ -5,17 +5,28 @@ import re
 from agentos_orchestrator.os_control.workflow.adapters import (
     ApiIntentWorkflowAdapter,
     BrowserWorkflowAdapter,
+    CalculatorWorkflowAdapter,
+    CalendarWorkflowAdapter,
+    ChatWorkflowAdapter,
+    CrossAppHandoffWorkflowAdapter,
     EditorWorkflowAdapter,
+    EmailWorkflowAdapter,
     ExplorerFileOpsWorkflowAdapter,
     FileOpsIntentAdapter,
     FileManagerWorkflowAdapter,
     GenericAppWorkflowAdapter,
     OfficeWorkflowAdapter,
+    PdfWorkflowAdapter,
     ResearchWorkflowAdapter,
+    SettingsWorkflowAdapter,
     SpreadsheetCellEditIntentAdapter,
     SpreadsheetWorkflowAdapter,
     WorkflowContext,
     workflow_prefers_research_tool,
+)
+from agentos_orchestrator.os_control.workflow.intent_parser import (
+    StructuredIntent,
+    parse_structured_intent,
 )
 from agentos_orchestrator.os_control.workflow.models import (
     DesktopWorkflowPlan,
@@ -37,6 +48,8 @@ class DesktopWorkflowPlanner:
     }
 
     APP_TARGET_KEYWORDS = (
+        ("calculator", "calc.exe"),
+        ("calc", "calc.exe"),
         ("file explorer", "explorer.exe"),
         ("explorer", "explorer.exe"),
         ("powerpoint", "powerpnt.exe"),
@@ -57,6 +70,11 @@ class DesktopWorkflowPlanner:
         ("browser", "msedge.exe"),
         ("edge", "msedge.exe"),
         ("chrome", "chrome.exe"),
+        ("outlook", "outlook.exe"),
+        ("mail app", "outlook.exe"),
+        ("settings", "settings.exe"),
+        ("open settings", "settings.exe"),
+        ("windows settings", "settings.exe"),
     )
 
     DEFAULT_MODE_TARGETS = {
@@ -117,10 +135,17 @@ class DesktopWorkflowPlanner:
         self.api_intent_adapter = ApiIntentWorkflowAdapter()
         self.browser_adapter = BrowserWorkflowAdapter()
         self.research_adapter = ResearchWorkflowAdapter()
+        self.calculator_adapter = CalculatorWorkflowAdapter()
         self.file_manager_adapter = FileManagerWorkflowAdapter()
         self.explorer_file_ops_adapter = ExplorerFileOpsWorkflowAdapter()
         self.file_ops_intent_adapter = FileOpsIntentAdapter()
         self.generic_app_adapter = GenericAppWorkflowAdapter()
+        self.cross_app_handoff_adapter = CrossAppHandoffWorkflowAdapter()
+        self.chat_adapter = ChatWorkflowAdapter()
+        self.email_adapter = EmailWorkflowAdapter()
+        self.calendar_adapter = CalendarWorkflowAdapter()
+        self.settings_adapter = SettingsWorkflowAdapter()
+        self.pdf_adapter = PdfWorkflowAdapter()
         self.office_adapter = OfficeWorkflowAdapter()
         self.editor_adapter = EditorWorkflowAdapter()
         self.spreadsheet_adapter = SpreadsheetWorkflowAdapter()
@@ -128,13 +153,14 @@ class DesktopWorkflowPlanner:
 
     def plan(self, objective: str) -> DesktopWorkflowPlan:
         cleaned = re.sub(r"\s+", " ", objective).strip()
-        sub_tasks = self._sub_tasks(cleaned)
+        intent = parse_structured_intent(cleaned)
+        sub_tasks = self._sub_tasks(cleaned, intent)
         segments = self._task_segments(cleaned, sub_tasks)
         mode = self._plan_mode(segments)
         app_target = self._plan_app_target(segments)
         artifacts = [artifact for segment in segments for artifact in segment[3]]
         lower = cleaned.lower()
-        requires_clarification = self._needs_clarification(cleaned, lower)
+        requires_clarification = self._needs_clarification(cleaned, lower, intent)
         clarification_questions = self._clarification_questions(
             cleaned,
             mode,
@@ -147,6 +173,7 @@ class DesktopWorkflowPlanner:
             mode=mode,
             app_target=app_target,
             summary="",
+            intent=intent.asdict(),
             steps=steps,
             artifacts=artifacts,
             risks=risks,
@@ -180,18 +207,26 @@ class DesktopWorkflowPlanner:
 
     def _build_steps(
         self,
-        segments: list[tuple[str, str, str | None, list[WorkflowArtifact]]],
+        segments: list[
+            tuple[str, str, str | None, list[WorkflowArtifact], StructuredIntent]
+        ],
     ) -> list[DesktopWorkflowStep]:
         steps: list[DesktopWorkflowStep] = []
-        for item, segment_mode, target, segment_artifacts in segments:
-            steps.extend(
-                self._segment_steps(
-                    item,
-                    segment_mode,
-                    target,
-                    segment_artifacts,
-                )
-            )
+        seen_launches: set[str] = set()
+        for item, segment_mode, target, segment_artifacts, intent in segments:
+            for step in self._segment_steps(
+                item,
+                segment_mode,
+                target,
+                segment_artifacts,
+                intent,
+            ):
+                if step.action_type == "launch_app":
+                    launch_target = str(step.value or step.selector or "")
+                    if launch_target in seen_launches:
+                        continue
+                    seen_launches.add(launch_target)
+                steps.append(step)
         return steps
 
     @staticmethod
@@ -212,6 +247,7 @@ class DesktopWorkflowPlanner:
         mode: str,
         app_target: str | None,
         artifacts: list[WorkflowArtifact],
+        intent: StructuredIntent,
     ) -> list[DesktopWorkflowStep]:
         segment_steps: list[DesktopWorkflowStep] = []
         lower = objective.lower()
@@ -242,20 +278,33 @@ class DesktopWorkflowPlanner:
             app_target=effective_app_target,
             artifact_path=artifact_path,
             research_artifact_path=research_artifact_path,
+            intent=intent,
         )
         research_steps = self.research_adapter.steps_for(context)
         if research_steps:
             segment_steps.extend(research_steps)
         api_steps = self.api_intent_adapter.steps_for(context)
+        cross_app_browser_handoff = self._owns_browser_handoff(context)
         if api_steps:
             segment_steps.extend(api_steps)
-        elif not research_steps:
+        elif (
+            not research_steps
+            and not cross_app_browser_handoff
+            and effective_app_target in {None, "msedge.exe", "chrome.exe"}
+        ):
             segment_steps.extend(self.browser_adapter.steps_for(context))
         if effective_app_target and not api_steps:
             self._append_launch_step(segment_steps, effective_app_target)
+        segment_steps.extend(self.calculator_adapter.steps_for(context))
         segment_steps.extend(self.file_manager_adapter.steps_for(context))
         segment_steps.extend(self.explorer_file_ops_adapter.steps_for(context))
         segment_steps.extend(self.file_ops_intent_adapter.steps_for(context))
+        segment_steps.extend(self.cross_app_handoff_adapter.steps_for(context))
+        segment_steps.extend(self.chat_adapter.steps_for(context))
+        segment_steps.extend(self.email_adapter.steps_for(context))
+        segment_steps.extend(self.calendar_adapter.steps_for(context))
+        segment_steps.extend(self.settings_adapter.steps_for(context))
+        segment_steps.extend(self.pdf_adapter.steps_for(context))
         segment_steps.extend(self.spreadsheet_adapter.steps_for(context))
         segment_steps.extend(
             self.spreadsheet_cell_edit_intent_adapter.steps_for(context)
@@ -266,30 +315,57 @@ class DesktopWorkflowPlanner:
         segment_steps.extend(self.editor_adapter.steps_for(context))
         if mode == "drawing" and artifact_path:
             segment_steps.extend(self._drawing_steps(objective, artifact_path))
-        mode_delta = len(segment_steps) - before_mode_specific
-        if mode_delta == 0 and app_target and self._needs_focus_step(lower):
-            segment_steps.append(self._focus_step())
         return segment_steps
 
     def _task_segments(
         self,
         objective: str,
         sub_tasks: list[str],
-    ) -> list[tuple[str, str, str | None, list[WorkflowArtifact]]]:
+    ) -> list[tuple[str, str, str | None, list[WorkflowArtifact], StructuredIntent]]:
         if not sub_tasks:
             sub_tasks = [objective]
-        segments: list[tuple[str, str, str | None, list[WorkflowArtifact]]] = []
+        objective_lower = objective.lower()
+        objective_intent = parse_structured_intent(objective)
+        objective_mode = self._segment_mode(objective_lower, objective_intent)
+        shared_app_target = self._segment_app_target(
+            objective_lower,
+            objective_mode,
+            objective_intent,
+        )
+        segments: list[
+            tuple[str, str, str | None, list[WorkflowArtifact], StructuredIntent]
+        ] = []
         for item in sub_tasks:
             lower = item.lower()
-            mode = self._segment_mode(lower)
-            app_target = self._segment_app_target(lower, mode)
+            intent = parse_structured_intent(item)
+            mode = self._segment_mode(lower, intent)
+            app_target = self._segment_app_target(lower, mode, intent)
+            if (
+                app_target is None
+                and shared_app_target is not None
+                and not intent.cross_app
+                and not objective_intent.cross_app
+            ):
+                app_target = shared_app_target
             artifacts = self._artifacts(item, lower, mode)
-            segments.append((item, mode, app_target, artifacts))
+            segments.append((item, mode, app_target, artifacts, intent))
         return segments
 
     @staticmethod
+    def _owns_browser_handoff(context: WorkflowContext) -> bool:
+        intent = context.intent
+        return bool(
+            intent.cross_app
+            and intent.is_clipboard_copy()
+            and intent.source_surface == "browser"
+            and intent.destination_surface == "editor"
+        )
+
+    @staticmethod
     def _plan_mode(
-        segments: list[tuple[str, str, str | None, list[WorkflowArtifact]]],
+        segments: list[
+            tuple[str, str, str | None, list[WorkflowArtifact], StructuredIntent]
+        ],
     ) -> str:
         modes = {segment[1] for segment in segments}
         if not modes:
@@ -302,7 +378,9 @@ class DesktopWorkflowPlanner:
 
     @staticmethod
     def _plan_app_target(
-        segments: list[tuple[str, str, str | None, list[WorkflowArtifact]]],
+        segments: list[
+            tuple[str, str, str | None, list[WorkflowArtifact], StructuredIntent]
+        ],
     ) -> str | None:
         targets = [segment[2] for segment in segments if segment[2]]
         if not targets:
@@ -421,8 +499,10 @@ class DesktopWorkflowPlanner:
         return None
 
     @staticmethod
-    def _segment_mode(lower: str) -> str:
-        if DesktopWorkflowPlanner._is_explorer_file_op(lower):
+    def _segment_mode(lower: str, intent: StructuredIntent) -> str:
+        if intent.is_file_workflow() or DesktopWorkflowPlanner._is_explorer_file_op(lower):
+            return "app-task"
+        if intent.primary_domain in {"chat", "browser", "pdf", "cross_app"}:
             return "app-task"
         if DesktopWorkflowPlanner._is_spreadsheet_cell_intent(lower):
             return "spreadsheet"
@@ -448,7 +528,17 @@ class DesktopWorkflowPlanner:
         return any(token in lower for token in ("set", "update", "cell", "sheet"))
 
     @staticmethod
-    def _segment_app_target(lower: str, mode: str) -> str | None:
+    def _segment_app_target(
+        lower: str,
+        mode: str,
+        intent: StructuredIntent,
+    ) -> str | None:
+        if intent.is_file_workflow():
+            return "explorer.exe"
+        if intent.cross_app:
+            return None
+        if intent.app_target is not None:
+            return intent.app_target
         explicit = DesktopWorkflowPlanner._explicit_app_target(lower)
         if explicit is not None:
             return explicit
@@ -490,6 +580,9 @@ class DesktopWorkflowPlanner:
 
     @staticmethod
     def _is_knowledge_task(lower: str) -> bool:
+        intent = parse_structured_intent(lower)
+        if intent.prefers_local_file_search() or intent.is_file_copy():
+            return False
         cues = (
             "search",
             "look up",
@@ -554,6 +647,8 @@ class DesktopWorkflowPlanner:
             "powerpoint": "powerpnt.exe",
             "edge": "msedge.exe",
             "chrome": "chrome.exe",
+            "outlook": "outlook.exe",
+            "settings": "settings.exe",
         }
         if name in aliases:
             return aliases[name]
@@ -567,6 +662,8 @@ class DesktopWorkflowPlanner:
     @staticmethod
     def _explicit_app_target(lower: str) -> str | None:
         explicit_app_keys = {
+            "calculator",
+            "calc",
             "file explorer",
             "explorer",
             "powerpoint",
@@ -581,6 +678,7 @@ class DesktopWorkflowPlanner:
             "browser",
             "edge",
             "chrome",
+            "settings",
         }
         explicit_scored: list[tuple[int, int, str]] = []
         fallback_scored: list[tuple[int, int, str]] = []
@@ -601,7 +699,16 @@ class DesktopWorkflowPlanner:
         return fallback_scored[0][2]
 
     @staticmethod
-    def _sub_tasks(objective: str) -> list[str]:
+    def _sub_tasks(objective: str, intent: StructuredIntent) -> list[str]:
+        app_bound_surfaces = {"chat_app", "email", "calendar", "settings"}
+        if (
+            intent.cross_app
+            or intent.is_clipboard_copy()
+            or intent.prefers_chat_search()
+            or intent.source_surface in app_bound_surfaces
+            or intent.destination_surface in app_bound_surfaces
+        ):
+            return [objective.strip()] if objective.strip() else []
         normalized = objective
         normalized = re.sub(r"\bthen\b", " and ", normalized, flags=re.I)
         normalized = re.sub(r"\bnext\b", " and ", normalized, flags=re.I)
@@ -640,9 +747,15 @@ class DesktopWorkflowPlanner:
         )
 
     @staticmethod
-    def _needs_clarification(cleaned: str, lower: str) -> bool:
+    def _needs_clarification(
+        cleaned: str,
+        lower: str,
+        intent: StructuredIntent,
+    ) -> bool:
         if not cleaned:
             return True
+        if intent.operations or intent.path_hints or intent.source_surface:
+            return False
         if len(cleaned.split()) < 4:
             return True
         if any(
@@ -688,18 +801,6 @@ class DesktopWorkflowPlanner:
                 "Should the browser step run first before drafting output?"
             )
         return questions
-
-    @staticmethod
-    def _needs_focus_step(lower: str) -> bool:
-        return "search for" in lower or "open " in lower
-
-    @staticmethod
-    def _focus_step() -> DesktopWorkflowStep:
-        return DesktopWorkflowStep(
-            action_type="focus",
-            selector="name=AgentOS",
-            description="Focus the working window before manual refinement.",
-        )
 
     @staticmethod
     def _summary(

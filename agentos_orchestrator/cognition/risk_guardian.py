@@ -475,12 +475,35 @@ def classify_target(action: UiAction) -> tuple[str, str]:
     target_class → one of the policy matrix rows' target_class values.
     data_sensitivity → "public" | "internal" | "confidential" | "secret"
     """
+    metadata = dict(action.metadata or {})
     combined = " ".join(
         filter(
             None,
             [action.action_type, str(action.selector or ""), str(action.value or "")],
         )
     ).lower()
+
+    file_like_action = action.action_type.lower().endswith("_file") or any(
+        key in metadata for key in ("source", "destination", "new_name", "path")
+    )
+    if file_like_action and "invoice" in combined and not any(
+        token in combined
+        for token in (
+            "pay",
+            "payment",
+            "checkout",
+            "purchase",
+            "billing",
+            "charge",
+            "stripe",
+            "paypal",
+            "venmo",
+            "wire",
+        )
+    ):
+        if action.action_type.lower() in {"delete_file", "remove_file"}:
+            return "file_delete", "internal"
+        return "ui", "internal"
 
     if _PAYMENT_TERMS.search(combined):
         return "payment", "confidential"

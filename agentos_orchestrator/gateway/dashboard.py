@@ -486,8 +486,11 @@ def create_dashboard_app(
             )
 
         @app.get("/benchmarks/eval-pack")
-        async def universal_eval_pack() -> dict:
-            return eval_pack_payload()
+        async def universal_eval_pack(
+            pack: str = "combined",
+            max_tasks: int = 100,
+        ) -> dict:
+            return eval_pack_payload(pack=pack, max_tasks=max_tasks)
 
         @app.post("/benchmarks/live-fire-eval")
         async def live_fire_eval(payload: dict) -> dict:

@@ -1,0 +1,8 @@
+2026-05-15 14:14:47.648 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 14:15:00.005 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. CustomControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 14:19:48.328 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 14:20:15.433 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 16:19:09.807 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 16:19:20.043 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 16:19:30.132 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. ButtonControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: ButtonControl}
+2026-05-15 16:19:40.256 windows_uia_backend.py[601] _invoke_click -> Can not move cursor. TabControl's BoundingRectangle is (0,0,0,0)[0x0]. SearchProperties: {ControlType: TabControl}

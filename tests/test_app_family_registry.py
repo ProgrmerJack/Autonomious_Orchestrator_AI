@@ -12,12 +12,19 @@ from agentos_orchestrator.app_family_registry import (
     launch_target_for_family,
     primary_selector_for_family,
 )
+from agentos_orchestrator.cognition.app_agent_runtime import AppAgentRuntime
 from agentos_orchestrator.cognition.adaptation_readiness import (
     collect_adaptation_readiness,
 )
 from agentos_orchestrator.cognition.app_adapters import adapter_families
-from agentos_orchestrator.cognition.capability_profile import known_app_families
-from agentos_orchestrator.cognition.live_fire_eval_recipes import actions_for_task
+from agentos_orchestrator.cognition.capability_profile import (
+    CapabilityProfiler,
+    known_app_families,
+)
+from agentos_orchestrator.cognition.live_fire_eval_recipes import (
+    abstract_state,
+    actions_for_task,
+)
 from agentos_orchestrator.cognition.os_eval_packs import EvalTask, SURFACE_FAMILIES
 from agentos_orchestrator.os_control import UiAction, VirtualDesktopSandboxBackend
 from agentos_orchestrator.product.status import benchmark_status
@@ -57,6 +64,37 @@ class AppFamilyRegistryTests(unittest.TestCase):
             self.assertIn("office-ribbon", selectors)
             self.assertIn("layers-panel", selectors)
             self.assertIn("enterprise-detail-panel", selectors)
+
+    def test_app_agent_runtime_resolves_new_everyday_families(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backend = VirtualDesktopSandboxBackend(root / "sandbox.json")
+            profiler = CapabilityProfiler()
+            runtime = AppAgentRuntime(root)
+            cases = (
+                ("outlook.exe", "email", "email-search-box"),
+                (
+                    "outlook.exe /select outlook:calendar",
+                    "calendar",
+                    "calendar-grid",
+                ),
+                ("settings.exe", "settings", "settings-search-box"),
+            )
+
+            for launch_target, family, primary_selector in cases:
+                backend.reset()
+                backend.perform(UiAction("launch_app", launch_target, launch_target))
+                nodes = backend.snapshot()
+                profile = profiler.profile(abstract_state(family, nodes), nodes)
+                session = runtime.resolve(
+                    profile,
+                    objective=f"exercise {family}",
+                    nodes=nodes,
+                )
+
+                self.assertEqual(profile.app_family, family)
+                self.assertEqual(session.skill_pack.family, family)
+                self.assertEqual(session.skill_pack.primary_selector, primary_selector)
 
     def test_virtual_sandbox_preserves_action_history_on_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

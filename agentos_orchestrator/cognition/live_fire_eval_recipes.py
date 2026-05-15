@@ -24,6 +24,9 @@ def actions_for_task(
     artifact_root: Path,
     run_id: str,
 ) -> list[UiAction]:
+    workflow = _workflow_actions_for_task(task, artifact_root, run_id)
+    if workflow is not None:
+        return workflow
     setup = _surface_setup(task.surface)
     main = _intent_action(task, artifact_root, run_id)
     return [setup] if main is None else [setup, main]
@@ -98,6 +101,360 @@ def _intent_action(
         "invalid_input_repair": _valid_field_action,
     }
     return builders.get(task.intent, _default_click_action)(task)
+
+
+def _workflow_actions_for_task(
+    task: EvalTask,
+    artifact_root: Path,
+    run_id: str,
+) -> list[UiAction] | None:
+    if task.intent == "browser_editor_handoff":
+        query = "nearest UPS store"
+        value = "Address result for: nearest UPS store"
+        return [
+            _surface_setup("browser"),
+            UiAction(
+                "open_url",
+                "browser-address-bar",
+                "https://www.bing.com/search?q=nearest+UPS+store",
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="state_changed",
+                        expected="The browser search result loads for the requested address.",
+                        target="browser-address-bar",
+                        value=query,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "set_clipboard",
+                "workflow-clipboard",
+                value,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="clipboard_contains",
+                        expected="Clipboard contains the copied address.",
+                        value=value,
+                        required=True,
+                    ).asdict()
+                },
+            ),
+            _surface_setup("editor"),
+            UiAction(
+                "set_text",
+                "document-canvas",
+                value,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected="The destination editor contains the copied address.",
+                        target="document-canvas",
+                        value=value,
+                    ).asdict()
+                },
+            ),
+        ]
+    if task.intent == "local_file_handoff":
+        staging_dir = artifact_root / "live_fire_inputs" / run_id
+        source_path = str((staging_dir / "invoice.pdf").resolve())
+        target_path = str((staging_dir / "april-invoice.pdf").resolve())
+        return [
+            UiAction(
+                "launch_app",
+                launch_target_for_family("file_explorer"),
+                value=launch_target_for_family("file_explorer"),
+                metadata={
+                    "create_artifact_path": source_path,
+                    "artifact_content": "Invoice PDF fixture",
+                },
+            ),
+            UiAction(
+                "rename_file",
+                "explorer-file-list",
+                f"{source_path} -> {target_path}",
+                metadata={
+                    "operation": "rename",
+                    "source": source_path,
+                    "new_name": target_path,
+                    "path": target_path,
+                    "create_artifact_path": target_path,
+                    "artifact_content": "Invoice PDF fixture",
+                    "verification_contract": VerificationContract(
+                        kind="file_exists",
+                        expected="The renamed invoice file exists.",
+                        target="explorer-file-list",
+                        path=target_path,
+                    ).asdict(),
+                },
+            ),
+        ]
+    if task.intent == "chat_reply_handoff":
+        query = "Q4 planning"
+        reply = "Draft summary for: Q4 planning"
+        return [
+            _surface_setup("chat_app"),
+            UiAction(
+                "type",
+                "conversation-list",
+                f"Search messages: {query}",
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="state_changed",
+                        expected="The chat search query is applied.",
+                        target="conversation-list",
+                        value=query,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "type",
+                "chat-composer",
+                reply,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected="The draft reply is present in the chat composer.",
+                        target="chat-composer",
+                        value=reply,
+                    ).asdict()
+                },
+            ),
+        ]
+    if task.intent == "pdf_editor_handoff":
+        note = "PDF note: renewal clause"
+        return [
+            _surface_setup("pdf_viewer"),
+            UiAction(
+                "type",
+                "pdf-search-box",
+                "renewal clause",
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected="The PDF search box contains the requested query.",
+                        target="pdf-search-box",
+                        value="renewal clause",
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "set_clipboard",
+                "workflow-clipboard",
+                note,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="clipboard_contains",
+                        expected="Clipboard contains the extracted PDF note.",
+                        value=note,
+                        required=True,
+                    ).asdict()
+                },
+            ),
+            _surface_setup("editor"),
+            UiAction(
+                "set_text",
+                "document-canvas",
+                note,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected="The destination editor contains the extracted PDF note.",
+                        target="document-canvas",
+                        value=note,
+                    ).asdict()
+                },
+            ),
+        ]
+    if task.intent == "email_send_attachment":
+        staging_dir = artifact_root / "live_fire_inputs" / run_id
+        source_path = str((staging_dir / "invoice.pdf").resolve())
+        attachment_name = Path(source_path).name
+        recipient = "Alex"
+        return [
+            UiAction(
+                "launch_app",
+                launch_target_for_family("file_explorer"),
+                value=launch_target_for_family("file_explorer"),
+                metadata={
+                    "create_artifact_path": source_path,
+                    "artifact_content": "Invoice PDF fixture",
+                },
+            ),
+            UiAction(
+                "launch_app",
+                launch_target_for_family("email"),
+                value=launch_target_for_family("email"),
+            ),
+            UiAction(
+                "set_text",
+                "email-to-field",
+                recipient,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected=(
+                            "The email recipient field contains the requested "
+                            "recipient."
+                        ),
+                        target="email-to-field",
+                        value=recipient,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "set_text",
+                "email-attachment-field",
+                source_path,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected=(
+                            "The email attachment field contains the selected "
+                            "file."
+                        ),
+                        target="email-attachment-field",
+                        value=source_path,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "click",
+                "email-send-button",
+                f"Send email to {recipient}",
+                metadata={
+                    "recipient": recipient,
+                    "attachment": attachment_name,
+                    "verification_contract": VerificationContract(
+                        kind="send_outcome",
+                        expected=(
+                            "The final email state proves the message was sent "
+                            "with the requested attachment."
+                        ),
+                        target="email-status-text",
+                        value=f"Sent email to {recipient}",
+                        metadata={
+                            "recipient": recipient,
+                            "attachment": attachment_name,
+                            "expected_state": "sent",
+                        },
+                    ).asdict(),
+                },
+            ),
+        ]
+    if task.intent == "calendar_invite_from_email":
+        query = "Zoom invite"
+        return [
+            UiAction(
+                "launch_app",
+                launch_target_for_family("email"),
+                value=launch_target_for_family("email"),
+            ),
+            UiAction(
+                "set_text",
+                "email-search-box",
+                query,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected=(
+                            "The email search box contains the requested invite "
+                            "query."
+                        ),
+                        target="email-search-box",
+                        value=query,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "launch_app",
+                launch_target_for_family("calendar"),
+                value=launch_target_for_family("calendar"),
+            ),
+            UiAction(
+                "set_text",
+                "calendar-event-editor",
+                query,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected=(
+                            "The calendar event editor contains the invite title."
+                        ),
+                        target="calendar-event-editor",
+                        value=query,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "click",
+                "calendar-invite-button",
+                f"Create invite for {query}",
+                metadata={
+                    "event_title": query,
+                    "verification_contract": VerificationContract(
+                        kind="invite_outcome",
+                        expected=(
+                            "The final calendar state proves the invite was "
+                            "created for the requested event."
+                        ),
+                        target="calendar-details",
+                        value=f"Invite created for {query}",
+                        metadata={
+                            "event_title": query,
+                            "expected_state": "invited",
+                        },
+                    ).asdict(),
+                },
+            ),
+        ]
+    if task.intent == "settings_toggle_night_light":
+        setting_name = "Night Light"
+        return [
+            UiAction(
+                "launch_app",
+                launch_target_for_family("settings"),
+                value=launch_target_for_family("settings"),
+            ),
+            UiAction(
+                "set_text",
+                "settings-search-box",
+                setting_name,
+                metadata={
+                    "verification_contract": VerificationContract(
+                        kind="field_contains",
+                        expected=(
+                            "The Settings search box contains the requested "
+                            "setting name."
+                        ),
+                        target="settings-search-box",
+                        value=setting_name,
+                    ).asdict()
+                },
+            ),
+            UiAction(
+                "click",
+                "settings-toggle",
+                f"{setting_name}:on",
+                metadata={
+                    "setting_name": setting_name,
+                    "setting_state": "on",
+                    "verification_contract": VerificationContract(
+                        kind="toggle_state",
+                        expected=(
+                            "The final Settings state proves the requested toggle "
+                            "is on."
+                        ),
+                        target="settings-status-text",
+                        value=f"{setting_name} is on",
+                        metadata={
+                            "setting_name": setting_name,
+                            "expected_state": "on",
+                        },
+                    ).asdict(),
+                },
+            ),
+        ]
+    return None
 
 
 def _tool_action(task: EvalTask) -> UiAction:
@@ -311,4 +668,6 @@ def _semantic_label(node: UiNode) -> str:
     metadata = node.metadata or {}
     chunks = [node.name, str(metadata.get("text") or "")]
     chunks.append(str(metadata.get("value") or ""))
+    chunks.append(str(metadata.get("semantic_name") or ""))
+    chunks.extend(str(item) for item in list(metadata.get("selector_aliases") or []))
     return " ".join(chunk for chunk in chunks if chunk)

@@ -136,6 +136,53 @@ class FillFormRegroundingBackend:
 
 
 class LiveFireEvalTests(unittest.TestCase):
+    def test_runner_executes_real_user_handoff_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backend = VirtualDesktopSandboxBackend(root / ".agentos" / "sandbox.json")
+            result = LiveFireEvalRunner(backend, root).run(
+                LiveFireEvalConfig(
+                    run_id="live_fire_handoff_test",
+                    pack="handoff",
+                    promote_failures=False,
+                )
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.task_count, 4)
+            self.assertEqual(
+                {task.surface for task in result.task_results},
+                {"browser", "file_explorer", "chat_app", "pdf_viewer"},
+            )
+            self.assertTrue(any(item.intent == "browser_editor_handoff" for item in result.task_results))
+
+    def test_runner_executes_everyday_family_pack_with_task_specific_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backend = VirtualDesktopSandboxBackend(root / ".agentos" / "sandbox.json")
+            result = LiveFireEvalRunner(backend, root).run(
+                LiveFireEvalConfig(
+                    run_id="live_fire_everyday_test",
+                    pack="everyday",
+                    promote_failures=False,
+                )
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.task_count, 3)
+            self.assertEqual(
+                {task.surface for task in result.task_results},
+                {"email", "calendar", "settings"},
+            )
+            verification_kinds = {
+                verification["kind"]
+                for task in result.task_results
+                for verification in task.verifications
+            }
+            self.assertIn("send_outcome", verification_kinds)
+            self.assertIn("invite_outcome", verification_kinds)
+            self.assertIn("toggle_state", verification_kinds)
+
     def test_runner_emits_replay_and_training_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agentos_orchestrator.os_control.base import UiAction
+from agentos_orchestrator.os_control.workflow.intent_parser import parse_structured_intent
 
 from .control_substrate import ActionProposal, GoalLock
 
@@ -222,13 +223,37 @@ class IntentConstraintCompiler:
     def compile(self, objective: str) -> list[IntentConstraint]:
         """Compile the objective into constraints."""
         lower = objective.lower()
+        parsed_intent = parse_structured_intent(objective)
         constraints: list[IntentConstraint] = []
 
         # Always active: visual prompt injection guard
         constraints.append(_VisualPromptInjectionGuard())
 
         # Category-specific constraints activated by objective keywords
-        if not _PAYMENT_RE.search(lower):
+        invoice_only_file_task = (
+            parsed_intent.is_file_workflow()
+            and "invoice" in lower
+            and not any(
+                token in lower
+                for token in (
+                    "pay",
+                    "payment",
+                    "checkout",
+                    "purchase",
+                    "billing",
+                    "charge",
+                    "stripe",
+                    "paypal",
+                    "venmo",
+                    "zelle",
+                    "wire",
+                )
+            )
+        )
+        payment_in_scope = bool(_PAYMENT_RE.search(lower)) and not invoice_only_file_task
+        if invoice_only_file_task:
+            pass
+        elif not payment_in_scope:
             # Payment actions are only allowed if the objective explicitly
             # mentions payment. Otherwise block any payment-like actions.
             constraints.append(

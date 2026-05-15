@@ -18,7 +18,7 @@ if (-not (Test-Path $Python)) {
 
 Push-Location $Root
 & $Python -m pip install --upgrade pip
-& $Python -m pip install -e ".[dashboard]"
+& $Python -m pip install -e ".[dashboard,os-control]"
 Pop-Location
 
 Push-Location $Dashboard

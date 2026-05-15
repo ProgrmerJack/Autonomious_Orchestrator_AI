@@ -608,14 +608,20 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(
             client.live_fire_eval(
                 max_tasks=1,
+                pack="everyday",
                 windows_safe_pack=True,
                 repeat=2,
             )["path"],
             "/benchmarks/live-fire-eval",
         )
         payload = cast(dict[str, Any], client.calls[-1][2])
+        self.assertEqual(payload["pack"], "everyday")
         self.assertTrue(payload["windows_safe_pack"])
         self.assertEqual(payload["repeat"], 2)
+        self.assertEqual(
+            client.eval_pack(pack="everyday", max_tasks=3)["path"],
+            "/benchmarks/eval-pack?pack=everyday&max_tasks=3",
+        )
         self.assertEqual(
             client.live_fire_review()["path"],
             "/benchmarks/live-fire-review?limit=10",

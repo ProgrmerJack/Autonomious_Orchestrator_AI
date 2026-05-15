@@ -274,6 +274,7 @@ class VirtualDesktopSandboxBackend:
         self._apply_draw_action(nodes, action, selected_index)
         self._apply_cell_edit_action(nodes, action, selected_index, receipt)
         self._apply_form_action(nodes, action, selected_index, receipt)
+        self._apply_family_outcome_action(nodes, action, selected_index, receipt)
         self._apply_file_operation_action(
             state,
             action,
@@ -604,6 +605,138 @@ class VirtualDesktopSandboxBackend:
             "field_count": len(form_fields),
         }
         receipt["status"] = "form-submitted"
+
+    @staticmethod
+    def _apply_family_outcome_action(
+        nodes: list[dict],
+        action: UiAction,
+        selected_index: int | None,
+        receipt: dict,
+    ) -> None:
+        if selected_index is None:
+            return
+        if action.action_type not in {"click", "invoke"}:
+            return
+        node_id = str(nodes[selected_index].get("node_id") or "")
+        metadata = dict(action.metadata or {})
+        if node_id == "email-send-button":
+            recipient = str(
+                metadata.get("recipient")
+                or VirtualDesktopSandboxBackend._node_value(nodes, "email-to-field")
+                or "recipient"
+            )
+            attachment = str(
+                metadata.get("attachment")
+                or Path(
+                    VirtualDesktopSandboxBackend._node_value(
+                        nodes,
+                        "email-attachment-field",
+                    )
+                    or "attachment.txt"
+                ).name
+            )
+            VirtualDesktopSandboxBackend._update_node_metadata(
+                nodes,
+                "email-status-text",
+                {
+                    "text": f"Sent email to {recipient} with attachment {attachment}",
+                    "status": "sent",
+                    "recipient": recipient,
+                    "attachment": attachment,
+                },
+            )
+            receipt["email"] = {
+                "status": "sent",
+                "recipient": recipient,
+                "attachment": attachment,
+            }
+            receipt["status"] = "email-sent"
+            return
+        if node_id == "calendar-invite-button":
+            event_title = str(
+                metadata.get("event_title")
+                or VirtualDesktopSandboxBackend._node_value(
+                    nodes,
+                    "calendar-event-editor",
+                )
+                or "event"
+            )
+            VirtualDesktopSandboxBackend._update_node_metadata(
+                nodes,
+                "calendar-details",
+                {
+                    "text": f"Invite created for {event_title}",
+                    "status": "invited",
+                    "event_title": event_title,
+                },
+            )
+            receipt["calendar"] = {
+                "status": "invited",
+                "event_title": event_title,
+            }
+            receipt["status"] = "invite-created"
+            return
+        if node_id == "settings-toggle":
+            setting_name, setting_state = (
+                VirtualDesktopSandboxBackend._parse_setting_toggle(
+                    str(action.value or "")
+                )
+            )
+            if not setting_name:
+                setting_name = str(metadata.get("setting_name") or "setting")
+            if not setting_state:
+                setting_state = str(metadata.get("setting_state") or "on")
+            VirtualDesktopSandboxBackend._update_node_metadata(
+                nodes,
+                "settings-toggle",
+                {
+                    "text": f"{setting_name} toggle {setting_state}",
+                    "state": setting_state,
+                    "setting_name": setting_name,
+                },
+            )
+            VirtualDesktopSandboxBackend._update_node_metadata(
+                nodes,
+                "settings-status-text",
+                {
+                    "text": f"{setting_name} is {setting_state}",
+                    "state": setting_state,
+                    "setting_name": setting_name,
+                },
+            )
+            receipt["setting"] = {
+                "name": setting_name,
+                "state": setting_state,
+            }
+            receipt["status"] = "toggle-updated"
+
+    @staticmethod
+    def _node_value(nodes: list[dict], node_id: str) -> str:
+        for node in nodes:
+            if str(node.get("node_id") or "") != node_id:
+                continue
+            metadata = dict(node.get("metadata") or {})
+            return str(metadata.get("value") or metadata.get("text") or "")
+        return ""
+
+    @staticmethod
+    def _update_node_metadata(
+        nodes: list[dict],
+        node_id: str,
+        updates: dict[str, str],
+    ) -> None:
+        for node in nodes:
+            if str(node.get("node_id") or "") != node_id:
+                continue
+            metadata = dict(node.get("metadata") or {})
+            metadata.update(updates)
+            node["metadata"] = metadata
+            return
+
+    @staticmethod
+    def _parse_setting_toggle(value: str) -> tuple[str, str]:
+        left, _, right = str(value or "").partition(":")
+        return left.strip(), right.strip().lower()
 
     @staticmethod
     def _apply_window_switch_action(
@@ -1385,6 +1518,124 @@ class VirtualDesktopSandboxBackend:
                     "primary",
                 ),
             ],
+            "email": [
+                (
+                    "email-search-box",
+                    "Edit",
+                    "Email Search Box",
+                    [500, 130, 420, 38],
+                    "search",
+                ),
+                (
+                    "email-inbox-list",
+                    "List",
+                    "Inbox Message List",
+                    [180, 160, 300, 620],
+                    "navigation",
+                ),
+                (
+                    "email-to-field",
+                    "Edit",
+                    "To",
+                    [500, 180, 520, 40],
+                    "recipient",
+                ),
+                (
+                    "email-compose-body",
+                    "Document",
+                    "Email Composer",
+                    [500, 240, 720, 420],
+                    "primary",
+                ),
+                (
+                    "email-send-button",
+                    "Button",
+                    "Send Email",
+                    [1040, 680, 120, 40],
+                    "send",
+                ),
+                (
+                    "email-attachment-field",
+                    "Edit",
+                    "Attachment Field",
+                    [500, 680, 520, 40],
+                    "attachment",
+                ),
+                (
+                    "email-status-text",
+                    "Text",
+                    "Email Status",
+                    [500, 730, 520, 32],
+                    "status",
+                ),
+            ],
+            "calendar": [
+                (
+                    "calendar-grid",
+                    "Table",
+                    "Calendar Grid",
+                    [460, 160, 620, 220],
+                    "primary",
+                ),
+                (
+                    "calendar-side-panel",
+                    "List",
+                    "Calendar List",
+                    [180, 160, 260, 620],
+                    "navigation",
+                ),
+                (
+                    "calendar-event-editor",
+                    "Document",
+                    "Calendar Event Editor",
+                    [460, 180, 620, 220],
+                    "editor",
+                ),
+                (
+                    "calendar-invite-button",
+                    "Button",
+                    "Create Invite",
+                    [1090, 180, 150, 40],
+                    "invite",
+                ),
+                (
+                    "calendar-details",
+                    "Pane",
+                    "Event Details",
+                    [460, 430, 620, 350],
+                    "details",
+                ),
+            ],
+            "settings": [
+                (
+                    "settings-search-box",
+                    "Edit",
+                    "Settings Search Box",
+                    [520, 180, 360, 38],
+                    "search",
+                ),
+                (
+                    "settings-category-list",
+                    "List",
+                    "Settings Categories",
+                    [180, 160, 260, 620],
+                    "navigation",
+                ),
+                (
+                    "settings-toggle",
+                    "Button",
+                    "Settings Toggle",
+                    [520, 260, 220, 48],
+                    "toggle",
+                ),
+                (
+                    "settings-status-text",
+                    "Text",
+                    "Settings Status",
+                    [520, 330, 320, 32],
+                    "status",
+                ),
+            ],
             "design_canvas": [
                 (
                     "design-toolbox",
@@ -1468,6 +1719,18 @@ class VirtualDesktopSandboxBackend:
             return "office_form"
         if any(token in lower for token in ("acrobat", "pdf")):
             return "pdf_viewer"
+        if any(
+            token in lower
+            for token in ("outlook:calendar", "calendar", "meeting", "appointment")
+        ):
+            return "calendar"
+        if any(token in lower for token in ("outlook", "mail", "inbox", "email")):
+            return "email"
+        if any(
+            token in lower
+            for token in ("settings", "night light", "bluetooth", "wi-fi", "wifi")
+        ):
+            return "settings"
         if any(token in lower for token in ("teams", "chat")):
             return "chat_app"
         if any(

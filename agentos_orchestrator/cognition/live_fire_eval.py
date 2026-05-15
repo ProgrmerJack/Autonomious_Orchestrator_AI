@@ -12,6 +12,9 @@ from typing import Any
 
 from agentos_orchestrator.app_family_registry import safe_windows_families
 from agentos_orchestrator.os_control.base import UiAction
+from agentos_orchestrator.os_control.windows_family_adapter import (
+    selector_matches_node,
+)
 
 from .active_inference import ActiveInferenceExplorer
 from .app_adapters import AdapterRegistry
@@ -25,7 +28,14 @@ from .live_fire_eval_recipes import (
     snapshot_nodes,
 )
 from .mode_arbitration import ModeArbiter, ModeContext
-from .os_eval_packs import EvalTask, build_universal_app_eval_pack
+from .os_eval_packs import (
+    EvalTask,
+    build_combined_live_fire_eval_pack,
+    build_everyday_family_eval_pack,
+    build_real_user_handoff_eval_pack,
+    build_universal_app_eval_pack,
+    normalize_eval_pack_name,
+)
 from .replay_debug import load_replay_debug
 from .runtime_state import AgentRuntimeState, OutcomeEvaluation
 from .safety_gates import FormalSafetyVerifier, SafetyPolicy
@@ -57,6 +67,7 @@ class LiveFireEvalConfig:
     max_tasks: int | None = None
     surfaces: tuple[str, ...] = ()
     intents: tuple[str, ...] = ()
+    pack: str = "universal"
     windows_safe_pack: bool = False
     repeat: int = 1
     promote_failures: bool = True
@@ -257,7 +268,7 @@ class LiveFireEvalRunner:
                     context.action,
                     task.objective,
                 )
-        self._materialize_artifact(context.action)
+        self._materialize_artifact(context.action, blocked=blocked)
         after_nodes = context.before_nodes if blocked else snapshot_nodes(self.backend)
         after = abstract_state(task.surface, after_nodes)
         verification = verify_action_contract(
@@ -394,7 +405,9 @@ class LiveFireEvalRunner:
             }
         )
 
-    def _materialize_artifact(self, action: UiAction) -> None:
+    def _materialize_artifact(self, action: UiAction, blocked: bool = False) -> None:
+        if blocked:
+            return
         target = action.metadata.get("create_artifact_path")
         if not target:
             return
@@ -548,13 +561,8 @@ class LiveFireEvalRunner:
 
     @staticmethod
     def _selector_matches_nodes(selector: str, nodes: list[Any]) -> bool:
-        selector_lower = selector.lower()
         for node in nodes:
-            node_id = str(getattr(node, "node_id", "") or "").lower()
-            name = str(getattr(node, "name", "") or "")
-            if node_id and node_id == selector_lower:
-                return True
-            if name and f"name={name}".lower() == selector_lower:
+            if selector_matches_node(selector, node):
                 return True
         return False
 
@@ -653,7 +661,15 @@ class _Option:
 
 
 def _select_tasks(config: LiveFireEvalConfig) -> list[EvalTask]:
-    tasks = build_universal_app_eval_pack().tasks
+    pack = normalize_eval_pack_name(config.pack)
+    if pack == "handoff":
+        tasks = build_real_user_handoff_eval_pack().tasks
+    elif pack == "everyday":
+        tasks = build_everyday_family_eval_pack().tasks
+    elif pack == "combined":
+        tasks = build_combined_live_fire_eval_pack().tasks
+    else:
+        tasks = build_universal_app_eval_pack().tasks
     surfaces = config.surfaces
     intents = config.intents
     if config.windows_safe_pack:
@@ -693,6 +709,7 @@ def _repeat_task(task: EvalTask, round_index: int) -> EvalTask:
         failure_modes=list(task.failure_modes),
         metrics=list(task.metrics),
         live_fire=task.live_fire,
+        workflow_surfaces=list(task.workflow_surfaces),
     )
 
 

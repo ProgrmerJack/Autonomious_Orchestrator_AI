@@ -24,6 +24,9 @@ CONTRACT_KINDS = {
     "tab_focused",
     "process_launched",
     "state_changed",
+    "send_outcome",
+    "invite_outcome",
+    "toggle_state",
 }
 
 
@@ -166,6 +169,9 @@ def verify_action_contract(
         "tab_focused": _verify_tab_focused,
         "process_launched": _verify_process_launched,
         "state_changed": _verify_state_changed,
+        "send_outcome": _verify_send_outcome,
+        "invite_outcome": _verify_invite_outcome,
+        "toggle_state": _verify_toggle_state,
     }
     handler = handlers.get(contract.kind, _verify_state_changed)
     return handler(contract, before, after, receipt, receipt_info)
@@ -362,12 +368,150 @@ def _verify_state_changed(
     receipt: str,
     receipt_info: dict[str, Any],
 ) -> VerificationResult:
+    if _receipt_explicit_failure(receipt, receipt_info):
+        observed = json.dumps(receipt_info, sort_keys=True) if receipt_info else receipt[:500]
+        return _result(
+            contract,
+            False,
+            observed,
+            "the backend receipt reported an explicit action failure",
+        )
     diff = diff_ui_states(before, after)
     matched = bool(diff) or _receipt_success(receipt, receipt_info)
     if not matched and _focus_receipt_found_target(contract, receipt_info):
         matched = True
     observed = json.dumps(diff, sort_keys=True) if diff else receipt[:500]
     return _result(contract, matched, observed, "no state change was detected")
+
+
+def _verify_send_outcome(
+    contract: VerificationContract,
+    before: AbstractUIState,
+    after: AbstractUIState,
+    receipt: str,
+    receipt_info: dict[str, Any],
+) -> VerificationResult:
+    del before, receipt
+    labels = _after_labels(after)
+    email_info = dict(receipt_info.get("email") or {})
+    recipient = str(contract.metadata.get("recipient") or "").strip().lower()
+    attachment = str(contract.metadata.get("attachment") or "").strip().lower()
+    state = (
+        str(contract.metadata.get("expected_state") or "sent")
+        .strip()
+        .lower()
+    )
+    marker = str(contract.value or "").strip().lower()
+    matched_after = bool(marker) and marker in labels
+    if matched_after and attachment:
+        matched_after = attachment in labels
+    matched_receipt = (
+        str(email_info.get("status") or "").strip().lower() == state
+        and (
+            not recipient
+            or recipient in str(email_info.get("recipient") or "").lower()
+        )
+        and (
+            not attachment
+            or attachment in str(email_info.get("attachment") or "").lower()
+        )
+    )
+    observed = (
+        labels[:500]
+        if labels
+        else json.dumps(email_info, sort_keys=True)[:500]
+    )
+    return _result(
+        contract,
+        matched_after or matched_receipt,
+        observed,
+        "task-specific email send proof was not observed",
+    )
+
+
+def _verify_invite_outcome(
+    contract: VerificationContract,
+    before: AbstractUIState,
+    after: AbstractUIState,
+    receipt: str,
+    receipt_info: dict[str, Any],
+) -> VerificationResult:
+    del before, receipt
+    labels = _after_labels(after)
+    calendar_info = dict(receipt_info.get("calendar") or {})
+    event_title = (
+        str(contract.metadata.get("event_title") or "").strip().lower()
+    )
+    state = (
+        str(contract.metadata.get("expected_state") or "invited")
+        .strip()
+        .lower()
+    )
+    marker = str(contract.value or "").strip().lower()
+    matched_after = bool(marker) and marker in labels
+    if matched_after and event_title:
+        matched_after = event_title in labels
+    matched_receipt = (
+        str(calendar_info.get("status") or "").strip().lower() == state
+        and (
+            not event_title
+            or event_title
+            in str(calendar_info.get("event_title") or "").lower()
+        )
+    )
+    observed = (
+        labels[:500]
+        if labels
+        else json.dumps(calendar_info, sort_keys=True)[:500]
+    )
+    return _result(
+        contract,
+        matched_after or matched_receipt,
+        observed,
+        "task-specific calendar invite proof was not observed",
+    )
+
+
+def _verify_toggle_state(
+    contract: VerificationContract,
+    before: AbstractUIState,
+    after: AbstractUIState,
+    receipt: str,
+    receipt_info: dict[str, Any],
+) -> VerificationResult:
+    del before, receipt
+    labels = _after_labels(after)
+    setting_info = dict(receipt_info.get("setting") or {})
+    setting_name = (
+        str(contract.metadata.get("setting_name") or "").strip().lower()
+    )
+    state = (
+        str(contract.metadata.get("expected_state") or "on")
+        .strip()
+        .lower()
+    )
+    marker = str(contract.value or "").strip().lower()
+    matched_after = bool(marker) and marker in labels
+    if matched_after and setting_name:
+        matched_after = setting_name in labels
+    matched_receipt = (
+        str(setting_info.get("state") or "").strip().lower() == state
+        and (
+            not setting_name
+            or setting_name in str(setting_info.get("name") or "").lower()
+        )
+    )
+    observed = (
+        labels[:500]
+        if labels
+        else json.dumps(setting_info, sort_keys=True)[:500]
+    )
+    return _result(
+        contract,
+        matched_after or matched_receipt,
+        observed,
+        "task-specific toggle proof was not observed",
+    )
 
 
 def _focus_receipt_found_target(
@@ -431,6 +575,10 @@ def _parse_receipt(receipt: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _after_labels(after: AbstractUIState) -> str:
+    return " ".join(item.semantic_label for item in after.elements).lower()
+
+
 def _receipt_success(receipt: str, receipt_info: dict[str, Any]) -> bool:
     if receipt_info.get("success") is True:
         return True
@@ -440,6 +588,7 @@ def _receipt_success(receipt: str, receipt_info: dict[str, Any]) -> bool:
         "success",
         "executed",
         "launched",
+        "navigated",
         "typed",
         "invoked",
         "hotkey-sent",
@@ -462,6 +611,36 @@ def _receipt_success(receipt: str, receipt_info: dict[str, Any]) -> bool:
     }:
         return True
     return any(token in str(receipt).lower() for token in ("ok", "success", "executed"))
+
+
+def _receipt_explicit_failure(receipt: str, receipt_info: dict[str, Any]) -> bool:
+    if receipt_info.get("success") is False:
+        return True
+    status = str(receipt_info.get("status") or "").strip().lower()
+    if status in {
+        "blocked",
+        "denied",
+        "error",
+        "failed",
+        "selector-not-found",
+        "unsupported-action",
+        "unsupported",
+        "unavailable",
+        "timeout",
+        "invalid",
+        "not-found",
+    }:
+        return True
+    failure_markers = (
+        "no ui element matched selector",
+        "unsupported action",
+        "unsupported-action",
+        "selector-not-found",
+        "is not supported",
+        "destructive_during_exploration",
+    )
+    receipt_lower = str(receipt or "").lower()
+    return any(marker in receipt_lower for marker in failure_markers)
 
 
 def known_contract_kinds() -> set[str]:

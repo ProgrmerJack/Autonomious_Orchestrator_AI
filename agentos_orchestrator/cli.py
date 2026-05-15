@@ -5,6 +5,7 @@ import asyncio
 import importlib
 import json
 import os
+import platform
 import secrets
 import shutil
 import subprocess
@@ -581,6 +582,11 @@ def build_parser() -> argparse.ArgumentParser:
     eval_live_fire_parser.add_argument("--max-tasks", type=int)
     eval_live_fire_parser.add_argument("--surface", action="append")
     eval_live_fire_parser.add_argument("--intent", action="append")
+    eval_live_fire_parser.add_argument(
+        "--pack",
+        choices=("universal", "handoff", "everyday", "combined"),
+        default="combined",
+    )
     eval_live_fire_parser.add_argument("--run-id", default="")
     eval_live_fire_parser.add_argument(
         "--safe-windows-pack",
@@ -893,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
             target=f"{args.backend}://live-fire/eval-pack",
             payload={
                 "trial": "universal-eval-pack",
+                "pack": args.pack,
                 "max_tasks": args.max_tasks,
                 "surfaces": args.surface or [],
                 "intents": args.intent or [],
@@ -911,6 +918,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tasks=args.max_tasks,
             surfaces=tuple(args.surface or ()),
             intents=tuple(args.intent or ()),
+            pack=args.pack,
             windows_safe_pack=args.safe_windows_pack,
             repeat=args.repeat,
             promote_failures=not args.no_promote_failures,
@@ -1011,19 +1019,42 @@ def main(argv: list[str] | None = None) -> int:
 
 def _pc_backend(name: str, state_path: str | Path):
     if name == "windows-uia":
-        return WindowsUiaBackend()
-    if name == "rust-native-windows":
-        return RustNativeWindowsBackend(
+        backend = WindowsUiaBackend()
+    elif name == "rust-native-windows":
+        backend = RustNativeWindowsBackend(
             Path(state_path).with_name("rust_native_body.json")
         )
-    if name == "virtual-desktop-sandbox":
-        return VirtualDesktopSandboxBackend(
+    elif name == "virtual-desktop-sandbox":
+        backend = VirtualDesktopSandboxBackend(
             Path(state_path).with_name("virtual_desktop_sandbox.json")
         )
-    raise ValueError(
-        f"Unknown PC backend: {name}. Expected 'windows-uia', "
-        "'rust-native-windows', or 'virtual-desktop-sandbox'."
-    )
+    else:
+        raise ValueError(
+            f"Unknown PC backend: {name}. Expected 'windows-uia', "
+            "'rust-native-windows', or 'virtual-desktop-sandbox'."
+        )
+    if hasattr(backend, "available") and not backend.available():
+        raise RuntimeError(_pc_backend_unavailable_message(name))
+    return backend
+
+
+def _pc_backend_unavailable_message(name: str) -> str:
+    system = platform.system()
+    if name == "windows-uia":
+        if system != "Windows":
+            return "The windows-uia backend only runs on Windows."
+        return (
+            "The windows-uia backend is unavailable. Install AgentOS with "
+            "the 'os-control' extra or run `pip install uiautomation`, then retry."
+        )
+    if name == "rust-native-windows":
+        if system != "Windows":
+            return "The rust-native-windows backend only runs on Windows."
+        return (
+            "The rust-native-windows backend is unavailable. Verify the Rust "
+            "agent_body build succeeds with the 'uia-windows' feature and retry."
+        )
+    return f"The {name} backend is unavailable in this environment."
 
 
 def _launch_dashboard(args: argparse.Namespace) -> int:
