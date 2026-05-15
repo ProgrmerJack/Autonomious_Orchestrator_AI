@@ -486,19 +486,23 @@ def classify_target(action: UiAction) -> tuple[str, str]:
     file_like_action = action.action_type.lower().endswith("_file") or any(
         key in metadata for key in ("source", "destination", "new_name", "path")
     )
-    if file_like_action and "invoice" in combined and not any(
-        token in combined
-        for token in (
-            "pay",
-            "payment",
-            "checkout",
-            "purchase",
-            "billing",
-            "charge",
-            "stripe",
-            "paypal",
-            "venmo",
-            "wire",
+    if (
+        file_like_action
+        and "invoice" in combined
+        and not any(
+            token in combined
+            for token in (
+                "pay",
+                "payment",
+                "checkout",
+                "purchase",
+                "billing",
+                "charge",
+                "stripe",
+                "paypal",
+                "venmo",
+                "wire",
+            )
         )
     ):
         if action.action_type.lower() in {"delete_file", "remove_file"}:

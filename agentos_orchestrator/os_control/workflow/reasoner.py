@@ -610,7 +610,9 @@ class DesktopWorkflowReasoner:
         if plan.mode in {"presentation", "drawing", "report", "script", "spreadsheet"}:
             return True
         intent = StructuredIntent.from_dict(getattr(plan, "intent", {}) or {})
-        return intent.destination_surface == "editor" or intent.source_surface == "editor"
+        return (
+            intent.destination_surface == "editor" or intent.source_surface == "editor"
+        )
 
     @classmethod
     def _browser_navigation_complete(
@@ -746,7 +748,9 @@ class DesktopWorkflowReasoner:
         names: tuple[str, ...],
         roles: set[str],
     ) -> UiNode | None:
-        ranked = sorted(nodes, key=lambda item: (item.focused, item.enabled), reverse=True)
+        ranked = sorted(
+            nodes, key=lambda item: (item.focused, item.enabled), reverse=True
+        )
         for node in ranked:
             if roles and node.role not in roles:
                 continue

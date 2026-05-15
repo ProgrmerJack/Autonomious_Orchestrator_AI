@@ -66,9 +66,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(nodes[0].bounds, (0, 0, 1920, 1080))
 
         receipt = json.loads(
-            backend.perform(
-                UiAction("click", "10,20", metadata={"x": 10, "y": 20})
-            )
+            backend.perform(UiAction("click", "10,20", metadata={"x": 10, "y": 20}))
         )
         self.assertEqual(receipt["status"], "clicked")
         self.assertEqual(receipt["backend"], "rust-native-windows")
@@ -136,9 +134,7 @@ class AdapterTests(unittest.TestCase):
             agent_body_client=cast(AgentBodyClient, FakeAgentBody())
         )
 
-        receipt = json.loads(
-            backend.perform(UiAction("launch_app", "browser"))
-        )
+        receipt = json.loads(backend.perform(UiAction("launch_app", "browser")))
 
         self.assertTrue(receipt["launch_surface_detected"])
         self.assertIn("Browser", receipt["launch_surface_names"])
@@ -244,9 +240,7 @@ class AdapterTests(unittest.TestCase):
             native_fallback=cast(RustNativeWindowsBackend, FakeNativeBackend())
         )
         receipt = json.loads(
-            backend.perform(
-                UiAction("click", "10,20", metadata={"x": 10, "y": 20})
-            )
+            backend.perform(UiAction("click", "10,20", metadata={"x": 10, "y": 20}))
         )
 
         self.assertEqual(receipt["status"], "clicked")
@@ -430,9 +424,7 @@ class AdapterTests(unittest.TestCase):
                         "agent_body_manifest": str(
                             root / "crates" / "agent_body" / "Cargo.toml"
                         ),
-                        "state_path": str(
-                            Path(temp_dir) / "agent_body_state.json"
-                        ),
+                        "state_path": str(Path(temp_dir) / "agent_body_state.json"),
                         "control_request": {
                             "kind": "act",
                             "action_type": "launch_app",

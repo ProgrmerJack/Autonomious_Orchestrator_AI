@@ -79,7 +79,9 @@ class StructuredIntent:
             file_pattern=str(payload.get("file_pattern") or ""),
             app_target=_optional_text(payload.get("app_target")),
             source_app_target=_optional_text(payload.get("source_app_target")),
-            destination_app_target=_optional_text(payload.get("destination_app_target")),
+            destination_app_target=_optional_text(
+                payload.get("destination_app_target")
+            ),
             app_mentions=[str(item) for item in payload.get("app_mentions") or []],
             operations=[str(item) for item in payload.get("operations") or []],
             irreversible_verbs=[
@@ -164,7 +166,9 @@ def parse_structured_intent(objective: str) -> StructuredIntent:
         source_surface=source_surface,
     )
     irreversible_verbs = [
-        verb for verb in _IRREVERSIBLE_VERBS if re.search(rf"\b{re.escape(verb)}\b", lower)
+        verb
+        for verb in _IRREVERSIBLE_VERBS
+        if re.search(rf"\b{re.escape(verb)}\b", lower)
     ]
     safety_predicates = _safety_predicates(
         search_scope=search_scope,
@@ -202,17 +206,37 @@ def parse_structured_intent(objective: str) -> StructuredIntent:
         entities=entities,
         path_hints=path_hints,
         safety_predicates=safety_predicates,
-        cross_app=bool(source_surface and destination_surface and source_surface != destination_surface),
+        cross_app=bool(
+            source_surface
+            and destination_surface
+            and source_surface != destination_surface
+        ),
     )
 
 
 def _mentioned_surfaces(lower: str) -> list[str]:
     mentions: list[str] = []
-    if any(token in lower for token in ("chrome", "edge", "browser", "website", "url", "web ")):
+    if any(
+        token in lower
+        for token in ("chrome", "edge", "browser", "website", "url", "web ")
+    ):
         mentions.append("browser")
-    if any(token in lower for token in ("file explorer", "explorer", "downloads", "desktop", "documents", "folder")):
+    if any(
+        token in lower
+        for token in (
+            "file explorer",
+            "explorer",
+            "downloads",
+            "desktop",
+            "documents",
+            "folder",
+        )
+    ):
         mentions.append("file_explorer")
-    if any(token in lower for token in ("notepad", "editor", "document canvas", "text editor")):
+    if any(
+        token in lower
+        for token in ("notepad", "editor", "document canvas", "text editor")
+    ):
         mentions.append("editor")
     if any(
         token in lower
@@ -240,7 +264,10 @@ def _mentioned_surfaces(lower: str) -> list[str]:
         )
     ):
         mentions.append("calendar")
-    if any(token in lower for token in ("slack", "teams", "chat", "conversation", "messages")):
+    if any(
+        token in lower
+        for token in ("slack", "teams", "chat", "conversation", "messages")
+    ):
         mentions.append("chat_app")
     if any(token in lower for token in ("pdf", "acrobat")):
         mentions.append("pdf_viewer")
@@ -272,14 +299,46 @@ def _search_scope(
     file_pattern: str,
     file_operation: str,
 ) -> str:
-    if any(token in lower for token in ("messages about", "search for messages", "search messages")):
+    if any(
+        token in lower
+        for token in ("messages about", "search for messages", "search messages")
+    ):
         return "app_messages"
     if any(token in lower for token in ("search", "find", "locate", "latest")):
-        if file_operation or file_pattern or path_hints or " pdf" in lower or "downloads" in lower:
+        if (
+            file_operation
+            or file_pattern
+            or path_hints
+            or " pdf" in lower
+            or "downloads" in lower
+        ):
             return "local_files"
-        if any(token in lower for token in ("chrome", "edge", "browser", "website", "nearest", "address", "store", "url", "web ")):
+        if any(
+            token in lower
+            for token in (
+                "chrome",
+                "edge",
+                "browser",
+                "website",
+                "nearest",
+                "address",
+                "store",
+                "url",
+                "web ",
+            )
+        ):
             return "web"
-    if any(token in lower for token in ("research", "look up", "compare", "investigate", "analy", "analyse")):
+    if any(
+        token in lower
+        for token in (
+            "research",
+            "look up",
+            "compare",
+            "investigate",
+            "analy",
+            "analyse",
+        )
+    ):
         return "web"
     return "none"
 
@@ -289,7 +348,18 @@ def _copy_semantics(lower: str, file_operation: str, file_pattern: str) -> str:
         return "none"
     if file_operation == "copy":
         return "file"
-    if any(token in lower for token in ("address", "summary", "text", "message", "reply", "note", "paragraph")):
+    if any(
+        token in lower
+        for token in (
+            "address",
+            "summary",
+            "text",
+            "message",
+            "reply",
+            "note",
+            "paragraph",
+        )
+    ):
         return "text"
     if any(token in lower for token in ("link", "url")):
         return "link"
@@ -348,7 +418,15 @@ def _source_and_destination_surfaces(
         )
     ):
         source_surface = "settings"
-    if any(token in lower for token in ("into notepad", "into the editor", "in notepad", "paste into notepad")):
+    if any(
+        token in lower
+        for token in (
+            "into notepad",
+            "into the editor",
+            "in notepad",
+            "paste into notepad",
+        )
+    ):
         destination_surface = "editor"
     elif any(
         token in lower
@@ -379,11 +457,19 @@ def _source_and_destination_surfaces(
         destination_surface = "chat_app"
     elif any(token in lower for token in ("into word", "into document")):
         destination_surface = "editor"
-    if destination_surface is None and "email" in mentioned_surfaces and any(
-        token in lower for token in ("attach", "draft", "compose", "send email")
+    if (
+        destination_surface is None
+        and "email" in mentioned_surfaces
+        and any(
+            token in lower for token in ("attach", "draft", "compose", "send email")
+        )
     ):
         destination_surface = "email"
-    if destination_surface is None and copy_semantics in {"text", "link", "clipboard"} and "editor" in mentioned_surfaces:
+    if (
+        destination_surface is None
+        and copy_semantics in {"text", "link", "clipboard"}
+        and "editor" in mentioned_surfaces
+    ):
         destination_surface = "editor"
     return source_surface, destination_surface
 
@@ -418,7 +504,11 @@ def _single_app_target(
     source_app_target: str | None,
     destination_app_target: str | None,
 ) -> str | None:
-    if source_app_target and destination_app_target and source_app_target != destination_app_target:
+    if (
+        source_app_target
+        and destination_app_target
+        and source_app_target != destination_app_target
+    ):
         return None
     return source_app_target or destination_app_target
 
@@ -456,12 +546,15 @@ def _operations(
     if destination_surface == "email" and "attach" in lower:
         ops.append("attach_file")
     if destination_surface == "calendar" and any(
-        token in lower for token in ("calendar", "event", "meeting", "invite", "schedule")
+        token in lower
+        for token in ("calendar", "event", "meeting", "invite", "schedule")
     ):
         ops.append("create_calendar_event")
     if source_surface == "settings":
         ops.append("search_settings")
-        if any(token in lower for token in ("turn on", "turn off", "enable", "disable")):
+        if any(
+            token in lower for token in ("turn on", "turn off", "enable", "disable")
+        ):
             ops.append("toggle_setting")
     if source_surface == "chat_app" and destination_surface == "chat_app":
         ops.append("draft_reply")
@@ -544,7 +637,9 @@ def _entities(
         recipient = _recipient(cleaned, lower)
         if recipient:
             payload["recipient"] = recipient
-        attachment_source = payload.get("file_source") or _attachment_source(cleaned, lower)
+        attachment_source = payload.get("file_source") or _attachment_source(
+            cleaned, lower
+        )
         if attachment_source:
             payload["file_source"] = attachment_source
     if destination_surface == "calendar":

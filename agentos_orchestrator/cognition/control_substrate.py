@@ -747,7 +747,10 @@ def build_goal_lock(
         required_surface = (
             parsed_intent.source_surface or parsed_intent.destination_surface or ""
         )
-    if parsed_intent.primary_domain and parsed_intent.primary_domain not in allowed_domains:
+    if (
+        parsed_intent.primary_domain
+        and parsed_intent.primary_domain not in allowed_domains
+    ):
         allowed_domains.append(parsed_intent.primary_domain)
     for surface in (parsed_intent.source_surface, parsed_intent.destination_surface):
         if surface and surface not in allowed_domains:
@@ -769,7 +772,9 @@ def build_goal_lock(
             )
         ),
         external_navigation_intent=parsed_intent.prefers_web_search(),
-        file_op_intent=bool(parsed_intent.is_file_workflow() or parsed_intent.is_file_copy()),
+        file_op_intent=bool(
+            parsed_intent.is_file_workflow() or parsed_intent.is_file_copy()
+        ),
         required_surface=required_surface,
         intent_profile=parsed_intent.asdict(),
         required_verifications=list(parsed_intent.expected_verification),

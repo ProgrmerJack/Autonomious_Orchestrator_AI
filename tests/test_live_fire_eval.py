@@ -154,9 +154,16 @@ class LiveFireEvalTests(unittest.TestCase):
                 {task.surface for task in result.task_results},
                 {"browser", "file_explorer", "chat_app", "pdf_viewer"},
             )
-            self.assertTrue(any(item.intent == "browser_editor_handoff" for item in result.task_results))
+            self.assertTrue(
+                any(
+                    item.intent == "browser_editor_handoff"
+                    for item in result.task_results
+                )
+            )
 
-    def test_runner_executes_everyday_family_pack_with_task_specific_proof(self) -> None:
+    def test_runner_executes_everyday_family_pack_with_task_specific_proof(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             backend = VirtualDesktopSandboxBackend(root / ".agentos" / "sandbox.json")

@@ -369,7 +369,9 @@ def _verify_state_changed(
     receipt_info: dict[str, Any],
 ) -> VerificationResult:
     if _receipt_explicit_failure(receipt, receipt_info):
-        observed = json.dumps(receipt_info, sort_keys=True) if receipt_info else receipt[:500]
+        observed = (
+            json.dumps(receipt_info, sort_keys=True) if receipt_info else receipt[:500]
+        )
         return _result(
             contract,
             False,
@@ -396,11 +398,7 @@ def _verify_send_outcome(
     email_info = dict(receipt_info.get("email") or {})
     recipient = str(contract.metadata.get("recipient") or "").strip().lower()
     attachment = str(contract.metadata.get("attachment") or "").strip().lower()
-    state = (
-        str(contract.metadata.get("expected_state") or "sent")
-        .strip()
-        .lower()
-    )
+    state = str(contract.metadata.get("expected_state") or "sent").strip().lower()
     marker = str(contract.value or "").strip().lower()
     matched_after = bool(marker) and marker in labels
     if matched_after and attachment:
@@ -408,19 +406,14 @@ def _verify_send_outcome(
     matched_receipt = (
         str(email_info.get("status") or "").strip().lower() == state
         and (
-            not recipient
-            or recipient in str(email_info.get("recipient") or "").lower()
+            not recipient or recipient in str(email_info.get("recipient") or "").lower()
         )
         and (
             not attachment
             or attachment in str(email_info.get("attachment") or "").lower()
         )
     )
-    observed = (
-        labels[:500]
-        if labels
-        else json.dumps(email_info, sort_keys=True)[:500]
-    )
+    observed = labels[:500] if labels else json.dumps(email_info, sort_keys=True)[:500]
     return _result(
         contract,
         matched_after or matched_receipt,
@@ -439,30 +432,20 @@ def _verify_invite_outcome(
     del before, receipt
     labels = _after_labels(after)
     calendar_info = dict(receipt_info.get("calendar") or {})
-    event_title = (
-        str(contract.metadata.get("event_title") or "").strip().lower()
-    )
-    state = (
-        str(contract.metadata.get("expected_state") or "invited")
-        .strip()
-        .lower()
-    )
+    event_title = str(contract.metadata.get("event_title") or "").strip().lower()
+    state = str(contract.metadata.get("expected_state") or "invited").strip().lower()
     marker = str(contract.value or "").strip().lower()
     matched_after = bool(marker) and marker in labels
     if matched_after and event_title:
         matched_after = event_title in labels
-    matched_receipt = (
-        str(calendar_info.get("status") or "").strip().lower() == state
-        and (
-            not event_title
-            or event_title
-            in str(calendar_info.get("event_title") or "").lower()
-        )
+    matched_receipt = str(
+        calendar_info.get("status") or ""
+    ).strip().lower() == state and (
+        not event_title
+        or event_title in str(calendar_info.get("event_title") or "").lower()
     )
     observed = (
-        labels[:500]
-        if labels
-        else json.dumps(calendar_info, sort_keys=True)[:500]
+        labels[:500] if labels else json.dumps(calendar_info, sort_keys=True)[:500]
     )
     return _result(
         contract,
@@ -482,29 +465,19 @@ def _verify_toggle_state(
     del before, receipt
     labels = _after_labels(after)
     setting_info = dict(receipt_info.get("setting") or {})
-    setting_name = (
-        str(contract.metadata.get("setting_name") or "").strip().lower()
-    )
-    state = (
-        str(contract.metadata.get("expected_state") or "on")
-        .strip()
-        .lower()
-    )
+    setting_name = str(contract.metadata.get("setting_name") or "").strip().lower()
+    state = str(contract.metadata.get("expected_state") or "on").strip().lower()
     marker = str(contract.value or "").strip().lower()
     matched_after = bool(marker) and marker in labels
     if matched_after and setting_name:
         matched_after = setting_name in labels
-    matched_receipt = (
-        str(setting_info.get("state") or "").strip().lower() == state
-        and (
-            not setting_name
-            or setting_name in str(setting_info.get("name") or "").lower()
-        )
+    matched_receipt = str(
+        setting_info.get("state") or ""
+    ).strip().lower() == state and (
+        not setting_name or setting_name in str(setting_info.get("name") or "").lower()
     )
     observed = (
-        labels[:500]
-        if labels
-        else json.dumps(setting_info, sort_keys=True)[:500]
+        labels[:500] if labels else json.dumps(setting_info, sort_keys=True)[:500]
     )
     return _result(
         contract,

@@ -441,7 +441,8 @@ class UniversalDesktopAgentV2:
         del backend
         repaired = copy.deepcopy(plan)
         intent = StructuredIntent.from_dict(
-            getattr(repaired, "intent", {}) or parse_structured_intent(objective).asdict()
+            getattr(repaired, "intent", {})
+            or parse_structured_intent(objective).asdict()
         )
         repaired.intent = intent.asdict()
         if intent.prefers_local_file_search():
@@ -609,8 +610,7 @@ class UniversalDesktopAgentV2:
     ) -> None:
         run.avg_latency_ms = sum(latencies) / max(len(latencies), 1)
         run.model_used_ratio = self.world_model._model_used_count / max(
-            self.world_model._model_used_count
-            + self.world_model._fallback_used_count,
+            self.world_model._model_used_count + self.world_model._fallback_used_count,
             1,
         )
         if self.pixel_env:
@@ -751,9 +751,7 @@ class UniversalDesktopAgentV2:
         raw = " ".join(part for part in raw_parts if part).lower()
         raw = raw.replace("/", " ").replace("\\", " ").replace(":", " ")
         tokens = {
-            token.strip("\"'")
-            for token in raw.split()
-            if len(token.strip("\"'")) >= 3
+            token.strip("\"'") for token in raw.split() if len(token.strip("\"'")) >= 3
         }
         aliases = {
             "calc.exe": {"calc", "calculator"},
@@ -1257,9 +1255,12 @@ class UniversalDesktopAgentV2:
             )
             should_record_policy = not self._receipt_is_explicit_failure(receipt)
             if policy_source in {"local_vla", "adaptive_perception"}:
-                should_record_policy = should_record_policy and self._action_is_grounded(
-                    action,
-                    snapshot_nodes,
+                should_record_policy = (
+                    should_record_policy
+                    and self._action_is_grounded(
+                        action,
+                        snapshot_nodes,
+                    )
                 )
             if should_record_policy:
                 self.affordance_policies.record(
@@ -1907,7 +1908,9 @@ class UniversalDesktopAgentV2:
         nodes = self._safe_snapshot_nodes()
         node_elements = self._elements_from_nodes(nodes)
         if nodes:
-            node_state = AbstractUIState.from_perceived_elements(node_elements, "unknown")
+            node_state = AbstractUIState.from_perceived_elements(
+                node_elements, "unknown"
+            )
             profile = self.capability_profiler.profile(
                 node_state,
                 nodes=nodes,
@@ -2110,15 +2113,13 @@ class UniversalDesktopAgentV2:
         elif raw_type in {"text_field", "edit", "document"}:
             action_type = "type" if action.value else "click"
         elif raw_type == "focus" and not self._backend_supports_action("focus"):
-            if (
-                self._action_is_grounded(action, nodes)
-                or (
-                    metadata.get("x") is not None
-                    and metadata.get("y") is not None
-                )
+            if self._action_is_grounded(action, nodes) or (
+                metadata.get("x") is not None and metadata.get("y") is not None
             ):
                 action_type = "click"
-        if action_type == action.action_type and metadata == dict(action.metadata or {}):
+        if action_type == action.action_type and metadata == dict(
+            action.metadata or {}
+        ):
             return action
         return UiAction(
             action_type=action_type,

@@ -221,9 +221,7 @@ class WindowsUiaBackend:
             "draw_path": draw_path,
         }
         if action.action_type == "cell_edit":
-            sandbox_receipt = dict(
-                action.metadata.get("sandbox_receipt") or {}
-            )
+            sandbox_receipt = dict(action.metadata.get("sandbox_receipt") or {})
             if sandbox_receipt:
                 receipt["cell_edit"] = sandbox_receipt
         if action.action_type not in {
@@ -559,9 +557,7 @@ class WindowsUiaBackend:
     def _launch_app(self, action: UiAction) -> dict[str, Any]:
         launch_target = str(action.value or action.selector or "").strip()
         if not launch_target:
-            raise BackendUnavailable(
-                "launch_app requires an executable target"
-            )
+            raise BackendUnavailable("launch_app requires an executable target")
         try:
             process = subprocess.Popen(launch_target)
         except OSError:
@@ -636,17 +632,14 @@ class WindowsUiaBackend:
     def _draw_path(self, target: Any, path_json: str) -> list[dict[str, int]]:
         bounds = self._control_bounds(target)
         if bounds is None:
-            raise BackendUnavailable(
-                "Cannot draw on a target with empty bounds"
-            )
+            raise BackendUnavailable("Cannot draw on a target with empty bounds")
         left, top, width, height = bounds
         parsed = json.loads(path_json)
         points = parsed.get("points") if isinstance(parsed, dict) else parsed
         if not isinstance(points, list) or len(points) < 2:
             raise BackendUnavailable("draw_path requires at least two points")
         resolved = [
-            self._resolve_point(point, left, top, width, height)
-            for point in points
+            self._resolve_point(point, left, top, width, height) for point in points
         ]
         first = resolved[0]
         self._set_cursor_pos(first["x"], first["y"])

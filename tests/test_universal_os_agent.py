@@ -873,7 +873,9 @@ class VerificationContractTests(unittest.TestCase):
         self.assertTrue(result.matched)
         self.assertEqual(result.kind, "state_changed")
 
-    def test_state_changed_rejects_explicit_failure_receipt_even_with_diff(self) -> None:
+    def test_state_changed_rejects_explicit_failure_receipt_even_with_diff(
+        self,
+    ) -> None:
         action = UiAction(
             "click",
             "name=Missing",

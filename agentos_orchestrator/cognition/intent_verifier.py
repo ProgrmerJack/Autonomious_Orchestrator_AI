@@ -24,7 +24,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agentos_orchestrator.os_control.base import UiAction
-from agentos_orchestrator.os_control.workflow.intent_parser import parse_structured_intent
+from agentos_orchestrator.os_control.workflow.intent_parser import (
+    parse_structured_intent,
+)
 
 from .control_substrate import ActionProposal, GoalLock
 
@@ -250,7 +252,9 @@ class IntentConstraintCompiler:
                 )
             )
         )
-        payment_in_scope = bool(_PAYMENT_RE.search(lower)) and not invoice_only_file_task
+        payment_in_scope = (
+            bool(_PAYMENT_RE.search(lower)) and not invoice_only_file_task
+        )
         if invoice_only_file_task:
             pass
         elif not payment_in_scope:

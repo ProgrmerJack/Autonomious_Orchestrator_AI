@@ -799,15 +799,17 @@ class V2WorkflowBootstrapRegressionTests(unittest.TestCase):
             use_local_vla=False,
         )
         run = agent.run(objective)
-        self.assertEqual(run.final_state["bootstrap"]["executed_steps"], len(plan.steps))
-        self.assertEqual(run.final_state["bootstrap"]["verified_steps"], len(plan.steps))
+        self.assertEqual(
+            run.final_state["bootstrap"]["executed_steps"], len(plan.steps)
+        )
+        self.assertEqual(
+            run.final_state["bootstrap"]["verified_steps"], len(plan.steps)
+        )
         self.assertTrue(run.success)
         return plan, backend, run
 
     def test_run_bootstrap_handles_calculator_arithmetic(self) -> None:
-        plan, backend, _run = self._run_objective(
-            "In Calculator, compute 56 plus 19."
-        )
+        plan, backend, _run = self._run_objective("In Calculator, compute 56 plus 19.")
         self.assertEqual(
             [action.selector for action in backend.actions],
             [step.selector for step in plan.steps],
@@ -816,12 +818,8 @@ class V2WorkflowBootstrapRegressionTests(unittest.TestCase):
         self.assertEqual(backend.actions[-1].selector, "name=Equals")
 
     def test_run_bootstrap_handles_notepad_note_creation(self) -> None:
-        plan, backend, _run = self._run_objective(
-            "Open Notepad and type hello world."
-        )
-        self.assertFalse(
-            any(step.selector == "name=AgentOS" for step in plan.steps)
-        )
+        plan, backend, _run = self._run_objective("Open Notepad and type hello world.")
+        self.assertFalse(any(step.selector == "name=AgentOS" for step in plan.steps))
         self.assertEqual(backend.actions[0].selector, "notepad.exe")
         self.assertFalse(
             any(action.selector == "app-workspace" for action in backend.actions)
@@ -836,13 +834,13 @@ class V2WorkflowBootstrapRegressionTests(unittest.TestCase):
         plan, backend, _run = self._run_objective(
             "Open Settings and search for Bluetooth."
         )
-        self.assertFalse(
-            any(step.selector == "name=AgentOS" for step in plan.steps)
-        )
+        self.assertFalse(any(step.selector == "name=AgentOS" for step in plan.steps))
         self.assertTrue(
             any(action.selector == "settings-search-box" for action in backend.actions)
         )
-        self.assertFalse(any(action.action_type == "open_url" for action in backend.actions))
+        self.assertFalse(
+            any(action.action_type == "open_url" for action in backend.actions)
+        )
 
     def test_run_bootstrap_handles_browser_search_then_notepad_paste(self) -> None:
         _plan, backend, _run = self._run_objective(

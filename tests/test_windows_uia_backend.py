@@ -213,9 +213,7 @@ class WindowsUiaBackendTests(unittest.TestCase):
         backend = _StubWindowsUiaBackend(controls=[(control, node)])
 
         receipt = json.loads(
-            backend.perform(
-                UiAction("type", "document-canvas", "hello world")
-            )
+            backend.perform(UiAction("type", "document-canvas", "hello world"))
         )
 
         self.assertEqual(control.typed, ["hello world"])

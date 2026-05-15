@@ -309,8 +309,7 @@ def _workflow_actions_for_task(
                     "verification_contract": VerificationContract(
                         kind="field_contains",
                         expected=(
-                            "The email attachment field contains the selected "
-                            "file."
+                            "The email attachment field contains the selected file."
                         ),
                         target="email-attachment-field",
                         value=source_path,
@@ -357,8 +356,7 @@ def _workflow_actions_for_task(
                     "verification_contract": VerificationContract(
                         kind="field_contains",
                         expected=(
-                            "The email search box contains the requested invite "
-                            "query."
+                            "The email search box contains the requested invite query."
                         ),
                         target="email-search-box",
                         value=query,

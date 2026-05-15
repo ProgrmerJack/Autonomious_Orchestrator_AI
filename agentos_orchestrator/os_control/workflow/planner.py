@@ -500,7 +500,9 @@ class DesktopWorkflowPlanner:
 
     @staticmethod
     def _segment_mode(lower: str, intent: StructuredIntent) -> str:
-        if intent.is_file_workflow() or DesktopWorkflowPlanner._is_explorer_file_op(lower):
+        if intent.is_file_workflow() or DesktopWorkflowPlanner._is_explorer_file_op(
+            lower
+        ):
             return "app-task"
         if intent.primary_domain in {"chat", "browser", "pdf", "cross_app"}:
             return "app-task"

@@ -132,10 +132,7 @@ class RustNativeWindowsBackend:
             payload.setdefault("launch_snapshot_nodes", len(settled_nodes))
             payload.setdefault(
                 "launch_surface_names",
-                [
-                    node.name
-                    for node in self._meaningful_nodes(settled_nodes)[:5]
-                ],
+                [node.name for node in self._meaningful_nodes(settled_nodes)[:5]],
             )
         if matched is not None:
             payload.setdefault("matched_name", matched.name)
@@ -197,9 +194,7 @@ class RustNativeWindowsBackend:
         action: UiAction,
     ) -> bool:
         before_ids = {node.node_id for node in before_nodes}
-        meaningful_after = RustNativeWindowsBackend._meaningful_nodes(
-            after_nodes
-        )
+        meaningful_after = RustNativeWindowsBackend._meaningful_nodes(after_nodes)
         if any(node.node_id not in before_ids for node in meaningful_after):
             return True
         if any(node.focused for node in meaningful_after):

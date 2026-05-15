@@ -90,16 +90,11 @@ class AppFamilyAdapter:
     ) -> VerificationContract | None:
         selector = str(action.selector or "").strip().lower()
         metadata = dict(action.metadata or {})
-        if (
-            self.family == "email"
-            and action.action_type in {"click", "invoke"}
-        ):
+        if self.family == "email" and action.action_type in {"click", "invoke"}:
             if "send" in selector:
                 return VerificationContract(
                     kind="send_outcome",
-                    expected=(
-                        "The final email state proves the message was sent."
-                    ),
+                    expected=("The final email state proves the message was sent."),
                     target=action.selector,
                     metadata={
                         "recipient": str(metadata.get("recipient") or ""),
@@ -107,18 +102,12 @@ class AppFamilyAdapter:
                         "expected_state": "sent",
                     },
                 )
-        if (
-            self.family == "calendar"
-            and action.action_type in {"click", "invoke"}
-        ):
-            if any(
-                token in selector for token in ("invite", "meeting", "send")
-            ):
+        if self.family == "calendar" and action.action_type in {"click", "invoke"}:
+            if any(token in selector for token in ("invite", "meeting", "send")):
                 return VerificationContract(
                     kind="invite_outcome",
                     expected=(
-                        "The final calendar state proves the invite "
-                        "was created."
+                        "The final calendar state proves the invite was created."
                     ),
                     target=action.selector,
                     metadata={
@@ -126,20 +115,15 @@ class AppFamilyAdapter:
                         "expected_state": "invited",
                     },
                 )
-        if (
-            self.family == "settings"
-            and action.action_type in {"click", "invoke"}
-        ):
+        if self.family == "settings" and action.action_type in {"click", "invoke"}:
             if any(
-                token in selector
-                for token in ("toggle", "night light", "nightlight")
+                token in selector for token in ("toggle", "night light", "nightlight")
             ):
                 setting_name, setting_state = _settings_toggle_target(action)
                 return VerificationContract(
                     kind="toggle_state",
                     expected=(
-                        "The final Settings state proves the requested "
-                        "toggle state."
+                        "The final Settings state proves the requested toggle state."
                     ),
                     target=action.selector,
                     metadata={

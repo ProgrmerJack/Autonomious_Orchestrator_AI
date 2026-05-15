@@ -214,14 +214,10 @@ def _semantic_score(node: UiNode, selector: str, family: str) -> float:
     elif normalized_selector == "email-to-field":
         if "edit" in role:
             score += 24.0
-        if any(
-            token in haystack for token in ("to", "recipient", "recipients")
-        ):
+        if any(token in haystack for token in ("to", "recipient", "recipients")):
             score += 32.0
     elif normalized_selector == "email-attachment-field":
-        if any(
-            token in haystack for token in ("attach", "attachment", "file")
-        ):
+        if any(token in haystack for token in ("attach", "attachment", "file")):
             score += 34.0
         if any(token in role for token in ("edit", "button")):
             score += 14.0
@@ -256,8 +252,7 @@ def _semantic_score(node: UiNode, selector: str, family: str) -> float:
         if "button" in role:
             score += 20.0
         if any(
-            token in haystack
-            for token in ("invite", "send update", "send", "meeting")
+            token in haystack for token in ("invite", "send update", "send", "meeting")
         ):
             score += 34.0
     elif normalized_selector == "browser-address-bar":
@@ -303,9 +298,7 @@ def _semantic_score(node: UiNode, selector: str, family: str) -> float:
         ):
             score += 34.0
     elif normalized_selector == "settings-toggle":
-        if any(
-            token in role for token in ("button", "check", "switch", "toggle")
-        ):
+        if any(token in role for token in ("button", "check", "switch", "toggle")):
             score += 24.0
         if any(
             token in haystack
@@ -327,9 +320,7 @@ def _semantic_score(node: UiNode, selector: str, family: str) -> float:
 
 def _selector_aliases(node: UiNode, family_hint: str = "") -> list[str]:
     metadata = dict(node.metadata or {})
-    existing = [
-        str(item) for item in list(metadata.get("selector_aliases") or [])
-    ]
+    existing = [str(item) for item in list(metadata.get("selector_aliases") or [])]
     aliases = [item for item in existing if item]
     haystack = _node_haystack(node)
     role = _normalize(node.role)
@@ -349,8 +340,7 @@ def _selector_aliases(node: UiNode, family_hint: str = "") -> list[str]:
         if "button" in role and "send" in haystack:
             aliases.append("email-send-button")
         if any(
-            token in haystack
-            for token in ("message sent", "mail sent", "sent items")
+            token in haystack for token in ("message sent", "mail sent", "sent items")
         ):
             aliases.append("email-status-text")
     if family == "calendar":
@@ -429,9 +419,7 @@ def _selector_aliases(node: UiNode, family_hint: str = "") -> list[str]:
                 "editor",
             )
         ):
-            aliases.extend(
-                ["document-canvas", "editor-canvas", "app-workspace"]
-            )
+            aliases.extend(["document-canvas", "editor-canvas", "app-workspace"])
     if family == "browser":
         if "edit" in role and any(
             token in haystack
@@ -485,9 +473,7 @@ def _implicit_semantic_target(action: UiAction, family: str) -> str:
         if any(token in selector for token in ("invite", "send", "meeting")):
             return "calendar-invite-button"
     if family == "settings" and action.action_type in {"click", "invoke"}:
-        if any(
-            token in selector for token in ("toggle", "night light", "nightlight")
-        ):
+        if any(token in selector for token in ("toggle", "night light", "nightlight")):
             return "settings-toggle"
     return ""
 
@@ -513,9 +499,7 @@ def _uses_semantic_selector(selector: str) -> bool:
         return False
     if "=" in cleaned or "," in cleaned:
         return False
-    return cleaned.startswith(
-        ("browser-", "email-", "calendar-", "settings-")
-    )
+    return cleaned.startswith(("browser-", "email-", "calendar-", "settings-"))
 
 
 def _uses_uia_only_selector(selector: str) -> bool:
@@ -666,9 +650,7 @@ def _node_haystack(node: UiNode) -> str:
         str(metadata.get("value") or ""),
         str(metadata.get("semantic_name") or ""),
     ]
-    chunks.extend(
-        str(item) for item in list(metadata.get("selector_aliases") or [])
-    )
+    chunks.extend(str(item) for item in list(metadata.get("selector_aliases") or []))
     return _normalize(" ".join(chunk for chunk in chunks if chunk))
 
 

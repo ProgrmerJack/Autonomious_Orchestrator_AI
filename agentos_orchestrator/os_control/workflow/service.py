@@ -231,8 +231,7 @@ class DesktopWorkflowService:
                 materialized_step,
                 objective=objective,
                 remaining_steps=[
-                    self._materialize_handoff_step(item)
-                    for item in plan.steps[index:]
+                    self._materialize_handoff_step(item) for item in plan.steps[index:]
                 ],
             )
             receipt_payload = self._json_or_text(receipt)
@@ -367,9 +366,7 @@ class DesktopWorkflowService:
         if intent.file_source_hint:
             self._workflow_blackboard["file_source"] = intent.file_source_hint
         if intent.file_destination_hint:
-            self._workflow_blackboard["file_destination"] = (
-                intent.file_destination_hint
-            )
+            self._workflow_blackboard["file_destination"] = intent.file_destination_hint
         self._workflow_blackboard["workflow_objective"] = str(plan.objective or "")
 
     def _materialize_handoff_step(self, step: Any) -> DesktopWorkflowStep:

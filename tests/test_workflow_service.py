@@ -811,7 +811,9 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertEqual(plan.app_target, "settings.exe")
         self.assertIn("search_settings", plan.intent.get("operations") or [])
         self.assertIn("toggle_setting", plan.intent.get("operations") or [])
-        self.assertTrue(any(step.selector == "settings-search-box" for step in plan.steps))
+        self.assertTrue(
+            any(step.selector == "settings-search-box" for step in plan.steps)
+        )
         self.assertTrue(any(step.selector == "settings-toggle" for step in plan.steps))
         self.assertFalse(any(step.selector == "app-workspace" for step in plan.steps))
 
@@ -825,7 +827,9 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertEqual(plan.intent.get("destination_surface"), "email")
         self.assertIn("attach_file", plan.intent.get("operations") or [])
         self.assertTrue(any(step.selector == "email-to-field" for step in plan.steps))
-        self.assertTrue(any(step.selector == "email-attachment-field" for step in plan.steps))
+        self.assertTrue(
+            any(step.selector == "email-attachment-field" for step in plan.steps)
+        )
         self.assertFalse(any(step.selector == "app-workspace" for step in plan.steps))
 
     def test_planner_routes_email_invite_into_calendar_family(self) -> None:
@@ -841,7 +845,9 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertIn("search_email", plan.intent.get("operations") or [])
         self.assertIn("create_calendar_event", plan.intent.get("operations") or [])
         self.assertTrue(any(step.selector == "email-search-box" for step in plan.steps))
-        self.assertTrue(any(step.selector == "calendar-event-editor" for step in plan.steps))
+        self.assertTrue(
+            any(step.selector == "calendar-event-editor" for step in plan.steps)
+        )
 
     def test_planner_emits_explicit_programmer_tool_step(self) -> None:
         planner = DesktopWorkflowPlanner()
@@ -990,7 +996,9 @@ class WorkflowServiceTests(unittest.TestCase):
             self.assertIn("settings.exe", launches)
             self.assertIn("settings-search-box", selectors)
             self.assertIn("settings-toggle", selectors)
-            self.assertFalse(any(item["action_type"] == "hotkey" for item in result["receipts"]))
+            self.assertFalse(
+                any(item["action_type"] == "hotkey" for item in result["receipts"])
+            )
 
     def test_find_stock_and_analyze_prefers_research_tool_lane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1579,9 +1587,13 @@ class WorkflowServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             service = DesktopWorkflowService(Path(temp_dir))
             backend = GoalLockBlockingBackend()
-            intent = DesktopWorkflowPlanner().plan(
-                "search Chrome for the nearest UPS store and copy the address into Notepad"
-            ).intent
+            intent = (
+                DesktopWorkflowPlanner()
+                .plan(
+                    "search Chrome for the nearest UPS store and copy the address into Notepad"
+                )
+                .intent
+            )
             plan = DesktopWorkflowPlan(
                 objective="",
                 mode="app-task",
@@ -1632,9 +1644,7 @@ class WorkflowServiceTests(unittest.TestCase):
                 backend,
             )
 
-            self.assertTrue(
-                any(item[0] == "set_clipboard" for item in backend.actions)
-            )
+            self.assertTrue(any(item[0] == "set_clipboard" for item in backend.actions))
             self.assertEqual(backend.field_value, backend.clipboard)
             self.assertTrue(
                 any(

@@ -68,9 +68,7 @@ class AgentBodyClient:
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         invocation = self._resolve_invocation()
         if not invocation:
-            raise AgentBodyUnavailableError(
-                "Rust agent_body was not available."
-            )
+            raise AgentBodyUnavailableError("Rust agent_body was not available.")
         try:
             return self._session_request(payload, invocation)
         except AgentBodyError:
@@ -126,9 +124,7 @@ class AgentBodyClient:
         try:
             response = json.loads(stdout)
         except json.JSONDecodeError as exc:
-            raise AgentBodyError(
-                f"agent_body returned invalid JSON: {stdout}"
-            ) from exc
+            raise AgentBodyError(f"agent_body returned invalid JSON: {stdout}") from exc
         if not isinstance(response, dict):
             raise AgentBodyError("agent_body returned a non-object response")
         return response
@@ -161,14 +157,10 @@ class _AgentBodySession:
             stdin.write(json.dumps(payload) + "\n")
             stdin.flush()
         except OSError as exc:
-            raise AgentBodyError(
-                f"agent_body session write failed: {exc}"
-            ) from exc
+            raise AgentBodyError(f"agent_body session write failed: {exc}") from exc
         response = self._read_response(stdout)
         if not isinstance(response, dict):
-            raise AgentBodyError(
-                "agent_body session returned a non-object response"
-            )
+            raise AgentBodyError("agent_body session returned a non-object response")
         return response
 
     def close(self) -> None:
@@ -206,9 +198,7 @@ class _AgentBodySession:
                 bufsize=1,
             )
         except OSError as exc:
-            raise AgentBodyError(
-                f"agent_body session launch failed: {exc}"
-            ) from exc
+            raise AgentBodyError(f"agent_body session launch failed: {exc}") from exc
         self.process = process
         self._consume_startup(process)
         return process
@@ -248,9 +238,7 @@ class _AgentBodySession:
                 ) from exc
             if isinstance(payload, dict):
                 return payload
-            raise AgentBodyError(
-                "agent_body session returned a non-object response"
-            )
+            raise AgentBodyError("agent_body session returned a non-object response")
 
 
 def resolve_agent_body_invocation(
@@ -260,18 +248,14 @@ def resolve_agent_body_invocation(
     agent_body_command = metadata.get("agent_body_command")
     if isinstance(agent_body_command, (list, tuple)):
         command = [
-            str(item).strip()
-            for item in agent_body_command
-            if str(item).strip()
+            str(item).strip() for item in agent_body_command if str(item).strip()
         ]
         if command:
             return command
     agent_body_bin = str(metadata.get("agent_body_bin") or "").strip()
     if agent_body_bin:
         return [agent_body_bin]
-    agent_body_manifest = str(
-        metadata.get("agent_body_manifest") or ""
-    ).strip()
+    agent_body_manifest = str(metadata.get("agent_body_manifest") or "").strip()
     # Auto-running the Rust body is still an explicit opt-in for sandbox
     # providers. Real OS-control backends pass an explicit manifest path.
     if (
@@ -280,8 +264,7 @@ def resolve_agent_body_invocation(
     ):
         return []
     manifest = Path(
-        agent_body_manifest
-        or str(Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
+        agent_body_manifest or str(Path.cwd() / "crates" / "agent_body" / "Cargo.toml")
     )
     if not manifest.exists() or shutil.which("cargo") is None:
         return []
@@ -309,9 +292,7 @@ def _agent_body_features(metadata: Mapping[str, Any]) -> list[str]:
             if part.strip()
         )
     elif isinstance(raw_features, (list, tuple, set)):
-        features.extend(
-            str(item).strip() for item in raw_features if str(item).strip()
-        )
+        features.extend(str(item).strip() for item in raw_features if str(item).strip())
     deduped: list[str] = []
     for feature in features:
         if feature and feature not in deduped:

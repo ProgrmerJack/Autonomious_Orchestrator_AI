@@ -402,7 +402,9 @@ class BrowserWorkflowAdapter:
     def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
         if not self._needs_browser(context):
             return []
-        launch_target = context.intent.source_app_target or context.app_target or "msedge.exe"
+        launch_target = (
+            context.intent.source_app_target or context.app_target or "msedge.exe"
+        )
         target = self._browser_target(context)
         if target is None:
             return []
@@ -429,7 +431,10 @@ class BrowserWorkflowAdapter:
 
     @staticmethod
     def _needs_browser(context: WorkflowContext) -> bool:
-        if context.intent.prefers_local_file_search() or context.intent.prefers_chat_search():
+        if (
+            context.intent.prefers_local_file_search()
+            or context.intent.prefers_chat_search()
+        ):
             return False
         if context.intent.prefers_web_search():
             return True
@@ -491,10 +496,9 @@ class ResearchWorkflowAdapter:
             return []
         if not workflow_prefers_research_tool(context.lower, context.mode):
             return []
-        query = (
-            context.intent.entities.get("query")
-            or BrowserWorkflowAdapter._search_query(context.lower)
-        )
+        query = context.intent.entities.get(
+            "query"
+        ) or BrowserWorkflowAdapter._search_query(context.lower)
         request = {
             "kind": "workflow_research_brief",
             "objective": context.objective,
@@ -1105,14 +1109,24 @@ class ChatWorkflowAdapter:
 
 class EmailWorkflowAdapter:
     def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
-        if context.intent.source_surface != "email" and context.intent.destination_surface != "email":
+        if (
+            context.intent.source_surface != "email"
+            and context.intent.destination_surface != "email"
+        ):
             return []
         steps: list[DesktopWorkflowStep] = []
         source_target = context.intent.source_app_target or "outlook.exe"
         destination_target = context.intent.destination_app_target or "outlook.exe"
-        query = context.intent.entities.get("email_query") or context.intent.entities.get("query") or context.intent.object_hint
+        query = (
+            context.intent.entities.get("email_query")
+            or context.intent.entities.get("query")
+            or context.intent.object_hint
+        )
         recipient = context.intent.entities.get("recipient") or ""
-        file_source = context.intent.entities.get("file_source") or context.intent.file_source_hint
+        file_source = (
+            context.intent.entities.get("file_source")
+            or context.intent.file_source_hint
+        )
         if context.intent.source_surface == "file_explorer" and file_source:
             steps.extend(
                 [
@@ -1218,14 +1232,21 @@ class EmailWorkflowAdapter:
 
 class CalendarWorkflowAdapter:
     def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
-        if context.intent.source_surface != "calendar" and context.intent.destination_surface != "calendar":
+        if (
+            context.intent.source_surface != "calendar"
+            and context.intent.destination_surface != "calendar"
+        ):
             return []
         target = (
             context.intent.destination_app_target
             or context.intent.source_app_target
             or "outlook.exe /select outlook:calendar"
         )
-        event_title = context.intent.entities.get("event_title") or context.intent.object_hint or context.objective.strip().rstrip(".")
+        event_title = (
+            context.intent.entities.get("event_title")
+            or context.intent.object_hint
+            or context.objective.strip().rstrip(".")
+        )
         steps = [
             DesktopWorkflowStep(
                 action_type="launch_app",
@@ -1257,9 +1278,16 @@ class CalendarWorkflowAdapter:
 
 class SettingsWorkflowAdapter:
     def steps_for(self, context: WorkflowContext) -> list[DesktopWorkflowStep]:
-        if context.intent.source_surface != "settings" and context.app_target != "settings.exe":
+        if (
+            context.intent.source_surface != "settings"
+            and context.app_target != "settings.exe"
+        ):
             return []
-        setting_name = context.intent.entities.get("setting_name") or context.intent.object_hint or context.objective.strip().rstrip(".")
+        setting_name = (
+            context.intent.entities.get("setting_name")
+            or context.intent.object_hint
+            or context.objective.strip().rstrip(".")
+        )
         setting_value = context.intent.entities.get("setting_value") or ""
         steps: list[DesktopWorkflowStep] = []
         if setting_name:
